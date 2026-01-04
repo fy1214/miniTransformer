@@ -1,6 +1,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
-
+#include <cstdint>
 #include <cuda_fp4.h>
 
 template <typename T>
@@ -53,12 +53,27 @@ static_assert(sizeof(fp16x2) == 4);
 static_assert(sizeof(fp8e4m3x2) == 2);
 static_assert(sizeof(fp8e5m2x2) == 2);
 
-#if FP4_TYPE_SUPPORTED
 using fp4e2m1 = __nv_fp4_e2m1;
 using fp4e2m1x2 = __nv_fp4x2_e2m1;
 using fp4e2m1x4 = __nv_fp4x4_e2m1;
 static_assert(sizeof(fp4e2m1x2) == 1);
 static_assert(sizeof(fp4e2m1x4) == 2);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct uint16 {
+  uint4 u;
+  uint4 v;
+  uint4 s;
+  uint4 t;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct uint8 {
+  uint4 u;
+  uint4 v;
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

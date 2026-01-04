@@ -28,25 +28,6 @@
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};
 
-template <typename T>
-struct TypeExtrema {
-  static constexpr float max = std::numeric_limits<T>::max();
-};
-
-// Compute the global encode scale factor for a given global amax
-__device__ __forceinline__ float compute_global_encode_scaling_factor_FP4(const float global_amax) {
-  constexpr float fp8_max = TypeExtrema<fp8e4m3>::max;  // 448.0f;
-  constexpr float fp4_max = TypeExtrema<fp4e2m1>::max;  // 6.0f;
-  float global_encode_scale = fp8_max * fp4_max / global_amax;
-  // If scale is infinity, return max value of float32
-  global_encode_scale = fminf(global_encode_scale, TypeExtrema<float>::max);
-  // If global amax is 0 or infinity, return 1
-  if (global_amax == 0.0f || global_encode_scale == 0.0f) {
-    return 1.0f;
-  }
-  return global_encode_scale;
-}
-
 // Used in non-transpose variant
 // Compute per-block E4M3 encoding/decoding scaling factor
 __device__ __forceinline__ fp8e4m3 compute_decoding_scaling_factor(const float block_amax,
@@ -1168,15 +1149,13 @@ void quantize_transpose(
     bool use_2d_quantization,
     bool return_transpose
 ) {
-  using namespace quantize_transpose_kernel;
-  using namespace ptx;
-  bool use_stochastic_rounding = false;
+  constexpr bool use_stochastic_rounding = false;
 
   constexpr bool COMPUTE_ACTIVATIONS = false;
   using ParamOP = Empty;
   constexpr float (*OP)(float, const ParamOP &) = nullptr;
 
-  const total_elements = input.numel();
+  const size_t total_elements = input.numel();
   const size_t cols = input.size(-1);
   const size_t rows = total_elements / cols;
 
@@ -1204,13 +1183,13 @@ void quantize_transpose(
   alignas(64) CUtensorMap tensor_map_output{};
   alignas(64) CUtensorMap tensor_map_output_transpose{};
 
-  create_2D_tensor_map(tensor_map_input, input.data(), rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
+  create_2D_tensor_map(tensor_map_input, input, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
                        sizeof(IType) * 8);
 
-  create_2D_tensor_map(tensor_map_output, output->data, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
+  create_2D_tensor_map(tensor_map_output, output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
                        4);
   if (return_transpose) {
-    create_2D_tensor_map(tensor_map_output_transpose, output_transpose->data(), cols, rows,
+    create_2D_tensor_map(tensor_map_output_transpose, output_transpose, cols, rows,
                          BUFF_DIM_X, BUFF_DIM_Y, rows, 0, 4);
   }
   constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_DIM_X;
@@ -1241,7 +1220,7 @@ void quantize_transpose(
         auto kernel = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                       USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
 
-        if constexpr (use_2d_quantization) {
+        if (use_2d_quantization) {
           kernel = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                       USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
         }

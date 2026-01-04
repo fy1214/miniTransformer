@@ -3,6 +3,8 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 
+#include <torch/extension.h>
+
 using byte = uint8_t;
 using int16 = int16_t;
 using int32 = int32_t;

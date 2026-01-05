@@ -98,7 +98,7 @@ def setup_extensions() -> setuptools.Extension:
 
     # define sources and include directories
     root_dir = pathlib.Path(__file__).resolve().parent
-    extensions_dir = root_dir / "csrc"
+    extensions_dir = root_dir / "transformer" /"csrc"
     sources = list(glob.glob(os.path.join(extensions_dir, "**/*.cpp"), recursive=True))
     sources += list(glob.glob(os.path.join(extensions_dir, "**/*.cu"), recursive=True))
 

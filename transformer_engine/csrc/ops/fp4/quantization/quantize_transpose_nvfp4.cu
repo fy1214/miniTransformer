@@ -1184,13 +1184,13 @@ void quantize_transpose(
   alignas(64) CUtensorMap tensor_map_output_transpose{};
 
   create_2D_tensor_map(tensor_map_input, input, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
-                       sizeof(IType) * 8);
+                       sizeof(IType) * 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 
-  create_2D_tensor_map(tensor_map_output, output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
-                       4);
+  create_2D_tensor_map(tensor_map_output, *output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
+                       4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   if (return_transpose) {
-    create_2D_tensor_map(tensor_map_output_transpose, output_transpose, cols, rows,
-                         BUFF_DIM_X, BUFF_DIM_Y, rows, 0, 4);
+    create_2D_tensor_map(tensor_map_output_transpose, *output_transpose, cols, rows,
+                         BUFF_DIM_X, BUFF_DIM_Y, rows, 0, 4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   }
   constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_DIM_X;
   constexpr size_t buff_elems_total = BUFFS_NUM * buff_elems;

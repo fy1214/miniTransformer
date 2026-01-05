@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp4.h>
 
+#include "vector.cuh"
 #include "logging.h"
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group
@@ -275,7 +276,7 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x(const float2 in01, c
   }
 }
 
-__device__ __forceinline__ void abs_max_2x(bf16x2 &dst, const bf16x2 &p1, const bf16x2 &p2) {
+static __device__ __forceinline__ void abs_max_2x(bf16x2 &dst, const bf16x2 &p1, const bf16x2 &p2) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
   asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;"
                : "=r"(reinterpret_cast<uint32_t &>(dst))

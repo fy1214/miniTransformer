@@ -123,11 +123,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     const __grid_constant__ CUtensorMap tensor_map_output,
                                     const __grid_constant__ CUtensorMap tensor_map_output_t,
                                     nvfp4_scale_t *const scales_ptr,
-                                    nvfp4_scale_t *const scales_t_ptr, const float *noop,
-                                    const float *const amax_rowwise_ptr,
-                                    const float *const amax_colwise_ptr, const size_t rows,
-                                    const size_t cols, const size_t scale_stride,
-                                    const size_t scale_stride_t, const size_t *rng_state) {
+                                    nvfp4_scale_t *const scales_t_ptr,
+                                    const size_t rows, const size_t cols, 
+                                    const size_t scale_stride,
+                                    const size_t scale_stride_t) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);

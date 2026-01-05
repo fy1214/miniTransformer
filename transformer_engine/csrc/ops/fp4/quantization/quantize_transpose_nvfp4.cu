@@ -1014,7 +1014,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
             const size_t shmem_offset_rowwise = shmem_offset_base_rowwise_in + swizzled_thread_idx;
 
             vector::Vec<IType, PACK_SIZE> in;
-            vector::<IType, PACK_SIZE> act_in;
+            vector::Vec<IType, PACK_SIZE> act_in;
 
             in.load_from(&in_sh[shmem_offset_rowwise]);
 #pragma unroll

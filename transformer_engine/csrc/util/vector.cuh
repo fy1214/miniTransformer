@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cuda_fp4.h>
 
+#include "common.h"
+
 template <typename T>
 struct alignas(2 * sizeof(T)) FPx2 {
   T x;

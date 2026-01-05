@@ -21,12 +21,16 @@
 #include <torch/extension.h>
 #include <torch/torch.h>    
 
-#include "../../../util/common.h"
 #include "../../../util/ptx.cuh"
 #include "../../../util/vector.cuh"
 
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};
+
+template <typename T>
+struct TypeExtrema {
+  static constexpr float max = std::numeric_limits<T>::max();
+};
 
 // Used in non-transpose variant
 // Compute per-block E4M3 encoding/decoding scaling factor
@@ -1047,7 +1051,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
         }
 
         // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
+        constexpr float float_max = TypeExtrema<float>::max;
         const float block_scale_inverse = fminf(
             1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_rowwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};

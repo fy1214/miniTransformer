@@ -3,7 +3,11 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
+#include <ATen/cuda/Exceptions.h>
 #include <torch/extension.h>
+#include <torch/torch.h>
 
 using byte = uint8_t;
 using int16 = int16_t;
@@ -39,6 +43,9 @@ constexpr size_t TMA_SHMEM_ALIGNMENT = 128;  // shared memory address alignment
     { __VA_ARGS__ }                                               \
   }
 
+inline bool is_aligned_ptr(const void *ptr, size_t alignment) {
+  return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
 
 template <typename T>
 constexpr T DIVUP(const T &x, const T &y) {
@@ -62,7 +69,7 @@ CUtensorMapDataType get_CUtensorMapDataType(at::ScalarType dtype) {
         {at::kHalf, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16},
         {at::kBFloat16, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16},
         {at::Float8_e5m2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
-        {at::Float8_e4m3, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}};
+        {at::Float8_e4m3fn, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}};
     return typeMapping;
   }();
   return dtypeMapping.at(dtype);
@@ -90,15 +97,15 @@ void create_2D_tensor_map(CUtensorMap &tensorMap, const at::Tensor &tensor,
   // The distance between elements in units of sizeof(element)
   uint32_t elemStride[rank] = {1, 1};
 
-  const CUtensorMapDataType tensorDataType = get_CUtensorMapDataType(tensor.dtype());
+  const CUtensorMapDataType tensorDataType = get_CUtensorMapDataType(tensor.scalar_type());
   void *dataPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(tensor.data()) +
                                            (offset_elems * type_num_bits) / 8);
 
-  NVTE_CHECK(is_aligned_ptr(dataPtr, TMA_GMEM_ALIGNMENT),
+  TORCH_CHECK(is_aligned_ptr(dataPtr, TMA_GMEM_ALIGNMENT),
              "Tensor data pointer must be 16B aligned");
 
   const int TMA_needed_size = (TMA_GMEM_ALIGNMENT * 8) / type_num_bits;
-  NVTE_CHECK(globalX % TMA_needed_size == 0, "Shape not supported. For ", type_num_bits,
+  TORCH_CHECK(globalX % TMA_needed_size == 0, "Shape not supported. For ", type_num_bits,
              "-bit data type, expected multiple of ", TMA_needed_size, ", got ", globalX);
 
   // Create the tensor descriptor.
@@ -124,5 +131,5 @@ void create_2D_tensor_map(CUtensorMap &tensorMap, const at::Tensor &tensor,
       // CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
 
       // Any element that is outside of bounds will be set to zero by the TMA transfer.
-      CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+      CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }

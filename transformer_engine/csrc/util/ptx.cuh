@@ -11,6 +11,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp4.h>
 
+#include "logging.h"
+
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group
 template <size_t W>
 __device__ __forceinline__ void cp_async_bulk_wait_group_read() {
@@ -23,6 +25,7 @@ __device__ __forceinline__ void cp_async_bulk_wait_group_read() {
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor
 // shared::cta -> global
+// SM9.0+
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_shared_to_global(
     const uint64_t *tensor_map_ptr, const uint32_t offset_x, const uint32_t offset_y,
     uint64_t *src_shmem) {
@@ -37,6 +40,7 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_shared_to_global(
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
 
+// SM9.0+
 __device__ __forceinline__ void fence_proxy_async_shared_cta() {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   asm volatile("fence.proxy.async.shared::cta;");
@@ -46,6 +50,7 @@ __device__ __forceinline__ void fence_proxy_async_shared_cta() {
 }
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-commit-group
+// SM9.0+
 __device__ __forceinline__ void cp_async_bulk_commit_group() {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   asm volatile("cp.async.bulk.commit_group;");
@@ -54,6 +59,7 @@ __device__ __forceinline__ void cp_async_bulk_commit_group() {
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
 
+// SM10.0+
 __device__ __forceinline__ void mbarrier_wait_parity(uint64_t *mbar, const uint32_t parity) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   uint32_t mbar_ptr = __cvta_generic_to_shared(mbar);
@@ -64,6 +70,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t *mbar, const uint3
 #endif  // #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
+// SM10.0+
 template <int num_barriers>
 __forceinline__ __device__ void destroy_barriers(uint64_t *mbar, const bool is_master_thread) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -98,7 +105,7 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x(const uint64_t in_4x
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
-  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
+  constexpr bool has_rs = false;
   if constexpr (has_rs) {
     asm volatile(
         "{\n"
@@ -138,7 +145,7 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_roun
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_rn(const uint64_t in_4x,
                                                                     const float2 scale,
                                                                     const uint32_t rbits) {
-  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
+  constexpr bool is_blackwell = true;
   uint32_t out_4x = 0;  // Only need 16 bit. Using 32 bit container for packing.
   if constexpr (is_blackwell) {
     // NOTE: rbits unused for rn.
@@ -195,7 +202,7 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x(const float2 in01, c
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
     const float2 in01, const float2 in23, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
-  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
+  constexpr bool has_rs = false;
   if constexpr (has_rs) {
     asm volatile(
         "{\n"
@@ -231,7 +238,7 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_rn(const float2
                                                                     const float2 in23,
                                                                     const float2 scale,
                                                                     const uint32_t rbits) {
-  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
+  constexpr bool is_blackwell = true;
   uint32_t out_4x = 0;  // Only need 16 bit. Using 32 bit container for packing.
   if constexpr (is_blackwell) {
     // NOTE: rbits unused for rn.

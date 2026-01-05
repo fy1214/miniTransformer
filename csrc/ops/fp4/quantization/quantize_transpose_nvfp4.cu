@@ -116,7 +116,6 @@ constexpr size_t TOTAL_BANKS_WIDTH = (32 * 4 * 8) / 4;  // 256
 // Number of threads (rowwise scaling) that span 32 banks (4-byte banks) of shared memory
 constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM;  // 8 = 128 / 16
 
-/** 
 template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
           typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE>
 __global__ void __launch_bounds__(THREADS_NUM)
@@ -133,16 +132,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
 
-  using IType2 = typename ptx::FPx2<IType>;
+  using IType2 = typename vector::FPx2<IType>;
 
-  const size_t rng_sequence =
-      threadIdx.x + blockIdx.x * THREADS_NUM + blockIdx.y * gridDim.x * THREADS_NUM;
-  const size_t rng_seed = rng_state != nullptr ? rng_state[0] : 0;
-  const size_t rng_offset = rng_state != nullptr ? rng_state[1] : 0;
-  transformer_engine::curanddx::detail::philox4x32_native_state<10> rng;
-  rng.init(rng_seed, rng_sequence, rng_offset);
-  uint4 random_uint4 = USE_STOCHASTIC_ROUNDING ? rng.generate4() : uint4{0, 0, 0, 0};
-  // Index of the random number. It increments each time when used and resets to 0 if reaches 4x
   int rnd_idx = 0;
 
   constexpr bool IS_CACHED_ACT_OP = COMPUTE_ACTIVATIONS;
@@ -262,7 +253,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
     if (next_stage < STAGES) {
       // Wait for TMA transfer to have finished reading shared memory.
       // I.e. the buffer is ready to be written to
-      ptx::cp_async_bulk_wait_group_read<1>();
+      cp_async_bulk_wait_group_read<1>();
 
       const size_t next_buff = next_stage % BUFFS_NUM;
       const size_t next_stage_offset_Y = next_stage * BUFF_DIM_Y;
@@ -274,10 +265,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
                         global_offset_Y, shmem_buff_size, &mbar[next_stage], is_master_thread);
     }
 
-    ptx::fence_proxy_async_shared_cta();
+    fence_proxy_async_shared_cta();
 
     // Wait for the data to have arrived
-    ptx::mbarrier_wait_parity(&mbar[stage], 0);
+    mbarrier_wait_parity(&mbar[stage], 0);
 
     float block_amax = 0.0f;
 
@@ -411,10 +402,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
         block_amax = 0.0f;
         float in_compute_rowwise[SCALE_DIM];
-        Vec<IType, PACK_SIZE> in_cached[WAVES];
+        vector::Vec<IType, PACK_SIZE> in_cached[WAVES];
 
         // used as an IType container for BF16/FP16 --> NVFP4 CAST ONLY
-        Vec<IType2, PACK_SIZE / 2> in_IType[WAVES];
+        vector::Vec<IType2, PACK_SIZE / 2> in_IType[WAVES];
 
         // 1. Read/Compute elements. Find NVFP4-block AMAX
         if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
@@ -462,7 +453,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
                 for (int e = 0; e < PACK_SIZE; e += 2) {
                   const IType2 in_cached_2x = {in_cached[w].data.elt[e],
                                                in_cached[w].data.elt[e + 1]};
-                  ptx::abs_max_2x(thread_amax_2x, thread_amax_2x, in_cached_2x);
+                  abs_max_2x(thread_amax_2x, thread_amax_2x, in_cached_2x);
                 }
               }
             }
@@ -541,22 +532,23 @@ __global__ void __launch_bounds__(THREADS_NUM)
           Vec<fp4e2m1x4, PACK_SIZE / 4> out;
 #pragma unroll
           for (int e = 0; e < PACK_SIZE / 4; ++e) {
-            const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
+            //const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
+            const uint32_t rbits = 0;  // No stochastic rounding for transpose path
             IType2 in01;
             IType2 in23;
             if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
               const uint64_t elts = *reinterpret_cast<uint64_t *>(&in_IType[w].data.elt[2 * e]);
-              out.data.elt[e] = ptx::mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
+              out.data.elt[e] = mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
                   elts, block_scale_inverse_2x, rbits);
             } else if constexpr (IS_CACHED_ACT_OP) {
               const uint64_t elts = *reinterpret_cast<uint64_t *>(&in_cached[w].data.elt[4 * e]);
-              out.data.elt[e] = ptx::mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
+              out.data.elt[e] = mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
                   elts, block_scale_inverse_2x, rbits);
             } else {
               const int j = w * PACK_SIZE + 4 * e;
               const float2 in01 = make_float2(in_compute_rowwise[j], in_compute_rowwise[j + 1]);
               const float2 in23 = make_float2(in_compute_rowwise[j + 2], in_compute_rowwise[j + 3]);
-              out.data.elt[e] = ptx::mul_cvt_fp32_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
+              out.data.elt[e] = mul_cvt_fp32_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
                   in01, in23, block_scale_inverse_2x, rbits);
             }
           }
@@ -572,7 +564,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
     thread_amax = fmaxf(thread_amax, block_amax);
 
     // Wait for shared memory writes to be visible to TMA engine.
-    ptx::fence_proxy_async_shared_cta();
+    fence_proxy_async_shared_cta();
     __syncthreads();
     // After syncthreads, writes by all threads are visible to TMA engine.
 
@@ -595,7 +587,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
       }
 
       // Create a "bulk async-group" out of the previous bulk copy operation.
-      ptx::cp_async_bulk_commit_group();
+      cp_async_bulk_commit_group();
     }
   }  // end of stages
 
@@ -623,8 +615,6 @@ __global__ void __launch_bounds__(THREADS_NUM)
   NVTE_DEVICE_ERROR("sm_100 or higher is required.");
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
-
-**/
 
 template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
           typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE>
@@ -1224,7 +1214,7 @@ void quantize_transpose(
       use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
 
       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
-        auto kernel = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
+        auto kernel = quantize_transpose_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                       USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
 
         if (use_2d_quantization) {

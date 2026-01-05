@@ -637,12 +637,11 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        const size_t cols, 
                                        const size_t scale_stride,
                                        const size_t scale_stride_t) {
-  using namespace vector;
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
 
-  using IType2 = typename FPx2<IType>;
+  using IType2 = typename vector::FPx2<IType>;
 
   int rnd_idx =
       0;  // Index of the random number. It increments each time when used and resets to 0 if reaches 4x

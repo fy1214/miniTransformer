@@ -13,10 +13,7 @@
 #include <nvrtc.h>
 
 #include "nccl.h"
-
-#ifdef NVTE_WITH_CUBLASMP
 #include <cublasmp.h>
-#endif  // NVTE_WITH_CUBLASMP
 
 #include <iostream>
 #include <stdexcept>
@@ -138,6 +135,14 @@ inline std::string concat_strings(const Ts &...args) {
     if (status_NVTE_CHECK_NCCL != ncclSuccess) {                              \
       NVTE_ERROR("NCCL Error: ", ncclGetErrorString(status_NVTE_CHECK_NCCL)); \
     }                                                                         \
+  } while (false)
+
+#define NVTE_DEVICE_ERROR(message)                                                                 \
+  do {                                                                                             \
+    printf("%s:%d in function %s (thread (%d,%d,%d), block (%d,%d,%d)): %s\n", __FILE__, __LINE__, \
+           __func__, threadIdx.x, threadIdx.y, threadIdx.z, blockIdx.x, blockIdx.y, blockIdx.z,    \
+           (message));                                                                             \
+    assert(0);                                                                                     \
   } while (false)
 
 #endif  // TRANSFORMER_ENGINE_COMMON_UTIL_LOGGING_H_

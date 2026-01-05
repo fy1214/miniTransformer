@@ -1173,9 +1173,9 @@ void quantize_transpose(
   const size_t scale_stride_transpose =
       return_transpose ? output_scale_transpose->stride(0) : 0;
 
-  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale->data());
+  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale->data_ptr());
   nvfp4_scale_t *const scales_transpose_ptr =
-      reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose->data());
+      reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose->data_ptr());
 
   using IType = bf16;
 

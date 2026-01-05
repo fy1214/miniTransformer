@@ -64,12 +64,12 @@ constexpr __device__ __host__ __forceinline__ uint64_t DIVUP_TO_MULTIPLE(const T
 CUtensorMapDataType get_CUtensorMapDataType(at::ScalarType dtype) {
   static const std::unordered_map<at::ScalarType, CUtensorMapDataType> dtypeMapping = []() {
     std::unordered_map<at::ScalarType, CUtensorMapDataType> typeMapping = {
-        {at::kByte, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
-        {at::kFloat, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32},
-        {at::kHalf, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16},
-        {at::kBFloat16, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16},
-        {at::Float8_e5m2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
-        {at::Float8_e4m3fn, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}};
+        {at::ScalarType::Byte, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
+        {at::ScalarType::Float, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32},
+        {at::ScalarType::Half, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16},
+        {at::ScalarType::BFloat16, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16},
+        {at::ScalarType::Float8_e5m2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
+        {at::ScalarType::Float8_e4m3fn, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}};
     return typeMapping;
   }();
   return dtypeMapping.at(dtype);

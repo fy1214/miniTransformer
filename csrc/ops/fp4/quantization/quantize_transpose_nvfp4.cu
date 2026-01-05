@@ -1133,7 +1133,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 }
 
 
-void quantize_transpose(
+void quantize_transpose_nvfp4(
     const at::Tensor &input, 
     at::Tensor *output,
     at::Tensor *output_scale,

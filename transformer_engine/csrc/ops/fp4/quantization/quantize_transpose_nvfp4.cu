@@ -44,6 +44,7 @@ __device__ __forceinline__ fp8e4m3 compute_decoding_scaling_factor(const float b
 }
 
 constexpr size_t SCALE_DIM = 16;  // NVFP4 block (x16 elts)
+constexpr size_t THREADS_PER_WARP = 32;
 
 constexpr size_t CHUNK_DIM_Y = 128;
 constexpr size_t CHUNK_DIM_X = 128;
@@ -976,10 +977,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
         block_amax = block_amax_matrix[block_in_tile_y][block_in_tile_x];
         float in_compute_rowwise[SCALE_DIM];
-        Vec<IType, PACK_SIZE> in_cached[WAVES];
+        vector::Vec<IType, PACK_SIZE> in_cached[WAVES];
 
         // used as an IType container for BF16/FP16 --> NVFP4 CAST ONLY
-        Vec<IType2, PACK_SIZE / 2> in_IType[WAVES];
+        vector::Vec<IType2, PACK_SIZE / 2> in_IType[WAVES];
 
         // 1. Read/Compute elements. Find NVFP4-block AMAX
         if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
@@ -1012,8 +1013,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
             const size_t swizzled_thread_idx = thread_offset_X_rowwise + swizzled_group_idx;
             const size_t shmem_offset_rowwise = shmem_offset_base_rowwise_in + swizzled_thread_idx;
 
-            Vec<IType, PACK_SIZE> in;
-            Vec<IType, PACK_SIZE> act_in;
+            vector::Vec<IType, PACK_SIZE> in;
+            vector::<IType, PACK_SIZE> act_in;
 
             in.load_from(&in_sh[shmem_offset_rowwise]);
 #pragma unroll
@@ -1059,7 +1060,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
         // 3. Scale elements
 #pragma unroll
         for (int w = 0; w < WAVES; ++w) {
-          Vec<fp4e2m1x4, PACK_SIZE / 4> out;
+          vector::Vec<fp4e2m1x4, PACK_SIZE / 4> out;
 #pragma unroll
           for (int e = 0; e < PACK_SIZE / 4; ++e) {
             // const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
@@ -1124,7 +1125,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   // Vectorized store scaling factors through SHMEM
   if (RETURN_TRANSPOSE && colwise_scale_is_within_bounds_Y) {
-    using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
+    using ScalesVec = vector::Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
     const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
     ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(&out_colwise_scales_sh[scale_idx_sh]);
     const size_t scale_idx_global = scales_offset_Y_t * scale_stride_t + scales_offset_X_t;

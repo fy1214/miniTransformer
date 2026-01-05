@@ -637,6 +637,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        const size_t cols, 
                                        const size_t scale_stride,
                                        const size_t scale_stride_t) {
+  using namespace vector;
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);

@@ -217,15 +217,11 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const bool is_master_thread = (threadIdx.x == 0);
 
   // Compute a global encoding/decoding scaling factors for all S_dec_b
-  const float S_enc_rowwise = (amax_rowwise_ptr == nullptr)
-                                  ? 1.0f
-                                  : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
+  const float S_enc_rowwise = 1.0f;
   // NOTE: This is to match with how emulation code was written.
   const float S_dec_rowwise = 1.0 / S_enc_rowwise;
 
-  const float S_enc_colwise = (amax_colwise_ptr == nullptr)
-                                  ? S_enc_rowwise
-                                  : compute_global_encode_scaling_factor_FP4(*amax_colwise_ptr);
+  const float S_enc_colwise = S_enc_rowwise;
   const float S_dec_colwise = 1.0 / S_enc_colwise;
 
   float thread_amax = 0.0f;
@@ -339,7 +335,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
         out_colwise_scales_sh[scale_idx_sh] = S_dec_b_fp8;
 
         // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
+        constexpr float float_max = TypeExtrema<float>::max;
         const float block_scale_inverse = fminf(
             1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_colwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
@@ -349,7 +345,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
 #pragma unroll
         for (int e = 0; e < SCALE_DIM / 4; ++e) {
-          const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
+          //const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
+          const uint32_t rbits = 0;  // No stochastic rounding for transpose path
           if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
             const uint64_t elts = *reinterpret_cast<uint64_t *>(&in_colwise_IType[4 * e]);
             regs[e] = mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
@@ -528,7 +525,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 // 3. Scale elements
 #pragma unroll
         for (int w = 0; w < WAVES; ++w) {
-          vecort::Vec<fp4e2m1x4, PACK_SIZE / 4> out;
+          vector::Vec<fp4e2m1x4, PACK_SIZE / 4> out;
 #pragma unroll
           for (int e = 0; e < PACK_SIZE / 4; ++e) {
             //const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);

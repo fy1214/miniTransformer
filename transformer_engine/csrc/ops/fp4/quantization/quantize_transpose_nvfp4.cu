@@ -978,7 +978,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
         // 1. Read/Compute elements. Find NVFP4-block AMAX
         if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
-          IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+          // IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+          IType2 thread_amax_2x = {IType(0.0f), IType(0.0f)};
 #pragma unroll
           for (int w = 0; w < WAVES; ++w) {
             const size_t swizzled_group_idx = ((w + bank_group) * PACK_SIZE) % SCALE_DIM;

@@ -352,12 +352,12 @@ __global__ void __launch_bounds__(THREADS_NUM)
           const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
           if constexpr (NO_ACTIVATIONS_NOT_FP32_INPUT) {
             const uint64_t elts = *reinterpret_cast<uint64_t *>(&in_colwise_IType[4 * e]);
-            regs[e] = ptx::mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
+            regs[e] = mul_cvt_bf16_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
                 elts, block_scale_inverse_2x, rbits);
           } else {
             const float2 in01 = *reinterpret_cast<float2 *>(&in_compute_colwise[4 * e]);
             const float2 in23 = *reinterpret_cast<float2 *>(&in_compute_colwise[4 * e + 2]);
-            regs[e] = ptx::mul_cvt_fp32_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
+            regs[e] = mul_cvt_fp32_to_fp4_4x<USE_STOCHASTIC_ROUNDING>(
                 in01, in23, block_scale_inverse_2x, rbits);
           }
         }
@@ -418,7 +418,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
             in_IType[w].load_from(&in_sh[shmem_offset_rowwise]);
 #pragma unroll
             for (int e = 0; e < PACK_SIZE / 2; ++e) {
-              ptx::abs_max_2x(thread_amax_2x, thread_amax_2x, in_IType[w].data.elt[e]);
+              abs_max_2x(thread_amax_2x, thread_amax_2x, in_IType[w].data.elt[e]);
             }
           }
           block_amax =
@@ -468,8 +468,8 @@ __global__ void __launch_bounds__(THREADS_NUM)
             const size_t swizzled_thread_idx = thread_offset_X_rowwise + swizzled_group_idx;
             const size_t shmem_offset_rowwise = shmem_offset_base_rowwise_in + swizzled_thread_idx;
 
-            Vec<IType, PACK_SIZE> in;
-            Vec<IType, PACK_SIZE> act_in;
+            vector::Vec<IType, PACK_SIZE> in;
+            vector::Vec<IType, PACK_SIZE> act_in;
 
             in.load_from(&in_sh[shmem_offset_rowwise]);
 #pragma unroll
@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
         }
 
         // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
+        constexpr float float_max = TypeExtrema<float>::max;
         const float block_scale_inverse = fminf(
             1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_rowwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
@@ -528,7 +528,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 // 3. Scale elements
 #pragma unroll
         for (int w = 0; w < WAVES; ++w) {
-          Vec<fp4e2m1x4, PACK_SIZE / 4> out;
+          vecort::Vec<fp4e2m1x4, PACK_SIZE / 4> out;
 #pragma unroll
           for (int e = 0; e < PACK_SIZE / 4; ++e) {
             //const uint32_t rbits = get_rbits(rng, random_uint4, rnd_idx);
@@ -575,12 +575,12 @@ __global__ void __launch_bounds__(THREADS_NUM)
       const size_t global_offset_Y_t = block_offset_Y_t;
       const size_t global_offset_X_t = block_offset_X_t + stage_offset_Y;
 
-      ptx::cp_async_bulk_tensor_2d_shared_to_global(
+      cp_async_bulk_tensor_2d_shared_to_global(
           reinterpret_cast<const uint64_t *>(&tensor_map_output), global_offset_X, global_offset_Y,
           reinterpret_cast<uint64_t *>(&out_data_sh[buff_offset_out]));
 
       if constexpr (RETURN_TRANSPOSE) {
-        ptx::cp_async_bulk_tensor_2d_shared_to_global(
+        cp_async_bulk_tensor_2d_shared_to_global(
             reinterpret_cast<const uint64_t *>(&tensor_map_output_t), global_offset_X_t,
             global_offset_Y_t, reinterpret_cast<uint64_t *>(&out_t_data_sh[buff_offset_out_t]));
       }
@@ -592,7 +592,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   // Vectorized store scaling factors through SHMEM
   if (RETURN_TRANSPOSE && colwise_scale_is_within_bounds_Y) {
-    using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
+    using ScalesVec = vector::Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
     const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
     ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(&out_colwise_scales_sh[scale_idx_sh]);
     const size_t scale_idx_global = scales_offset_Y_t * scale_stride_t + scales_offset_X_t;

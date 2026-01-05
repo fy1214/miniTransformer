@@ -90,18 +90,6 @@ __forceinline__ __device__ void destroy_barriers(uint64_t *mbar, const bool is_m
 
 
 // ####################################################################################################
-
-template <bool USE_STOCHASTIC_ROUNDING>
-__device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x(const uint64_t in_4x,
-                                                            const float2 scale,
-                                                            const uint32_t rbits) {
-  if constexpr (USE_STOCHASTIC_ROUNDING) {
-    return mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(in_4x, scale, rbits);
-  } else {
-    return mul_cvt_bf16_to_fp4_4x_with_rn(in_4x, scale, rbits);
-  }
-}
-
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
@@ -189,13 +177,13 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_rn(const uint64
 }
 
 template <bool USE_STOCHASTIC_ROUNDING>
-__device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x(const float2 in01, const float2 in23,
+__device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x(const uint64_t in_4x,
                                                             const float2 scale,
                                                             const uint32_t rbits) {
   if constexpr (USE_STOCHASTIC_ROUNDING) {
-    return mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(in01, in23, scale, rbits);
+    return mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(in_4x, scale, rbits);
   } else {
-    return mul_cvt_fp32_to_fp4_4x_with_rn(in01, in23, scale, rbits);
+    return mul_cvt_bf16_to_fp4_4x_with_rn(in_4x, scale, rbits);
   }
 }
 
@@ -276,6 +264,16 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_rn(const float2
   return reinterpret_cast<fp4e2m1x4 *>(&out_4x)[0];
 }
 
+template <bool USE_STOCHASTIC_ROUNDING>
+__device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x(const float2 in01, const float2 in23,
+                                                            const float2 scale,
+                                                            const uint32_t rbits) {
+  if constexpr (USE_STOCHASTIC_ROUNDING) {
+    return mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(in01, in23, scale, rbits);
+  } else {
+    return mul_cvt_fp32_to_fp4_4x_with_rn(in01, in23, scale, rbits);
+  }
+}
 
 __device__ __forceinline__ void abs_max_2x(bf16x2 &dst, const bf16x2 &p1, const bf16x2 &p2) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)

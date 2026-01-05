@@ -98,7 +98,7 @@ void create_2D_tensor_map(CUtensorMap &tensorMap, const at::Tensor &tensor,
   uint32_t elemStride[rank] = {1, 1};
 
   const CUtensorMapDataType tensorDataType = get_CUtensorMapDataType(tensor.scalar_type());
-  void *dataPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(tensor.data()) +
+  void *dataPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(tensor.data_ptr()) +
                                            (offset_elems * type_num_bits) / 8);
 
   TORCH_CHECK(is_aligned_ptr(dataPtr, TMA_GMEM_ALIGNMENT),

@@ -22,27 +22,53 @@
 #include <stdexcept>
 #include <string>
 
-#include "../util/string.h"
+/* \brief Convert container to string */
+template <typename T, typename = typename std::enable_if<!std::is_arithmetic<T>::value>::type,
+          typename = decltype(std::declval<T>().begin())>
+inline std::string to_string_like(const T &container) {
+  std::string str;
+  str.reserve(1024);  // Assume strings are <1 KB
+  str += "(";
+  bool first = true;
+  for (const auto &val : container) {
+    if (!first) {
+      str += ",";
+    }
+    str += to_string_like(val);
+    first = false;
+  }
+  str += ")";
+  return str;
+}
+
+/*! \brief Convert arguments to strings and concatenate */
+template <typename... Ts>
+inline std::string concat_strings(const Ts &...args) {
+  std::string str;
+  str.reserve(1024);  // Assume strings are <1 KB
+  (..., (str += to_string_like(args)));
+  return str;
+}
 
 #define NVTE_WARN(...)                                            \
   do {                                                            \
-    std::cerr << ::transformer_engine::concat_strings(            \
+    std::cerr << concat_strings(            \
         __FILE__ ":", __LINE__, " in function ", __func__, ": ",  \
-        ::transformer_engine::concat_strings(__VA_ARGS__), "\n"); \
+        concat_strings(__VA_ARGS__), "\n"); \
   } while (false)
 
 #define NVTE_ERROR(...)                                              \
   do {                                                               \
-    throw ::std::runtime_error(::transformer_engine::concat_strings( \
+    throw ::std::runtime_error(concat_strings( \
         __FILE__ ":", __LINE__, " in function ", __func__, ": ",     \
-        ::transformer_engine::concat_strings(__VA_ARGS__)));         \
+        concat_strings(__VA_ARGS__)));         \
   } while (false)
 
 #define NVTE_CHECK(expr, ...)                                        \
   do {                                                               \
     if (!(expr)) {                                                   \
       NVTE_ERROR("Assertion failed: " #expr ". ",                    \
-                 ::transformer_engine::concat_strings(__VA_ARGS__)); \
+                 concat_strings(__VA_ARGS__)); \
     }                                                                \
   } while (false)
 

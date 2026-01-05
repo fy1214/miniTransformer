@@ -101,6 +101,19 @@ def setup_extensions() -> setuptools.Extension:
     extensions_dir = root_dir / "csrc"
     sources = list(glob.glob(os.path.join(extensions_dir, "**/*.cpp"), recursive=True))
     sources += list(glob.glob(os.path.join(extensions_dir, "**/*.cu"), recursive=True))
+
+    # 要排除的目录
+    exclude_dir = "ops/fp4/gemm"
+
+    # 过滤函数
+    def filter_exclude(files, exclude_pattern):
+        return [
+            f for f in files 
+            if exclude_pattern not in os.path.relpath(f, extensions_dir)
+        ]
+
+    sources = filter_exclude(sources, exclude_dir)
+
     include_dirs = [
         str(extensions_dir),
         # cutlass include directories

@@ -27,11 +27,11 @@ def check_quantization_nvfp4_versus_reference(
     # Input
     x = torch.randn((M, N), dtype=x_dtype, device=device)
 
-    qx = torch.randn((M, N // 2), dtype=nvfp4_output_t, device=device)
-    sx = torch.randn((M, N // 16), dtype=torch.bfloat16, device=device).to(nvfp4_scale_t)
+    qx = torch.empty((M, N // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
+    sx = torch.empty((M, N // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
     if return_transpose:
-        qx_t = torch.randn((N, M // 2), dtype=nvfp4_output_t, device=device)
-        sx_t = torch.randn((N, M // 16), dtype=torch.bfloat16, device=device).to(nvfp4_scale_t)
+        qx_t = torch.empty((N, M // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
+        sx_t = torch.empty((N, M // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
     else:
         qx_t = None
         sx_t = None

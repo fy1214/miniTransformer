@@ -1,8 +1,8 @@
 import torch
 import fp4_gemm
 
-nvfp4_scale_t = float8_e4m3fn
-nvfp4_output_t = torch.unit8
+nvfp4_output_t = torch.uint8
+nvfp4_scale_t = torch.float8_e4m3fn
 
 def unpack_fp4(x: torch.Tensor) -> torch.Tensor:
     repeated = x.repeat_interleave(2, dim=1)
@@ -28,10 +28,10 @@ def check_quantization_nvfp4_versus_reference(
     x = torch.randn((M, N), dtype=x_dtype, device=device)
 
     qx = torch.randn((M, N // 2), dtype=nvfp4_output_t, device=device)
-    sx = torch.randn((M, N // 16), dtype=nvfp4_scale_t, device=device)
+    sx = torch.randn((M, N // 16), dtype=torch.bfloat16, device=device).to(nvfp4_scale_t)
     if return_transpose:
         qx_t = torch.randn((N, M // 2), dtype=nvfp4_output_t, device=device)
-        sx_t = torch.randn((N, M // 16), dtype=nvfp4_scale_t, device=device)
+        sx_t = torch.randn((N, M // 16), dtype=torch.bfloat16, device=device).to(nvfp4_scale_t)
     else:
         qx_t = None
         sx_t = None

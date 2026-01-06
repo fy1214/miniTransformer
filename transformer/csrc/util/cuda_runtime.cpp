@@ -1,5 +1,5 @@
 
-
+/** 
 int sm_count(int device_id) {
   static std::vector<int> cache(num_devices(), -1);
   static std::vector<std::once_flag> flags(num_devices());
@@ -15,3 +15,4 @@ int sm_count(int device_id) {
   std::call_once(flags[device_id], init);
   return cache[device_id];
 }
+**/

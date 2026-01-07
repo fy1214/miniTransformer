@@ -287,6 +287,7 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.quantize_op = quantize_op
             ctx.is_first_microbatch = is_first_microbatch
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.activation_dtype = activation_dtype
 
             qx_t, sx_t, qw_t, sw_t = (
                 qresult_x.data_t,
@@ -401,11 +402,7 @@ class _QuantizedLinear(torch.autograd.Function):
         else:
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
-        out_dtype_wgrad = (
-            dy.dtype
-            if ctx.qlinear_params.mm_wgrad.out_dtype is None
-            else ctx.qlinear_params.mm_wgrad.out_dtype
-        )
+        out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad
         wgrad = ctx.quantize_op.qgemm(
             qdy_t,

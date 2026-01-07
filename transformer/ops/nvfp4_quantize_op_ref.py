@@ -553,12 +553,12 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         # accumulation happens at epilogue in float32
         if accumulate:
             assert out is not None, "Output tensor must be provided for accumulation."
-            y += out.to(torch.float32)
+            out = (out.to(torch.float32) + y).to(out_dtype)
+            return out
         else:
             assert out is None, "Output tensor should be None when accumulate is False."
-
-        y = y.to(out_dtype)
-        return y
+            y = y.to(out_dtype)
+            return y
 
     def qgemm(
         self,
@@ -576,6 +576,9 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
     ) -> torch.Tensor:
+        if out is not None:
+            assert out_dtype == out.dtype, "Output dtype mismatch."
+
         return self._ref_qgemm(
             qx,
             qw,

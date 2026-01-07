@@ -5,16 +5,16 @@ from transformer.module.linear import Linear
 def check_linear_init():
     in_features = 1024
     out_features = 4096
-    sequence_parallel = False,
-    fuse_wgrad_accumulation = True,
-    tp_group = None,
-    tp_size = 1,
-    get_rng_state_tracker = None,
-    rng_tracker_name = None,
-    init_method = None,
-    bias = False,
-    return_bias = False,
-    params_dtype = None,
+    sequence_parallel = False
+    fuse_wgrad_accumulation = True
+    tp_group = None
+    tp_size = 1
+    get_rng_state_tracker = None
+    rng_tracker_name = None
+    init_method = None
+    bias = False
+    return_bias = False
+    params_dtype = torch.bfloat16
     parallel_mode = 'column'
     parameters_split = None
     device = "cuda"

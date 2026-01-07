@@ -84,17 +84,6 @@ class QLinearParams:
 
     def __post_init__(self):
         if self.quantize_op is not None:
-            # If quantize_op is provided, ensure that scaling types are supported.
-            supported_scaling_types = self.quantize_op.supported_scaling_types
-            assert (
-                self.x_params.scaling_type in supported_scaling_types
-            ), "Unsupported scaling type."
-            assert (
-                self.w_params.scaling_type in supported_scaling_types
-            ), "Unsupported scaling type."
-            assert (
-                self.g_params.scaling_type in supported_scaling_types
-            ), "Unsupported scaling type"
             for v in self.overrides_for_layer_name.values():
                 assert (
                     len(v.overrides_for_layer_name) == 0

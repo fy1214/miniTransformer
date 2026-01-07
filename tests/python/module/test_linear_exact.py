@@ -15,14 +15,14 @@ def check_linear_init():
     bias = False,
     return_bias = False,
     params_dtype = None,
-    parallel_mode = 'column',
-    parameters_split = None,
-    device = "cuda",
-    ub_overlap_rs = False,
-    ub_overlap_ag = False,
-    ub_name = None,
+    parallel_mode = 'column'
+    parameters_split = None
+    device = "cuda"
+    ub_overlap_rs = False
+    ub_overlap_ag = False
+    ub_name = None
     # JQ: hybrid addtional args
-    layer_number = 0,
+    layer_number = 0
     qlinear_params = get_qlinear_params_from_predefined(QuantizeRecipe.FP4_SUB_CHANNEL_REF)
 
     linear = Linear(

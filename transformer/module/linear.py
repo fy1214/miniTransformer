@@ -2,18 +2,19 @@ import logging
 import torch
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from transformer_engine.module import config
-from transformer_engine.ops import quantization
-from transformer_engine import ops
-from transformer_engine.module.base import LayerLinearBaseModule
-from transformer_engine.distributed.distributed import (
+from transformer.module._common import noop_cat
+from transformer.module.base import LayerLinearBaseModule
+import transformer.module.config as config
+
+from transformer.distributed.distributed import (
     allreduce,
     get_distributed_rank,
     gather_along_first_dim,
     reduce_scatter_along_first_dim,
     set_tensor_model_parallel_attributes,
 )
-from transformer_engine.utils.utils import (
+from transformer.ops import quantization
+from transformer.utils.utils import (
     is_rank_0,
     init_method_constant,
     cast_if_needed,
@@ -234,28 +235,30 @@ class _QuantizedLinear(torch.autograd.Function):
             qlinear_params.x_params,
             transpose_required=is_grad_enabled,
             allgather_required=gather_required,
-            allgather_fp8=qlinear_params.allgather_fp8,
+            allgather_quantize=qlinear_params.allgather_quantize,
             tp_group=tp_group,
         )
         qx, sx = qresult_x.data, qresult_x.scale
 
         # Quantize w only for is_first_microbatch is True or None
-        update_fp8_weights = is_first_microbatch or is_first_microbatch is None
-        if update_fp8_weights:
+        update_quantize_weights = is_first_microbatch or is_first_microbatch is None
+        if update_quantize_weights:
             # Quantize w (with optional transpose)
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=is_grad_enabled
             )
             qw, sw = qresult_w.data, qresult_w.scale
-            # save FP8 weight cache between microbatches
+            # save quantized weight cache between microbatches
             weight_qresult_cache.data = qresult_w.data
             weight_qresult_cache.scale = qresult_w.scale
             weight_qresult_cache.data_t = qresult_w.data_t
             weight_qresult_cache.scale_t = qresult_w.scale_t
+            weight_qresult_cache.global_amax_row = qresult_w.global_amax_row
+            weight_qresult_cache.global_amax_col = qresult_w.global_amax_col
         else:
             qresult_w = weight_qresult_cache.to_qresult()
             qw, sw = qresult_w.data, qresult_w.scale
-            assert qw is not None, "FP8 weight cache should not be None"
+            assert qw is not None, "quantized weight cache should not be None"
 
         # Forward pass GEMM
         y = quantize_op.qgemm(
@@ -348,7 +351,7 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.qlinear_params.g_params,
             transpose_required=True,
             allgather_required=gather_required,
-            allgather_fp8=ctx.qlinear_params.allgather_fp8,
+            allgather_quantize=ctx.qlinear_params.allgather_quantize,
             tp_group=ctx.tp_group,
         )
         qdy, sdy, qdy_t, sdy_t = (
@@ -450,20 +453,20 @@ class _QuantizedLinear(torch.autograd.Function):
         qparams: quantization.QParams,
         transpose_required: bool,
         allgather_required: bool,
-        allgather_fp8: bool,
+        allgather_quantize: bool,
         tp_group: Optional[torch.distributed.ProcessGroup],
     ):
         """
         Quantize the input with optional AllGather.
         If AllGather is required, it support two paths:
-            1) Quantize the local tensor shard (with amax reduction if needed), then AllGather in FP8
+            1) Quantize the local tensor shard (with amax reduction if needed), then AllGather in quantize type
             2) AllGather in BF16, then quantize the full tensor
         If AllGather is not required, it will just quantize the local tensor shard.
         """
         if allgather_required:
-            # 1) AllGather in FP8
-            if allgather_fp8:
-                assert quantize_op.supports_allgather_fp8
+            # 1) AllGather in quantize
+            if allgather_quantize:
+                assert quantize_op.supports_allgather
                 assert tp_group is not None
                 qresult_x = quantize_op.quantize(
                     x,
@@ -473,8 +476,6 @@ class _QuantizedLinear(torch.autograd.Function):
                     tp_group=tp_group,
                 )
                 qresult_x.data, _ = gather_along_first_dim(qresult_x.data, tp_group)
-                if transpose_required:
-                    qresult_x = quantize_op.transpose_qresult(qresult_x)
             # 2) AllGather in BF16
             else:
                 assert tp_group is not None
@@ -886,11 +887,11 @@ class Linear(LayerLinearBaseModule):
         ), "weight_qresult_cache must be QuantizeResultCache"
         assert fp8_output is False, "FP8 output is not supported yet"
 
-        weight_tensor = ops.noop_cat(
+        weight_tensor = noop_cat(
             [getattr(self, name) for name in self.weight_names]
         )
         if self.use_bias:
-            bias_tensor = ops.noop_cat(
+            bias_tensor = noop_cat(
                 [getattr(self, name) for name in self.bias_names],
             )
         else:

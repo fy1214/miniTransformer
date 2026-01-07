@@ -5,13 +5,23 @@ import os
 import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
-from transformer_engine.utils import ops
-from transformer_engine.utils import quantization
-from transformer_engine.utils import quantization_subchannel_block_hybrid
-from .quantization import QParams, MMParams, ScalingType
+from transformer.ops.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
+from transformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from ..ops.quantization import QParams, MMParams
+from transformer.ops import quantization
 
 logger = logging.getLogger(__name__)
 
+@enum.unique
+class QuantizeType(enum.Enum):
+    """quantization type for linear layers."""
+
+    # Non-quantize
+    NONE = "none"
+    FP8 = "fp8"
+    MXFP8 = "mxfp8"
+    INT4 = "int4"
+    NVFP4 = "nvfp4"
 
 def should_switch_to_hybrid_linear():
     # Switch to kitchen linear if QAT_PARAMS is set
@@ -48,7 +58,8 @@ class QLinearParams:
     quantize_op: Custom quantize op implementation. If not provided, automatically determine QuantizeOp based on scaling_type.
     """
 
-    quantize: bool = True  # JQ: fp8 or bf16
+    quantize: bool = False  # fp8 / int4 / fp4
+    quantize_type: QuantizeType = None
 
     x_params: QParams = QParams()
     w_params: QParams = QParams()
@@ -58,10 +69,10 @@ class QLinearParams:
     mm_dgrad: MMParams = MMParams()
     mm_wgrad: MMParams = MMParams()
 
-    allgather_fp8: bool = False  # JQ: needed
+    allgather_quantize: bool = False
     memory_saving: bool = False
 
-    quantize_op: Optional[quantization.QuantizeOpBase] = None  # JQ: needed
+    quantize_op: Optional[quantization.QuantizeOpBase] = None
     # NOTE: We currently use ub_name for layer name in linear.
     # There is not much variation so we only know type of linear:
     # i.e. qkv, proj, fc1, fc2
@@ -105,26 +116,39 @@ class QuantizeRecipe(enum.Enum):
 
     # Non-quantize
     NON_QUANTIZE = "non_quantize"
-    FP4_SUB_CHANNEL_CUTLASS = "fp4_subchannel_scaling"
+    INT4_SUB_CHANNEL = "int4_subchannel_scaling"
+    FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
+    FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
 
 
 def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     """Get quantization parameters for linear layer based on recipe."""
     if recipe == QuantizeRecipe.NON_QUANTIZE:
         # Non-quantize (bf16)
-        return QLinearParams(quantize=False)
-    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CUTLASS:
-        _scaling_type = ScalingType.VECTOR_TILED_X_AND_G_BLOCK_TILED_W
+        return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL:
         # Split accumulator for all gemms.
         # fmt: off
         return QLinearParams(
-            x_params=QParams(quant_dtype=torch.float8_e4m3fn, scaling_type=_scaling_type, quant_tile_shape=(1, 16)),
-            w_params=QParams(quant_dtype=torch.float8_e4m3fn, scaling_type=_scaling_type, quant_tile_shape=(16, 16)),
-            g_params=QParams(quant_dtype=torch.float8_e4m3fn, scaling_type=_scaling_type, quant_tile_shape=(1, 16)),
-            quantize_op=quantization_subchannel_block_hybrid.HybridBlockAndVectorTiledQuantizeOp(ops.Backend.CUTLASS),
-            allgather_fp8=False,
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            w_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(16, 16), with_2d_quantization=True),
+            g_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            quantize_op=Nvfp4TiledQuantizeOp(),
+            allgather_quantize=False,
         )
         # fmt: on
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            w_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(16, 16), with_2d_quantization=True),
+            g_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            quantize_op=Nvfp4TiledQuantizeRefOp(),
+            allgather_quantize=False,
+        )
     else:
         raise ValueError(f"Unsupported quantize recipe: {recipe}")
 
@@ -138,92 +162,15 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
 
     if qat_params_idx == 1:
         return get_qlinear_params_from_predefined(QuantizeRecipe.NON_QUANTIZE)
-    if qat_params_idx == 4:
+    if qat_params_idx == 2:
         # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_CUTLASS
+            QuantizeRecipe.INT4_SUB_CHANNEL
         )
-    if qat_params_idx == 5:
+    if qat_params_idx == 3:
 		# default pow_2_scales=False
         return get_qlinear_params_from_predefined(
-			QuantizeRecipe.FP8_SUB_CHANNEL_CUBLAS
+			QuantizeRecipe.FP4_SUB_CHANNEL
 		)
-    def recipe_5001():
-        recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_CUBLAS
-        )
-        # NOTE: Replicates the choice to use power two scales based on DeepSeekV3
-        # dataflow diagram in tensors were stored quantized and double quantized
-        # to obtain the transpose. Kitchen is not double quantizing, but this
-        # recipe can apply the scale factor modification to match.
-        proj_and_fc1_recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_CUBLAS
-        )
-        proj_and_fc1_recipe.x_params = dataclasses.replace(
-            proj_and_fc1_recipe.x_params, pow_2_scales=True
-        )
-        fc2_recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_CUBLAS
-        )
-        fc2_recipe.g_params = dataclasses.replace(
-            fc2_recipe.g_params, pow_2_scales=True
-        )
-        recipe.overrides_for_layer_name = {
-            "proj": proj_and_fc1_recipe,
-            "fc1": proj_and_fc1_recipe,
-            "fc2": fc2_recipe,
-        }
-        return recipe
 
-    if qat_params_idx == 5001:
-        recipe = recipe_5001()
-        return recipe
-    if qat_params_idx == 5002:
-        recipe = recipe_5001()
-        # Same as 5001, but with memory saving mode.
-        recipe.memory_saving = True
-        for _, overrided_recipe in recipe.overrides_for_layer_name.items():
-            overrided_recipe.memory_saving = True
-        return recipe
-    if qat_params_idx == 5003:
-        # Same as 5001, but with pow_2_scales on all layers.
-        recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_CUBLAS
-        )
-        recipe.x_params = dataclasses.replace(recipe.x_params, pow_2_scales=True)
-        recipe.w_params = dataclasses.replace(recipe.w_params, pow_2_scales=True)
-        recipe.g_params = dataclasses.replace(recipe.g_params, pow_2_scales=True)
-        return recipe
-    if qat_params_idx == 6:
-        # default pow_2_scales=False
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_DEEPGEMM
-        )
-    if qat_params_idx == 6001:
-        recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_DEEPGEMM
-        )
-        # NOTE: Replicates the choice to use power two scales based on DeepSeekV3
-        # dataflow diagram in tensors were stored quantized and double quantized
-        # to obtain the transpose. Kitchen is not double quantizing, but this
-        # recipe can apply the scale factor modification to match.
-        proj_and_fc1_recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_DEEPGEMM
-        )
-        proj_and_fc1_recipe.x_params = dataclasses.replace(
-            proj_and_fc1_recipe.x_params, pow_2_scales=True
-        )
-        fc2_recipe = get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP8_SUB_CHANNEL_DEEPGEMM
-        )
-        fc2_recipe.g_params = dataclasses.replace(
-            fc2_recipe.g_params, pow_2_scales=True
-        )
-        recipe.overrides_for_layer_name = {
-            "proj": proj_and_fc1_recipe,
-            "fc1": proj_and_fc1_recipe,
-            "fc2": fc2_recipe,
-        }
-        return recipe
-    else:
-        raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")
+    raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

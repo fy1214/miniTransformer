@@ -1,6 +1,7 @@
 import torch
 from typing import Any, Optional, Tuple
-from .utils import FP8_DTYPES
+
+from transformer.utils.utils import FP8_DTYPES
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "tensor_model_parallel": False,

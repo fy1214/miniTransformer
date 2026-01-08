@@ -546,7 +546,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 qx_block, qw_block, torch.float32, is_b_transposed=True
             )
 
-        if not self.pow_2_scales and K > 0:
+        if not pow_2_scales and K > 0:
             # only apply global scale for NVFP4 and non-empty cases
             y = alpha * y
 

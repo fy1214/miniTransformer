@@ -293,11 +293,13 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.activation_dtype = activation_dtype
 
-            qx_t, sx_t, qw_t, sw_t = (
+            qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col = (
                 qresult_x.data_t,
                 qresult_x.scale_t,
+                qresult_x.global_amax_col,
                 qresult_w.data_t,
                 qresult_w.scale_t,
+                qresult_w.global_amax_col,
             )
 
             # If memory saving is enabled, we only save a shard of the qx_t tensor.
@@ -310,8 +312,10 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.save_for_backward(
                 qx_t,
                 sx_t,
+                qx_global_amax_col,
                 qw_t,
                 sw_t,
+                qw_global_amax_col,
                 w,
             )
 
@@ -330,7 +334,7 @@ class _QuantizedLinear(torch.autograd.Function):
         # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        (qx_t, sx_t, qw_t, sw_t, w) = ctx.saved_tensors
+        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, w) = ctx.saved_tensors
 
         assert qw_t is not None and sw_t is not None
         assert qx_t is not None and sx_t is not None
@@ -359,11 +363,13 @@ class _QuantizedLinear(torch.autograd.Function):
             allgather_quantize=ctx.qlinear_params.allgather_quantize,
             tp_group=ctx.tp_group,
         )
-        qdy, sdy, qdy_t, sdy_t = (
+        qdy, sdy, qdy_t, sdy_t, qdy_global_amax_row, qdy_global_amax_col = (
             qresult_dy.data,
             qresult_dy.scale,
             qresult_dy.data_t,
             qresult_dy.scale_t,
+            qresult_dy.global_amax_row,
+            qresult_dy.global_amax_col,
         )
 
         # If memory saving is enabled, we need to AllGather the full
@@ -384,6 +390,10 @@ class _QuantizedLinear(torch.autograd.Function):
             sdy,
             sw_t,
             None,
+            None,
+            accumulate=False,
+            global_amax_qx=qdy_global_amax_row,
+            global_amax_qw=qw_global_amax_col,
             qparams_x=ctx.qlinear_params.g_params,
             qparams_w=ctx.qlinear_params.w_params,
         )
@@ -418,6 +428,8 @@ class _QuantizedLinear(torch.autograd.Function):
             None,
             out=w.main_grad if ctx.fuse_wgrad_accumulation else None,  # main_grad is fp32 dtype
             accumulate=accumulate_wgrad_into_param_main_grad,
+            global_amax_qx=qdy_global_amax_col,
+            global_amax_qw=qx_global_amax_col,
             qparams_x=ctx.qlinear_params.g_params,
             qparams_w=ctx.qlinear_params.x_params,
         )

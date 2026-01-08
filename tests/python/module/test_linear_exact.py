@@ -63,7 +63,18 @@ class TestLinearExact:
         out = linear(inp, is_first_microbatch=True, fp8_output=False, inp_meta=None)
 
         print("Linear forward pass successful.")
+    
+    def test_linear_backward(self):
+        linear = self.build_linear(1024, 4096)
+        inp = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+        out = linear(inp, is_first_microbatch=True, fp8_output=False, inp_meta=None)
+
+        # Compute gradients
+        out.sum().backward()
+
+        print("Linear backward pass successful.")
 
 if __name__ == "__main__":
     test = TestLinearExact()
     test.test_linear_forward()
+    test.test_linear_backward()

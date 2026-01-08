@@ -238,7 +238,8 @@ class _QuantizedLinear(torch.autograd.Function):
             allgather_quantize=qlinear_params.allgather_quantize,
             tp_group=tp_group,
         )
-        qx, sx = qresult_x.data, qresult_x.scale
+
+        qx, sx, qx_global_amax_row = qresult_x.data, qresult_x.scale, qresult_x.global_amax_row
 
         # Quantize w only for is_first_microbatch is True or None
         update_quantize_weights = is_first_microbatch or is_first_microbatch is None
@@ -247,7 +248,7 @@ class _QuantizedLinear(torch.autograd.Function):
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=is_grad_enabled
             )
-            qw, sw = qresult_w.data, qresult_w.scale
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.global_amax_row
             # save quantized weight cache between microbatches
             weight_qresult_cache.data = qresult_w.data
             weight_qresult_cache.scale = qresult_w.scale
@@ -257,7 +258,7 @@ class _QuantizedLinear(torch.autograd.Function):
             weight_qresult_cache.global_amax_col = qresult_w.global_amax_col
         else:
             qresult_w = weight_qresult_cache.to_qresult()
-            qw, sw = qresult_w.data, qresult_w.scale
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.global_amax_row
             assert qw is not None, "quantized weight cache should not be None"
 
         # Forward pass GEMM
@@ -269,6 +270,9 @@ class _QuantizedLinear(torch.autograd.Function):
             sx,
             sw,
             bias,
+            accumulate=False,
+            global_amax_qx=qx_global_amax_row,
+            global_amax_qw=qw_global_amax_row,
             qparams_x=qlinear_params.x_params,
             qparams_w=qlinear_params.w_params,
         )

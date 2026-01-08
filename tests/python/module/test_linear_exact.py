@@ -1,6 +1,6 @@
 import torch
-from transformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
-from transformer.module.linear import Linear
+from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
+from miniTransformer.module.linear import Linear
 
 class TestLinearExact:
 

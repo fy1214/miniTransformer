@@ -13,7 +13,7 @@
 #include <nvrtc.h>
 
 #include "nccl.h"
-#include <cublasmp.h>
+// #include <cublasmp.h>
 
 #include <iostream>
 #include <stdexcept>

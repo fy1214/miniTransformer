@@ -2,19 +2,19 @@ import logging
 import torch
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from transformer.module._common import noop_cat
-from transformer.module.base import LayerLinearBaseModule
-import transformer.module.config as config
+from miniTransformer.module._common import noop_cat
+from miniTransformer.module.base import LayerLinearBaseModule
+import miniTransformer.module.config as config
 
-from transformer.distributed.distributed import (
+from miniTransformer.distributed.distributed import (
     allreduce,
     get_distributed_rank,
     gather_along_first_dim,
     reduce_scatter_along_first_dim,
     set_tensor_model_parallel_attributes,
 )
-from transformer.ops import quantization
-from transformer.utils.utils import (
+from miniTransformer.ops import quantization
+from miniTransformer.utils.utils import (
     is_rank_0,
     init_method_constant,
     cast_if_needed,

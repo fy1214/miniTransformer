@@ -2,8 +2,7 @@ import math
 import torch
 import fp4_gemm
 from typing import Optional
-from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
-from transformer.ops import quantization
+from miniTransformer.ops import quantization
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn

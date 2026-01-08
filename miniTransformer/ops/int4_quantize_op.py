@@ -1,7 +1,7 @@
 import torch
 from typing import Optional
-from transformer.ops import quantization
-from transformer.utils import utils
+from miniTransformer.ops import quantization
+from miniTransformer.utils import utils
 
 
 class Int4TiledQuantizeOp(quantization.QuantizeOpBase):

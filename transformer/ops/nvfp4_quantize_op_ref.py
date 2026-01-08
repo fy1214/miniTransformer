@@ -469,9 +469,6 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         high_precision_x = cast_from_fp4x2(qx, out_dtype)
         high_precision_w = cast_from_fp4x2(qw, out_dtype)
 
-        print(f'high_precision_x:{high_precision_x.shape}')
-        print(f'high_precision_w:{high_precision_w.shape}')
-
         if pow_2_scales:
 
             if sx.dtype == torch.uint8:

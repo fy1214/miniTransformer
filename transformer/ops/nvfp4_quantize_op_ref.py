@@ -469,6 +469,9 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         high_precision_x = cast_from_fp4x2(qx, out_dtype)
         high_precision_w = cast_from_fp4x2(qw, out_dtype)
 
+        print(f'high_precision_x:{high_precision_x.shape}')
+        print(f'high_precision_w:{high_precision_w.shape}')
+
         if pow_2_scales:
 
             if sx.dtype == torch.uint8:
@@ -509,7 +512,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         N, K_w = high_precision_w.shape
         assert K == K_w, "K dimension mismatch between qx and qw"
 
-        assert K % 32 == 0, "K dimension must be divisible by 32"
+        assert K % 32 == 0 if pow_2_scales else K % 16 == 0, "K dimension must be divisible by 16 or 32"
         assert N % 8 == 0, "N dimension must be divisible by 8"
 
         block_length = 32 if pow_2_scales else 16
@@ -556,7 +559,6 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             out = (out.to(torch.float32) + y).to(out_dtype)
             return out
         else:
-            assert out is None, "Output tensor should be None when accumulate is False."
             y = y.to(out_dtype)
             return y
 

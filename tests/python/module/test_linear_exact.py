@@ -66,7 +66,11 @@ class TestLinearExact:
     
     def test_linear_backward(self):
         linear = self.build_linear(1024, 4096)
-        inp = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+
+        # mock main_grad
+        linear.weight.main_grad = torch.zeros_like(linear.weight.data, dtype=torch.float32)
+        
+        inp = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
         out = linear(inp, is_first_microbatch=True, fp8_output=False, inp_meta=None)
 
         # Compute gradients

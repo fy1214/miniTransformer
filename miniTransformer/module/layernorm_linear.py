@@ -1,10 +1,8 @@
 import torch
 
 from typing import Callable, Dict, Optional, Tuple, Union, Any
-
-from transformer_engine.module import config
-from transformer_engine.module import quantization
-from transformer_engine.module.base import LayerLinearBaseModule
+from miniTransformer.module import config
+from miniTransformer.module.linear import Linear
 
 try:
     import transformer_engine as te  # type: ignore
@@ -81,7 +79,7 @@ def make_torch_norm(
         raise ValueError(f"Normalization type {normalization} is not supported.")
 
 
-class LayerNormLinear(LayerLinearBaseModule):
+class LayerNormLinear(Linear):
     r"""
     Applies layer normalization followed by linear transformation to the incoming data.
 

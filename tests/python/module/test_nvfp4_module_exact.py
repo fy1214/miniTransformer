@@ -585,4 +585,4 @@ def test_nvfp4_layernorm_linear_versus_reference(
     )
 
 if __name__ == '__main__':
-    test_nvfp4_linear_versus_reference(1024, 4096, False, torch.bfloat16, 1, True, True)
+    test_nvfp4_linear_versus_reference(1024, 4096, False, torch.bfloat16, 3, True, True)

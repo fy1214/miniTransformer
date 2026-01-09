@@ -233,7 +233,7 @@ class _QuantizedLinear(torch.autograd.Function):
             quantize_op,
             x,
             qlinear_params.x_params,
-            transpose_required=is_grad_enabled,
+            transpose_required=True,
             allgather_required=gather_required,
             allgather_quantize=qlinear_params.allgather_quantize,
             tp_group=tp_group,
@@ -246,7 +246,7 @@ class _QuantizedLinear(torch.autograd.Function):
         if update_quantize_weights:
             # Quantize w (with optional transpose)
             qresult_w = quantize_op.quantize(
-                w, qlinear_params.w_params, return_transpose=is_grad_enabled
+                w, qlinear_params.w_params, return_transpose=True
             )
             qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.global_amax_row
             # save quantized weight cache between microbatches

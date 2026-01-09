@@ -121,9 +121,27 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
-            x_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
-            w_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(16, 16), with_2d_quantization=True),
-            g_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            x_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(1, 16),  
+                with_2d_quantization=False,
+                with_rht=True
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(16, 16), 
+                with_2d_quantization=False,
+                with_rht=False
+            ),
+            g_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(1, 16),  
+                with_2d_quantization=False,
+                with_rht=True
+            ),
             quantize_op=Nvfp4TiledQuantizeOp(),
             allgather_quantize=False,
         )
@@ -132,9 +150,27 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
-            x_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
-            w_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(16, 16), with_2d_quantization=True),
-            g_params=QParams(output_dtype=torch.uint8, scaling_dtype=torch.float8_e4m3fn, quant_tile_shape=(1, 16),  with_2d_quantization=False),
+            x_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(1, 16),  
+                with_2d_quantization=False,
+                with_rht=True
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(16, 16), 
+                with_2d_quantization=False,
+                with_rht=False
+            ),
+            g_params=QParams(
+                output_dtype=torch.uint8, 
+                scaling_dtype=torch.float8_e4m3fn, 
+                quant_tile_shape=(1, 16),  
+                with_2d_quantization=False,
+                with_rht=True
+            ),
             quantize_op=Nvfp4TiledQuantizeRefOp(),
             allgather_quantize=False,
         )

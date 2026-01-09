@@ -248,7 +248,7 @@ class LayerNormLinear(Linear):
             use_te_norm = config.should_switch_to_hybrid_linear()
 
         if use_te_norm:
-            self.norm = make_te_norm(
+            self.layer_norm_weight = make_te_norm(
                 normalization,
                 in_features,
                 eps=eps,
@@ -258,7 +258,7 @@ class LayerNormLinear(Linear):
                 device=device,
             )
         else:
-            self.norm = make_torch_norm(
+            self.layer_norm_weight = make_torch_norm(
                 normalization,
                 in_features,
                 eps=eps,

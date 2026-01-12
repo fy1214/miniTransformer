@@ -16,4 +16,4 @@ class TELinear(Linear):
 3、train with slime or other script.
 
 
-![Qwen3-4B在fp4 ref op下loss曲线](/docs/images/image.jpg)
+![Qwen3-4B在fp4 ref op下loss曲线](doc/images/image.png)

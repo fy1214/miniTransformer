@@ -12,8 +12,8 @@
 #include <cstdint>
 
 #include "../../handle_manager.h"
-#include "../../../util/common.h"
-#include "../../swizzle.cuh"
+#include "../../../util/transformer_engine/common.h"
+#include "../../swizzle.h"
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
@@ -215,27 +215,6 @@ void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
                                            const float *amax_B, float *alpha_out) {
   // factor is defined in the enclosing namespace
   *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
-}
-
-at::Tensor swizzle_scaling_factors(
-  const at::Tensor& input,
-  bool rowwise
-) {
-  NVTE_CHECK(input.dim() >= 2, "Wrong ndims for swizzle input shape.");
-
-  std::vector<int64_t> output_size = {input.sizes()[0], input.sizes()[1]};
-  auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
-  auto out = at::empty(output_size, options);
-
-  // Launch kernel
-  swizzle_scaling_factors_kernel(
-    input, 
-    &out, 
-    at::cuda::getCurrentCUDAStream(), 
-    NVTE_NVFP4_1D_SCALING
-  );
-
-  return out;
 }
 
 void cublas_gemm( 

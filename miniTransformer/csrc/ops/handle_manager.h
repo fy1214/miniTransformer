@@ -1,4 +1,7 @@
+#include <vector>
 
+#include "../util/cuda_runtime.h"
+#include "../util/logging.h"
 
 template <typename Handle, void Create(Handle*), void Destroy(Handle) = nullptr>
 class HandleManager {

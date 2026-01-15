@@ -10,13 +10,9 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <mutex>
-#include <vector>
 
-#include "../../../util/common.h"
-#include "../../../util/logging.h"
-#include "../../../util/cuda_runtime.h"
 #include "../../handle_manager.h"
+#include "../../../util/common.h"
 #include "../../swizzle.cuh"
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {

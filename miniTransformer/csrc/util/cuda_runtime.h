@@ -6,6 +6,8 @@ namespace cuda {
 /* \brief Number of accessible devices */
 int num_devices();
 
+int current_device();
+
 int sm_arch(int device_id = -1);
 
 /* \brief Number of multiprocessors on a device

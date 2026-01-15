@@ -18,6 +18,20 @@ int num_devices() {
   return num_devices_;
 }
 
+int current_device() {
+  // Return 0 if CUDA context is not initialized
+  CUcontext context;
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuCtxGetCurrent, &context);
+  if (context == nullptr) {
+    return 0;
+  }
+
+  // Query device from CUDA runtime
+  int device_id;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device_id));
+  return device_id;
+}
+
 int sm_arch(int device_id) {
   static std::vector<int> cache(num_devices(), -1);
   static std::vector<std::once_flag> flags(num_devices());

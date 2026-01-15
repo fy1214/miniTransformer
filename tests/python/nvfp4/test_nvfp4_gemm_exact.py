@@ -51,8 +51,8 @@ def check_nvfp4_gemm_versus_reference(
     w = torch.randn((N, K), device="cuda").to(w_dtype)
     w_max = torch.max(torch.abs(w)).to(torch.float32).view(1)
 
-    qx, sx, qx_t, sx_t = quantize_transpose_nvfp4(x, False, False)
-    qw, sw, qw_t, sw_t = quantize_transpose_nvfp4(w, True, False)
+    qx, sx, qx_t, sx_t = quantize_transpose_nvfp4(x, False, True)
+    qw, sw, qw_t, sw_t = quantize_transpose_nvfp4(w, True, True)
 
     # Setup out tensor if accumulate is True
     if accumulate:

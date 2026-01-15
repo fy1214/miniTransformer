@@ -3,6 +3,7 @@
 
 #include "../util/logging.h"
 #include "../util/common.h"
+#include "../util/transformer_engine.h"
 
 constexpr int MXFP8_BLOCK_SIZE = 32;
 constexpr int NVFP4_BLOCK_SIZE = 16;

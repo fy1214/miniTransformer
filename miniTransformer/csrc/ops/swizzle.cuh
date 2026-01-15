@@ -109,10 +109,10 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
       input, output, M, K, original_M, original_K, blockIdx.x, blockIdx.y, gridDim.x, gridDim.y);
 }
 
-void swizzle_scaling_factors(const at::Tensor& input_scale, at::Tensor* output_scale, cudaStream_t stream, NVTEScalingMode scaling_mode) {
+void swizzle_scaling_factors_kernel(const at::Tensor& input_scale, at::Tensor* output_scale, cudaStream_t stream, NVTEScalingMode scaling_mode) {
   // Check scaling mode
   NVTE_CHECK(scaling_mode == NVTE_MXFP8_1D_SCALING || scaling_mode == NVTE_NVFP4_1D_SCALING,
-             "Input tensor has invalid scaling mode (", to_string(scaling_mode()), ").");
+             "Input tensor has invalid scaling mode (", to_string(scaling_mode), ").");
 
   // Deduce tensor dims
   int m{0}, k{0};

@@ -47,7 +47,8 @@ void cublas_gemm_impl(
   TORCH_CHECK((transB == CUBLAS_OP_T ? B0 : B1) == k,
              "GEMM inputs have incompatible dimensions (A is ", A0, "x", A1, ", B is ", B0, "x", B1,
              ")");
-  const int ldd = m;
+
+  int lda = k, ldb = k, ldc = m, ldd = m;
 
   // Return immediately if GEMM is trivial
   if (m <= 0 || n <= 0) {
@@ -69,10 +70,10 @@ void cublas_gemm_impl(
 
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
-  const cudaDataType_t D_type = CUDA_R_16BF;
-  if (inputB->dtype() == Half) {
+  cudaDataType_t D_type = CUDA_R_16BF;
+  if (inputB->dtype() == at::ScalarType::Half) {
     D_type = CUDA_R_16F;
-  } else if (inputB->dtype() == Float) {
+  } else if (inputB->dtype() == at::ScalarType::Float) {
     D_type = CUDA_R_32F;
   }
 
@@ -89,9 +90,9 @@ void cublas_gemm_impl(
   // Create matrix descriptors. Not setting any extra attributes.
   // First, set input and output type 
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, A_type, transA == CUBLAS_OP_N ? m : k,
-                                               transA == CUBLAS_OP_N ? k : m, param.lda));
+                                               transA == CUBLAS_OP_N ? k : m, lda));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, B_type, transB == CUBLAS_OP_N ? k : n,
-                                               transB == CUBLAS_OP_N ? n : k, param.ldb));
+                                               transB == CUBLAS_OP_N ? n : k, ldb));
 
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Ddesc, D_type, m, n, ldd));
 
@@ -127,8 +128,8 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
-  fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(A_scale->data());
-  fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(B_scale->data());
+  fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(A_scale->data_ptr());
+  fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(B_scale->data_ptr());
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                                                     &A_scale_inverse, sizeof(A_scale_inverse)));
@@ -162,10 +163,10 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
-  const auto A_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputA->data()));
-  const auto B_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputB->data()));
-  const auto C_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data()));
-  const auto D_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data()));
+  const auto A_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputA->data_ptr()));
+  const auto B_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputB->data_ptr()));
+  const auto C_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data_ptr()));
+  const auto D_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data_ptr()));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &A_alignment, sizeof(A_alignment)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
@@ -216,14 +217,23 @@ void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
   *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
 }
 
-at::Tensor swizzle_scaling_factors(at::Tensor& input,
-                                                  bool rowwise) {
+at::Tensor swizzle_scaling_factors(
+  at::Tensor& input,
+  bool rowwise
+) {
   NVTE_CHECK(input.shape().size() >= 2, "Wrong ndims for swizzle input shape.");
+
+  std::vector<int64_t> output_size = {input.sizes()[0], input.sizes()[1]};
   auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
-  auto out = at::empty(input.shape(), options);
+  auto out = at::empty(output_size, options);
 
   // Launch kernel
-  nvte_swizzle_scaling_factors(input, &out, at::cuda::getCurrentCUDAStream());
+  swizzle_scaling_factors_kernel(
+    input, 
+    &out, 
+    at::cuda::getCurrentCUDAStream(), 
+    NVTE_NVFP4_1D_SCALING
+  );
 
   return out;
 }
@@ -271,7 +281,7 @@ void cublas_gemm(
     D_tensor,
     transa ? CUBLAS_OP_T : CUBLAS_OP_N, 
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
-    workspace_tensor->data(), 
+    workspace_tensor->data_ptr(), 
     workspace_size, 
     static_cast<const void*>(&alpha), accumulate,
     use_split_accumulator, 

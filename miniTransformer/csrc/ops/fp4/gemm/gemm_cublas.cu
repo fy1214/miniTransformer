@@ -221,7 +221,7 @@ at::Tensor swizzle_scaling_factors(
   const at::Tensor& input,
   bool rowwise
 ) {
-  NVTE_CHECK(input.ndim() >= 2, "Wrong ndims for swizzle input shape.");
+  NVTE_CHECK(input.dim() >= 2, "Wrong ndims for swizzle input shape.");
 
   std::vector<int64_t> output_size = {input.sizes()[0], input.sizes()[1]};
   auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
@@ -275,14 +275,14 @@ void cublas_gemm(
 
   // Launch GEMM
   cublas_gemm_impl(
-    A,
-    A_scale_swizzle,
-    B,
-    B_scale_swizzle,
-    D,
+    &A,
+    &A_scale_swizzle,
+    &B,
+    &B_scale_swizzle,
+    &D,
     transa ? CUBLAS_OP_T : CUBLAS_OP_N,
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
-    workspace_tensor->data_ptr(), 
+    workspace_tensor.data_ptr(), 
     workspace_size, 
     static_cast<const void*>(&alpha), accumulate,
     use_split_accumulator, 

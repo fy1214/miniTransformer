@@ -25,7 +25,7 @@ enum NVTEScalingMode {
   NVTE_INVALID_SCALING = 100
 };
 
-std::string to_string(const NVTEScalingMode &mode) {
+inline std::string to_string(const NVTEScalingMode &mode) {
   switch (mode) {
     case NVTE_DELAYED_TENSOR_SCALING:
       return "NVTE_DELAYED_TENSOR_SCALING";

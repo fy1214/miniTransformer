@@ -7,90 +7,42 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
-#include <transformer_engine/gemm.h>
-#include <transformer_engine/multi_stream.h>
-#include <transformer_engine/recipe.h>
-#include <transformer_engine/transformer_engine.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <vector>
 
-#include "../common.h"
-#include "../util/cuda_runtime.h"
-#include "../util/handle_manager.h"
-#include "../util/logging.h"
-#include "../util/multi_stream.h"
-#include "./config.h"
-#include "./cutlass_grouped_gemm.cuh"
-
-namespace {
-
-/* Use CUDA const memory to store scalar 1 and 0 for cublas usage
-*/
-__device__ __constant__ float one_device;
-__device__ __constant__ float zero_device;
-
-inline float *GetScalarOne() {
-  static std::once_flag init_flag;
-  std::call_once(init_flag, []() {
-    float one = 1.0f;
-    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(one_device, &one, sizeof(float)));
-  });
-  // return address by cudaGetSymbolAddress
-  float *dev_ptr;
-  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), one_device));
-  return dev_ptr;
-}
-
-inline float *GetScalarZero() {
-  static std::once_flag init_flag;
-  std::call_once(init_flag, []() {
-    float zero = 0.0f;
-    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(zero_device, &zero, sizeof(float)));
-  });
-  // return address by cudaGetSymbolAddress
-  float *dev_ptr;
-  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), zero_device));
-  return dev_ptr;
-}
-
-__global__ __launch_bounds__(1) void set_float_kernel(float *ptr, float val) { *ptr = val; }
-
-uint32_t _getAlignment(uintptr_t address) {
-  // alignment are in bytes
-  uint32_t alignment = 256;
-  for (;; alignment /= 2) {
-    if (address % alignment == 0) {
-      return alignment;
-    }
-  }
-}
+#include "../../../util/common.h"
+#include "../../../util/logging.h"
+#include "../../../util/cuda_runtime.h"
+#include "../../handle_manager.h"
+#include "../../swizzle.cuh"
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
 }
 
-void cublas_gemm(const Tensor *inputA,
-                 const Tensor *A_scale,
-                 const Tensor *inputB,
-                 const Tensor *B_scale,
-                 Tensor *outputD,
-                 cublasOperation_t transA,
-                 cublasOperation_t transB, 
-                 void *workspace, 
-                 size_t workspaceSize,
-                 const void *alpha, 
-                 const void *beta, 
-                 bool use_split_accumulator, 
-                 int math_sm_count,
-                 cudaStream_t stream) {
+void cublas_gemm_impl(
+    const at::Tensor *inputA,
+    const at::Tensor *A_scale,
+    const at::Tensor *inputB,
+    const at::Tensor *B_scale,
+    at::Tensor *outputD,
+    cublasOperation_t transA,
+    cublasOperation_t transB, 
+    void *workspace, 
+    size_t workspaceSize,
+    const void *alpha, 
+    bool accumulate,
+    bool use_split_accumulator, 
+    int math_sm_count,
+    cudaStream_t stream) {
   // Tensor dims in row-major order
-  const int A0 = inputA->flat_first_dim();
-  const int A1 = inputA->flat_last_dim();
-  const int B0 = inputB->flat_first_dim();
-  const int B1 = inputB->flat_last_dim();
+  const int A0 = inputA->size(0);
+  const int A1 = inputA->size(1);
+  const int B0 = inputB->size(0);
+  const int B1 = inputB->size(1);
 
   // GEMM dims in column-major order
   const int m = transA == CUBLAS_OP_T ? A0 : A1;
@@ -127,6 +79,10 @@ void cublas_gemm(const Tensor *inputA,
   } else if (inputB->dtype() == Float) {
     D_type = CUDA_R_32F;
   }
+
+  float one = 1.0;
+  float zero = 0.0;
+  float beta = (accumulate) ? one : zero;
 
   // Use TF32 only for pure FP32 GEMM.
   cublasComputeType_t gemm_compute_type = CUBLAS_COMPUTE_32F;
@@ -237,12 +193,12 @@ void cublas_gemm(const Tensor *inputA,
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
-                                   inputA->data(),                      /* A */
-                                   Adesc, inputB->data(),               /* B */
-                                   Bdesc, beta,                  /* beta */
-                                   outputD->data(),                            /* C */
-                                   Cdesc, outputD->data(),                     /* D */
-                                   Ddesc, &heuristicResult.algo, /* algo */
+                                   inputA->data_ptr(), Adesc,           /* A */
+                                   inputB->data_ptr(), Bdesc,           /* B */ 
+                                   static_cast<const void*>(&beta),     /* beta */
+                                   outputD->data_ptr(), Cdesc,          /* C */
+                                   outputD->data_ptr(), Ddesc,          /* D */
+                                   &heuristicResult.algo, /* algo */
                                    aligned_workspace_ptr,        /* workspace */
                                    workspaceSize, stream));      /* stream */
 
@@ -254,16 +210,42 @@ void cublas_gemm(const Tensor *inputA,
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescDestroy(operationDesc));
 }
 
-}  // namespace transformer_engine
+// constexpr float factor = 6.0 * 6.0 * 448.0 * 448.0;
+constexpr float factor_inv = 1.0 / (6.0 * 6.0 * 448.0 * 448.0);
 
-void nvte_cublas_gemm_v2( 
+// compute alpha *= amax_A * amax_B / factor
+void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
+                                           const float *amax_B, float *alpha_out) {
+  // factor is defined in the enclosing namespace
+  *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
+}
+
+at::Tensor swizzle_scaling_factors(at::Tensor& input,
+                                                  bool rowwise) {
+  NVTE_CHECK(input.shape().size() >= 2, "Wrong ndims for swizzle input shape.");
+  auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+  auto out = at::empty(input.shape(), options);
+
+  // Launch kernel
+  nvte_swizzle_scaling_factors(input, &out, at::cuda::getCurrentCUDAStream());
+
+  return out;
+}
+
+void cublas_gemm( 
   const at::Tensor A,
+  const at::Tensor A_scale,
+  const float *amax_A,
   bool transa,
-  const at::Tensor B, 
+  const at::Tensor B,
+  const at::Tensor B_scale,
+  const float *amax_B,
   bool transb,
   float alpha,
   std::optional<float> beta, 
   at::Tensor D,
+  bool accumulate,
+  bool use_split_accumulator,
   const at::Tensor workspace_tensor,
   size_t workspace_size,
 ) {
@@ -272,28 +254,32 @@ void nvte_cublas_gemm_v2(
 
   // T是rowwise, N是colwise
   // Optionally swizzle the scaling factors
-  swizzled_scale_inverses_list.emplace_back(std::move(swizzle_scaling_factors(A_tensor, transa)));
-  swizzled_scale_inverses_list.emplace_back(
-  std::move(swizzle_scaling_factors(B_tensor, !transb)));
+  at::Tensor A_scale_swizzle = swizzle_scaling_factors(A_scale, transa);
+  at::Tensor B_scale_swizzle = swizzle_scaling_factors(B_scale, !transb);
+
+  // Compute alpha
+  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &alpha);
+
+  // Get the number of streaming multiprocessors
+  const int num_math_sms = cuda::sm_count(device_id);
 
   transa = true;
   transb = false;
 
-
   // Launch GEMM
-  cublas_gemm(
+  cublas_gemm_impl(
     A_tensor,
-    A_scale,
+    A_scale_swizzle,
     B_tensor,
-    B_scale,
+    B_scale_swizzle,
     D_tensor,
     transa ? CUBLAS_OP_T : CUBLAS_OP_N, 
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
     workspace_tensor->data(), 
     workspace_size, 
-    &alpha, &beta.value(),
-    config_.use_split_accumulator, 
-    config_.sm_count, 
+    static_cast<const void*>(&alpha), accumulate,
+    use_split_accumulator, 
+    num_math_sms, 
     stream
   );
 }

@@ -61,6 +61,16 @@ constexpr __device__ __host__ __forceinline__ uint64_t DIVUP_TO_MULTIPLE(const T
   return DIVUP(static_cast<uint64_t>(N), static_cast<uint64_t>(M)) * M;
 }
 
+uint32_t _getAlignment(uintptr_t address) {
+  // alignment are in bytes
+  uint32_t alignment = 256;
+  for (;; alignment /= 2) {
+    if (address % alignment == 0) {
+      return alignment;
+    }
+  }
+}
+
 // ###################################################
 
 CUtensorMapDataType get_CUtensorMapDataType(at::ScalarType dtype) {

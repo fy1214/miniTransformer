@@ -247,7 +247,7 @@ void cublas_gemm(
   bool accumulate,
   bool use_split_accumulator,
   const at::Tensor workspace_tensor,
-  size_t workspace_size,
+  size_t workspace_size
 ) {
 
   auto stream = at::cuda::getCurrentCUDAStream();

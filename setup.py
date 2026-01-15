@@ -112,7 +112,7 @@ def setup_extensions() -> setuptools.Extension:
             if exclude_pattern not in os.path.relpath(f, extensions_dir)
         ]
 
-    sources = filter_exclude(sources, exclude_dir)
+    # sources = filter_exclude(sources, exclude_dir)
 
     include_dirs = [
         str(extensions_dir),

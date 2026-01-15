@@ -14,7 +14,7 @@ void quantize_transpose_nvfp4(
     bool return_transpose
 );
 
-void cublas_gemm( 
+void cublas_gemm(
   const at::Tensor A,
   const at::Tensor A_scale,
   const float *amax_A,
@@ -29,5 +29,5 @@ void cublas_gemm(
   bool accumulate,
   bool use_split_accumulator,
   const at::Tensor workspace_tensor,
-  size_t workspace_size,
+  size_t workspace_size
 );

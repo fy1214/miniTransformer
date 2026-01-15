@@ -218,10 +218,10 @@ void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
 }
 
 at::Tensor swizzle_scaling_factors(
-  at::Tensor& input,
+  const at::Tensor& input,
   bool rowwise
 ) {
-  NVTE_CHECK(input.shape().size() >= 2, "Wrong ndims for swizzle input shape.");
+  NVTE_CHECK(input.ndim() >= 2, "Wrong ndims for swizzle input shape.");
 
   std::vector<int64_t> output_size = {input.sizes()[0], input.sizes()[1]};
   auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
@@ -267,6 +267,7 @@ void cublas_gemm(
   compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &alpha);
 
   // Get the number of streaming multiprocessors
+  const int device_id = cuda::current_device();
   const int num_math_sms = cuda::sm_count(device_id);
 
   transa = true;
@@ -274,12 +275,12 @@ void cublas_gemm(
 
   // Launch GEMM
   cublas_gemm_impl(
-    A_tensor,
+    A,
     A_scale_swizzle,
-    B_tensor,
+    B,
     B_scale_swizzle,
-    D_tensor,
-    transa ? CUBLAS_OP_T : CUBLAS_OP_N, 
+    D,
+    transa ? CUBLAS_OP_T : CUBLAS_OP_N,
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
     workspace_tensor->data_ptr(), 
     workspace_size, 

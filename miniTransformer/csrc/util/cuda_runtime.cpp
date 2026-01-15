@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <vector>
 
 #include "logging.h"
 

@@ -24,3 +24,21 @@ enum NVTEScalingMode {
   NVTE_NVFP4_1D_SCALING = 4,
   NVTE_INVALID_SCALING = 100
 };
+
+std::string to_string(const NVTEScalingMode &mode) {
+  switch (mode) {
+    case NVTE_DELAYED_TENSOR_SCALING:
+      return "NVTE_DELAYED_TENSOR_SCALING";
+    case NVTE_MXFP8_1D_SCALING:
+      return "NVTE_MXFP8_1D_SCALING";
+    case NVTE_BLOCK_SCALING_1D:
+      return "NVTE_BLOCK_SCALING_1D";
+    case NVTE_BLOCK_SCALING_2D:
+      return "NVTE_BLOCK_SCALING_2D";
+    case NVTE_NVFP4_1D_SCALING:
+      return "NVTE_NVFP4_1D_SCALING";
+    case NVTE_INVALID_SCALING:
+      return "NVTE_INVALID_SCALING";
+  }
+  return "Invalid Scaling";
+}

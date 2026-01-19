@@ -220,11 +220,11 @@ void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
 void cublas_gemm( 
   const at::Tensor A,
   const at::Tensor A_scale,
-  const float *amax_A,
+  const at::Tensor amax_A_tensor,
   bool transa,
   const at::Tensor B,
   const at::Tensor B_scale,
-  const float *amax_B,
+  const at::Tensor amax_B_tensor,
   bool transb,
   float alpha,
   std::optional<float> beta, 
@@ -243,6 +243,8 @@ void cublas_gemm(
   at::Tensor B_scale_swizzle = swizzle_scaling_factors(B_scale, !transb);
 
   // Compute alpha
+  float *amax_A = amax_A_tensor.data_ptr<float>();
+  float *amax_B = amax_B_tensor.data_ptr<float>();
   compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &alpha);
 
   // Get the number of streaming multiprocessors

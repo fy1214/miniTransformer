@@ -14,14 +14,14 @@ void quantize_transpose_nvfp4(
     bool return_transpose
 );
 
-void cublas_gemm(
+void cublas_gemm( 
   const at::Tensor A,
   const at::Tensor A_scale,
-  const float *amax_A,
+  const at::Tensor amax_A_tensor,
   bool transa,
   const at::Tensor B,
   const at::Tensor B_scale,
-  const float *amax_B,
+  const at::Tensor amax_B_tensor,
   bool transb,
   float alpha,
   std::optional<float> beta, 

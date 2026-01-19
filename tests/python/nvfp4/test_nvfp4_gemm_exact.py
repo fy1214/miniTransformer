@@ -64,12 +64,12 @@ def check_nvfp4_gemm_versus_reference(
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
-    out = fp4_gemm.nvfp4_gemm(
-        x,
+    out = fp4_gemm.cublas_gemm(
+        qx,
         sx,
         x_max,
         True,
-        w,
+        qw,
         sw,
         w_max,
         False,

@@ -245,7 +245,8 @@ void cublas_gemm(
   // Compute alpha
   float *amax_A = reinterpret_cast<float *>(amax_A_tensor.data_ptr());
   float *amax_B = reinterpret_cast<float *>(amax_B_tensor.data_ptr());
-  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &alpha);
+  float new_alpha = 1.0f;
+  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &new_alpha);
 
   // Get the number of streaming multiprocessors
   const int device_id = cuda::current_device();
@@ -265,7 +266,7 @@ void cublas_gemm(
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
     workspace_tensor.data_ptr(), 
     workspace_size, 
-    static_cast<const void*>(&alpha), accumulate,
+    static_cast<const void*>(&new_alpha), accumulate,
     use_split_accumulator, 
     num_math_sms, 
     stream

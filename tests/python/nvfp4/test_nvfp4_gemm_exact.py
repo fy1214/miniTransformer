@@ -58,7 +58,7 @@ def check_nvfp4_gemm_versus_reference(
     if accumulate:
         out = torch.randn((M, N), dtype=out_dtype, device=device)
     else:
-        out = None
+        out = torch.empty((M, N), dtype=out_dtype, device=device)
 
     # Native TE GEMM using tex.generic_gemm (cuBLAS GEMM)
     # Allocate cuBLAS workspace

@@ -21,8 +21,8 @@
 #include <torch/extension.h>
 #include <torch/torch.h>    
 
-#include "../../../util/ptx.cuh"
-#include "../../../util/vector.cuh"
+#include "../../../util/transformer_engine/ptx.cuh"
+#include "../../../util/transformer_engine/vector.cuh"
 
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};

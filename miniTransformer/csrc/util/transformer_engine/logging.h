@@ -19,6 +19,16 @@
 #include <stdexcept>
 #include <string>
 
+inline const std::string &to_string_like(const std::string &val) noexcept { return val; }
+
+constexpr const char *to_string_like(const char *val) noexcept { return val; }
+
+/* \brief Convert arithmetic type to string */
+template <typename T, typename = typename std::enable_if<std::is_arithmetic<T>::value>::type>
+inline std::string to_string_like(const T &val) {
+  return std::to_string(val);
+}
+
 /* \brief Convert container to string */
 template <typename T, typename = typename std::enable_if<!std::is_arithmetic<T>::value>::type,
           typename = decltype(std::declval<T>().begin())>

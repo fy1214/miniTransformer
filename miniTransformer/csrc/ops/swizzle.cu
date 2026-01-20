@@ -1,19 +1,4 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
-
-#include "../util/logging.h"
-#include "../util/common.h"
-
-constexpr int MXFP8_BLOCK_SIZE = 32;
-constexpr int NVFP4_BLOCK_SIZE = 16;
-
-constexpr __device__ __host__ int TB_DIM = 32;
-constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
-constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
-
-// output is in ~K-major interleaved blocks
-constexpr __device__ __host__ int NEW_SF_TILE_DIM_K_I32 = NEW_SF_TILE_DIM_K / 4;
-constexpr __device__ __host__ int NEW_SF_TILE_DIM_M_I32 = 32;
+#include "swizzle.h"
 
 template <typename LType>
 __device__ inline void regs_shuffle(LType* regs_vec) {
@@ -108,10 +93,10 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
       input, output, M, K, original_M, original_K, blockIdx.x, blockIdx.y, gridDim.x, gridDim.y);
 }
 
-void swizzle_scaling_factors(const at::Tensor& input_scale, at::Tensor* output_scale, cudaStream_t stream, NVTEScalingMode scaling_mode) {
+void swizzle_scaling_factors_kernel(const at::Tensor& input_scale, at::Tensor* output_scale, cudaStream_t stream, NVTEScalingMode scaling_mode) {
   // Check scaling mode
   NVTE_CHECK(scaling_mode == NVTE_MXFP8_1D_SCALING || scaling_mode == NVTE_NVFP4_1D_SCALING,
-             "Input tensor has invalid scaling mode (", to_string(scaling_mode()), ").");
+             "Input tensor has invalid scaling mode (", to_string(scaling_mode), ").");
 
   // Deduce tensor dims
   int m{0}, k{0};
@@ -187,4 +172,25 @@ void swizzle_scaling_factors(const at::Tensor& input_scale, at::Tensor* output_s
 		break;
 	}
 	NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
+at::Tensor swizzle_scaling_factors(
+  const at::Tensor& input,
+  bool rowwise
+) {
+  NVTE_CHECK(input.dim() >= 2, "Wrong ndims for swizzle input shape.");
+
+  std::vector<int64_t> output_size = {input.sizes()[0], input.sizes()[1]};
+  auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+  auto out = at::empty(output_size, options);
+
+  // Launch kernel
+  swizzle_scaling_factors_kernel(
+    input, 
+    &out, 
+    at::cuda::getCurrentCUDAStream(), 
+    NVTE_NVFP4_1D_SCALING
+  );
+
+  return out;
 }

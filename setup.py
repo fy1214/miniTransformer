@@ -92,7 +92,7 @@ def setup_extensions() -> setuptools.Extension:
         if version < (12, 6):
             raise RuntimeError(f"HYBRID requires CUDA 12.6 or newer. Got {version}")
         # add nvcc flags for specific architectures
-        cuda_archs = os.getenv("HYBRID_CUDA_ARCHS", "89;90;90a;100a")
+        cuda_archs = os.getenv("HYBRID_CUDA_ARCHS", "89;90;90a;100a;103a")
         for arch in cuda_archs.split(";"):
             nvcc_flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
 
@@ -112,7 +112,7 @@ def setup_extensions() -> setuptools.Extension:
             if exclude_pattern not in os.path.relpath(f, extensions_dir)
         ]
 
-    sources = filter_exclude(sources, exclude_dir)
+    # sources = filter_exclude(sources, exclude_dir)
 
     include_dirs = [
         str(extensions_dir),

@@ -1,5 +1,9 @@
+#include "cuda_runtime.h"
+
+#include <cuda.h>
 #include <filesystem>
 #include <mutex>
+#include <vector>
 
 #include "logging.h"
 
@@ -13,6 +17,13 @@ int num_devices() {
   };
   static int num_devices_ = query_num_devices();
   return num_devices_;
+}
+
+int current_device() {
+  // Query device from CUDA runtime
+  int device_id;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device_id));
+  return device_id;
 }
 
 int sm_arch(int device_id) {

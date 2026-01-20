@@ -10,14 +10,10 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <mutex>
-#include <vector>
 
-#include "../../../util/common.h"
-#include "../../../util/logging.h"
-#include "../../../util/cuda_runtime.h"
 #include "../../handle_manager.h"
-#include "../../swizzle.cuh"
+#include "../../../util/transformer_engine/common.h"
+#include "../../swizzle.h"
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
@@ -51,7 +47,8 @@ void cublas_gemm_impl(
   TORCH_CHECK((transB == CUBLAS_OP_T ? B0 : B1) == k,
              "GEMM inputs have incompatible dimensions (A is ", A0, "x", A1, ", B is ", B0, "x", B1,
              ")");
-  const int ldd = m;
+
+  int lda = k, ldb = k, ldc = m, ldd = m;
 
   // Return immediately if GEMM is trivial
   if (m <= 0 || n <= 0) {
@@ -73,10 +70,10 @@ void cublas_gemm_impl(
 
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
-  const cudaDataType_t D_type = CUDA_R_16BF;
-  if (inputB->dtype() == Half) {
+  cudaDataType_t D_type = CUDA_R_16BF;
+  if (inputB->dtype() == at::ScalarType::Half) {
     D_type = CUDA_R_16F;
-  } else if (inputB->dtype() == Float) {
+  } else if (inputB->dtype() == at::ScalarType::Float) {
     D_type = CUDA_R_32F;
   }
 
@@ -93,9 +90,9 @@ void cublas_gemm_impl(
   // Create matrix descriptors. Not setting any extra attributes.
   // First, set input and output type 
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, A_type, transA == CUBLAS_OP_N ? m : k,
-                                               transA == CUBLAS_OP_N ? k : m, param.lda));
+                                               transA == CUBLAS_OP_N ? k : m, lda));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, B_type, transB == CUBLAS_OP_N ? k : n,
-                                               transB == CUBLAS_OP_N ? n : k, param.ldb));
+                                               transB == CUBLAS_OP_N ? n : k, ldb));
 
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Ddesc, D_type, m, n, ldd));
 
@@ -131,8 +128,8 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
-  fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(A_scale->data());
-  fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(B_scale->data());
+  fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(A_scale->data_ptr());
+  fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(B_scale->data_ptr());
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                                                     &A_scale_inverse, sizeof(A_scale_inverse)));
@@ -166,10 +163,10 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
-  const auto A_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputA->data()));
-  const auto B_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputB->data()));
-  const auto C_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data()));
-  const auto D_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data()));
+  const auto A_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputA->data_ptr()));
+  const auto B_alignment = _getAlignment(reinterpret_cast<uintptr_t>(inputB->data_ptr()));
+  const auto C_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data_ptr()));
+  const auto D_alignment = _getAlignment(reinterpret_cast<uintptr_t>(outputD->data_ptr()));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &A_alignment, sizeof(A_alignment)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
@@ -220,26 +217,14 @@ void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
   *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
 }
 
-at::Tensor swizzle_scaling_factors(at::Tensor& input,
-                                                  bool rowwise) {
-  NVTE_CHECK(input.shape().size() >= 2, "Wrong ndims for swizzle input shape.");
-  auto options = at::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
-  auto out = at::empty(input.shape(), options);
-
-  // Launch kernel
-  nvte_swizzle_scaling_factors(input, &out, at::cuda::getCurrentCUDAStream());
-
-  return out;
-}
-
 void cublas_gemm( 
   const at::Tensor A,
   const at::Tensor A_scale,
-  const float *amax_A,
+  const at::Tensor amax_A_tensor,
   bool transa,
   const at::Tensor B,
   const at::Tensor B_scale,
-  const float *amax_B,
+  const at::Tensor amax_B_tensor,
   bool transb,
   float alpha,
   std::optional<float> beta, 
@@ -258,9 +243,13 @@ void cublas_gemm(
   at::Tensor B_scale_swizzle = swizzle_scaling_factors(B_scale, !transb);
 
   // Compute alpha
-  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &alpha);
+  float *amax_A = reinterpret_cast<float *>(amax_A_tensor.data_ptr());
+  float *amax_B = reinterpret_cast<float *>(amax_B_tensor.data_ptr());
+  float new_alpha = 1.0f;
+  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &new_alpha);
 
   // Get the number of streaming multiprocessors
+  const int device_id = cuda::current_device();
   const int num_math_sms = cuda::sm_count(device_id);
 
   transa = true;
@@ -268,16 +257,16 @@ void cublas_gemm(
 
   // Launch GEMM
   cublas_gemm_impl(
-    A_tensor,
-    A_scale_swizzle,
-    B_tensor,
-    B_scale_swizzle,
-    D_tensor,
-    transa ? CUBLAS_OP_T : CUBLAS_OP_N, 
+    &A,
+    &A_scale_swizzle,
+    &B,
+    &B_scale_swizzle,
+    &D,
+    transa ? CUBLAS_OP_T : CUBLAS_OP_N,
     transb ? CUBLAS_OP_T : CUBLAS_OP_N,
-    workspace_tensor->data(), 
+    workspace_tensor.data_ptr(), 
     workspace_size, 
-    static_cast<const void*>(&alpha), accumulate,
+    static_cast<const void*>(&new_alpha), accumulate,
     use_split_accumulator, 
     num_math_sms, 
     stream

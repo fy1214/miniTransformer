@@ -12,6 +12,8 @@ from triton.tools.mxfp import MXFP4Tensor
 from miniTransformer.ops.nvfp4_quantize_op_ref import cast_from_fp4x2
 from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 
+import fp4_gemm
+
 
 # triton kernel
 def _matmul_launch_metadata(grid, kernel, args):
@@ -324,6 +326,140 @@ def qgemm_cmp_triton_real(
         alpha = torch.div(partial_alpha, factor).squeeze(-1)
         output = alpha * output
 
+    # Handle accumulation
+    if accumulate:
+        assert out is not None, "Output tensor must be provided for accumulation."
+        output = (out.to(torch.float32) + output.to(torch.float32)).to(out_dtype)
+        return output
+    else:
+        output = output.to(out_dtype)
+        return output
+
+
+def qgemm_cmp_cublass_real(
+    qx: torch.Tensor,
+    qw: torch.Tensor,
+    m_params: quantization.MMParams,  
+    out_dtype: torch.dtype,
+    sx: torch.Tensor,
+    sw: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    pow_2_scales: bool = False,
+    global_amax_qx: torch.Tensor | None = None,
+    global_amax_qw: torch.Tensor | None = None,
+    qparams_x: Optional[quantization.QParams] = None,
+    qparams_w: Optional[quantization.QParams] = None,
+) -> torch.Tensor:
+    """
+    cuBLAS block-scaled QGEMM implementation using fp4_gemm.block_scaled_matmul_nvfp4.
+    
+    This implementation uses cuBLAS's hardware-accelerated block-scaled matmul for NVFP4 format.
+    It converts 2D scales (M, K//16) to the 4D layout expected by cuBLAS (M//128, K//64, 32, 16).
+    
+    Args:
+        qx: Packed FP4 input tensor (M, K//2), uint8
+        qw: Packed FP4 weight tensor (N, K//2), uint8
+        m_params: Matrix multiplication parameters
+        out_dtype: Output data type
+        sx: Scale tensor for x (M, K//16), float8_e4m3fn
+        sw: Scale tensor for w (N, K//16), float8_e4m3fn
+        bias: Optional bias tensor (not supported, must be None)
+        out: Optional output tensor for accumulation
+        accumulate: Whether to accumulate into output tensor
+        pow_2_scales: Whether scales are power-of-2 (not used in cuBLAS path)
+        global_amax_qx: Global amax for x (used for NVFP4 global scaling)
+        global_amax_qw: Global amax for w (used for NVFP4 global scaling)
+        qparams_x: Quantization parameters for x (not used)
+        qparams_w: Quantization parameters for w (not used)
+        
+    Returns:
+        Output tensor (M, N) in out_dtype
+    """
+    assert bias is None, "Bias is not implemented for cuBLAS block-scaled version."
+    
+    device = qx.device
+    M, K_bytes_a = qx.shape
+    N, K_bytes_b = qw.shape
+    K = K_bytes_a * 2  # K in elements (2 elements per byte)
+    
+    assert K_bytes_a == K_bytes_b, f"K dimension mismatch: {K_bytes_a} vs {K_bytes_b}"
+    assert qx.dtype == torch.uint8, f"qx must be uint8, got {qx.dtype}"
+    assert qw.dtype == torch.uint8, f"qw must be uint8, got {qw.dtype}"
+    
+    # Validate scale shapes
+    sx_M, sx_K = sx.shape
+    sw_N, sw_K = sw.shape
+    assert sx_M == M, f"sx first dimension mismatch: {sx_M} vs {M}"
+    assert sw_N == N, f"sw first dimension mismatch: {sw_N} vs {N}"
+    assert sx_K == K // 16, f"sx second dimension mismatch: {sx_K} vs {K//16}, K={K}"
+    assert sw_K == K // 16, f"sw second dimension mismatch: {sw_K} vs {K//16}, K={K}"
+    
+    # Convert 2D scales (M, K//16) to 4D layout (M//128, K//64, 32, 16) for cuBLAS
+    # This is the reverse of pack_scale_from_4d in initialize_nvfp4_for_qgemm
+    VEC_SIZE = 16
+    M_chunk = M // 128
+    K_chunk = K // 64  # K // VEC_SIZE // 4
+    
+    def unpack_scale_to_4d(scale_2d, target_M, target_K):
+        """
+        Convert 2D scale (M, K//16) to 4D layout (M//128, K//64, 32, 16).
+        This is the reverse operation of pack_scale_from_4d.
+        
+        pack_scale_from_4d does:
+        1. Reshape 4D (M_chunk, K_chunk, 32, 16) -> 5D (M_chunk, K_chunk, 32, 4, 4)
+        2. Permute (0, 3, 2, 1, 4) -> (M_chunk, 4, 32, K_chunk, 4)
+        3. Reshape -> 2D (M, K//16)
+        
+        So we reverse:
+        1. Reshape 2D (M, K//16) -> 5D (M_chunk, 4, 32, K_chunk, 4)
+        2. Permute (0, 3, 2, 1, 4) -> (M_chunk, K_chunk, 32, 4, 4) [reverse of permute(0,3,2,1,4) is permute(0,3,2,1,4)]
+        3. Reshape -> 4D (M_chunk, K_chunk, 32, 16)
+        """
+        M_chunk = target_M // 128
+        K_chunk = target_K // 64
+        scale_2d_fp32 = scale_2d.to(torch.float32)
+        # Reshape 2D to 5D: (M, K//16) -> (M_chunk, 4, 32, K_chunk, 4)
+        scale_5d = scale_2d_fp32.reshape(M_chunk, 4, 32, K_chunk, 4)
+        # Reverse permute: permute(0, 3, 2, 1, 4) maps (M_chunk, 4, 32, K_chunk, 4) -> (M_chunk, K_chunk, 32, 4, 4)
+        # The reverse of permute(0, 3, 2, 1, 4) is permute(0, 3, 2, 1, 4) itself (it's symmetric)
+        scale_5d = scale_5d.permute(0, 3, 2, 1, 4).contiguous()
+        # Reshape 5D to 4D: (M_chunk, K_chunk, 32, 4, 4) -> (M_chunk, K_chunk, 32, 16)
+        scale_4d = scale_5d.reshape(M_chunk, K_chunk, 32, 16)
+        return scale_4d
+    
+    # Convert scales from 2D to 4D layout
+    sx_4d = unpack_scale_to_4d(sx, M, K)
+    sw_4d = unpack_scale_to_4d(sw, N, K)
+    
+    # Convert to FP8 E4M3 and flatten for cuBLAS
+    sx_4d = sx_4d.to(torch.float8_e4m3fn)
+    sw_4d = sw_4d.to(torch.float8_e4m3fn)
+    sx_cublas = sx_4d.contiguous().flatten()
+    sw_cublas = sw_4d.contiguous().flatten()
+    
+    # Create workspace tensor (32MB as in reference implementation)
+    workspace_size = 32 * 1024 * 1024
+    workspace_tensor = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    
+    # Prepare output tensor (cuBLAS outputs FP16)
+    output = torch.empty((M, N), dtype=torch.float16, device=device)
+    
+    # Call cuBLAS block-scaled matmul
+    fp4_gemm.block_scaled_matmul_nvfp4(
+        qx, qw, output, sx_cublas, sw_cublas, workspace_tensor, workspace_size
+    )
+    
+    # Apply global scaling for NVFP4 mode
+    if not pow_2_scales and K > 0:
+        assert global_amax_qx is not None, "global_amax_qx must be provided for NVFP4 mode"
+        assert global_amax_qw is not None, "global_amax_qw must be provided for NVFP4 mode"
+        factor = 6.0 * 6.0 * 448.0 * 448.0
+        partial_alpha = global_amax_qx * global_amax_qw
+        alpha = torch.div(partial_alpha, factor).squeeze(-1)
+        output = alpha * output
+    
     # Handle accumulation
     if accumulate:
         assert out is not None, "Output tensor must be provided for accumulation."

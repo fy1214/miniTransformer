@@ -31,3 +31,13 @@ void cublas_gemm(
   const at::Tensor workspace_tensor,
   size_t workspace_size
 );
+
+void block_scaled_matmul_nvfp4(
+  const at::Tensor A,
+  const at::Tensor B,
+  at::Tensor output,
+  const at::Tensor scale_A,
+  const at::Tensor scale_B,
+  const at::Tensor workspace_tensor,
+  size_t workspace_size
+);

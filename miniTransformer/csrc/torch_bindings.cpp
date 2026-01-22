@@ -11,4 +11,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quantize_transpose_nvfp4", &quantize_transpose_nvfp4, "quantize and transpose (CUDA)");
     m.def("swizzle_scaling_factors", &swizzle_scaling_factors, "Swizzle scaling factors (CUDA)");
     m.def("cublas_gemm", &cublas_gemm, "FP4 GEMM with cuBLASLt (CUDA)");
+    m.def("block_scaled_matmul_nvfp4", &block_scaled_matmul_nvfp4, "Block-scaled matmul for NVFP4 (CUDA)");
 }

@@ -83,7 +83,7 @@ void cublas_gemm_impl(
   cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                    &transb, sizeof(transb));
   
-  int math_sm_count = 20;
+  math_sm_count = 20;
   cublasLtMatmulDescSetAttribute(operationDesc,
                                  CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
                                  &math_sm_count, sizeof(math_sm_count));
@@ -119,14 +119,13 @@ void cublas_gemm_impl(
       sizeof(B_scale_inverse));
 
   // 创建偏好设置
-  size_t workspaceSize = 1024 * 1024;
+  workspaceSize = 1024 * 1024;
   cublasLtMatmulPreferenceCreate(&preference);
   cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
       sizeof(workspaceSize));
 
   // set epilogue
-  cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
   cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
                                                 &epilogue, sizeof(epilogue));
   
@@ -312,7 +311,7 @@ void cublas_gemm(
   float *amax_A = reinterpret_cast<float *>(amax_A_tensor.data_ptr());
   float *amax_B = reinterpret_cast<float *>(amax_B_tensor.data_ptr());
   float new_alpha = 1.0f;
-  compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B, &new_alpha);
+  // new_alpha = compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B);
 
   // Get the number of streaming multiprocessors
   const int device_id = cuda::current_device();

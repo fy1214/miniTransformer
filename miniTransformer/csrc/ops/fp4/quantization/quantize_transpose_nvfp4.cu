@@ -43,6 +43,21 @@ __device__ __forceinline__ fp8e4m3 compute_decoding_scaling_factor(const float b
   return static_cast<fp8e4m3>(block_amax * rcp_6f * S_enc);
 }
 
+// Compute the global encode scale factor for a given global amax
+__device__ __forceinline__ float compute_global_encode_scaling_factor_FP4(const float global_amax) {
+  using namespace detail;
+  constexpr float fp8_max = TypeExtrema<fp8e4m3>::max;  // 448.0f;
+  constexpr float fp4_max = TypeExtrema<fp4e2m1>::max;  // 6.0f;
+  float global_encode_scale = fp8_max * fp4_max / global_amax;
+  // If scale is infinity, return max value of float32
+  global_encode_scale = fminf(global_encode_scale, TypeExtrema<float>::max);
+  // If global amax is 0 or infinity, return 1
+  if (global_amax == 0.0f || global_encode_scale == 0.0f) {
+    return 1.0f;
+  }
+  return global_encode_scale;
+}
+
 constexpr size_t SCALE_DIM = 16;  // NVFP4 block (x16 elts)
 constexpr size_t THREADS_PER_WARP = 32;
 
@@ -126,7 +141,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     nvfp4_scale_t *const scales_t_ptr,
                                     const size_t rows, const size_t cols, 
                                     const size_t scale_stride,
-                                    const size_t scale_stride_t) {
+                                    const size_t scale_stride_t,
+                                    const float *const amax_rowwise_ptr,
+                                    const float *const amax_colwise_ptr) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -623,7 +640,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        const size_t rows,
                                        const size_t cols, 
                                        const size_t scale_stride,
-                                       const size_t scale_stride_t) {
+                                       const size_t scale_stride_t,
+                                       const float *const amax_rowwise_ptr,
+                                       const float *const amax_colwise_ptr) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -715,11 +734,15 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const bool is_master_thread = (threadIdx.x == 0);
 
   // Compute a global encoding/decoding scaling factors for all S_dec_b
-  const float S_enc_rowwise = 1.0f;
+  const float S_enc_rowwise = (amax_rowwise_ptr == nullptr)
+                                  ? 1.0f
+                                  : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
   // NOTE: This is to match with how emulation code was written.
   const float S_dec_rowwise = 1.0 / S_enc_rowwise;
 
-  const float S_enc_colwise = S_enc_rowwise;
+  const float S_enc_colwise = (amax_colwise_ptr == nullptr)
+                                  ? S_enc_rowwise
+                                  : compute_global_encode_scaling_factor_FP4(*amax_colwise_ptr);
   const float S_dec_colwise = 1.0 / S_enc_colwise;
 
   const size_t warp_id = threadIdx.x / 32;
@@ -1134,7 +1157,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
 
 void quantize_transpose_nvfp4(
-    const at::Tensor &input, 
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
     at::Tensor &output,
     at::Tensor &output_scale,
     at::Tensor &output_transpose,
@@ -1169,6 +1194,9 @@ void quantize_transpose_nvfp4(
   nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale.data_ptr());
   nvfp4_scale_t *const scales_transpose_ptr =
       reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose.data_ptr());
+
+  float *const amax_rowwise_ptr = reinterpret_cast<float *>(amax_rowwise.data_ptr());
+  float *const amax_colwise_ptr = reinterpret_cast<float *>(amax_colwise.data_ptr());
 
   using IType = bf16;
 
@@ -1222,7 +1250,7 @@ void quantize_transpose_nvfp4(
         kernel<<<grid, block_size, dshmem_size, stream>>>(
             tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
             scales_transpose_ptr, rows, cols,
-            scale_stride, scale_stride_transpose);
+            scale_stride, scale_stride_transpose, amax_rowwise_ptr, amax_colwise_ptr);
       });
     );
 }

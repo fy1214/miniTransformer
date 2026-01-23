@@ -5,7 +5,9 @@
 #include <torch/all.h>
 
 void quantize_transpose_nvfp4(
-    const at::Tensor &input, 
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
     at::Tensor &output,
     at::Tensor &output_scale,
     at::Tensor &output_transpose,

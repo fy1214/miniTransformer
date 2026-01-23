@@ -67,11 +67,11 @@ def check_nvfp4_gemm_versus_reference(
     out = fp4_gemm.cublas_gemm(
         qx,
         sx,
-        x_max,
+        x_max.item(),
         True,
         qw,
         sw,
-        w_max,
+        w_max.item(),
         False,
         1, 0,
         out,

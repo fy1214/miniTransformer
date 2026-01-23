@@ -1135,10 +1135,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
 void quantize_transpose_nvfp4(
     const at::Tensor &input, 
-    at::Tensor *output,
-    at::Tensor *output_scale,
-    at::Tensor *output_transpose,
-    at::Tensor *output_scale_transpose,
+    at::Tensor &output,
+    at::Tensor &output_scale,
+    at::Tensor &output_transpose,
+    at::Tensor &output_scale_transpose,
     bool use_2d_quantization,
     bool return_transpose
 ) {
@@ -1162,13 +1162,13 @@ void quantize_transpose_nvfp4(
   const dim3 grid(blocks_X, blocks_Y);
   const size_t block_size = THREADS_NUM;
 
-  const size_t scale_stride = output_scale->stride(0);
+  const size_t scale_stride = output_scale.stride(0);
   const size_t scale_stride_transpose =
-      return_transpose ? output_scale_transpose->stride(0) : 0;
+      return_transpose ? output_scale_transpose.stride(0) : 0;
 
-  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale->data_ptr());
+  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale.data_ptr());
   nvfp4_scale_t *const scales_transpose_ptr =
-      reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose->data_ptr());
+      reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose.data_ptr());
 
   using IType = bf16;
 
@@ -1179,10 +1179,10 @@ void quantize_transpose_nvfp4(
   create_2D_tensor_map(tensor_map_input, input, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
                        sizeof(IType) * 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 
-  create_2D_tensor_map(tensor_map_output, *output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
+  create_2D_tensor_map(tensor_map_output, output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
                        4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   if (return_transpose) {
-    create_2D_tensor_map(tensor_map_output_transpose, *output_transpose, cols, rows,
+    create_2D_tensor_map(tensor_map_output_transpose, output_transpose, cols, rows,
                          BUFF_DIM_X, BUFF_DIM_Y, rows, 0, 4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   }
   constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_DIM_X;

@@ -50,9 +50,9 @@ def check_quantization_nvfp4_versus_reference(
         True,
         False,
     )
-    x_ref, sx_ref = result.data, result.scale
+    qx_ref, sx_ref = result.data, result.scale
 
-    torch.testing.assert_close(x, x_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(qx, qx_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(sx, sx_ref, atol=0.0, rtol=0.0)
 
 if __name__ == "__main__":

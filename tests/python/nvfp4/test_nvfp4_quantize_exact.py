@@ -1,3 +1,5 @@
+from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.ops.quantization import QParams
 import torch
 import fp4_gemm
 
@@ -29,15 +31,29 @@ def check_quantization_nvfp4_versus_reference(
 
     qx = torch.empty((M, N // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
     sx = torch.empty((M, N // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
-    if return_transpose:
-        qx_t = torch.empty((N, M // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
-        sx_t = torch.empty((N, M // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
-    else:
-        qx_t = None
-        sx_t = None
+    qx_t = torch.empty((N, M // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
+    sx_t = torch.empty((N, M // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
 
     fp4_gemm.quantize_transpose_nvfp4(x, qx, sx, qx_t, sx_t, with_2d_quantization, return_transpose)
 
+    ref_op = Nvfp4TiledQuantizeRefOp()
+    param = QParams(
+        output_dtype=torch.uint8, 
+        scaling_dtype=torch.float8_e4m3fn, 
+        quant_tile_shape=(16, 16), 
+        with_2d_quantization=True,
+        with_rht=False
+    )
+    result = ref_op.quantize(
+        x,
+        param,
+        True,
+        False,
+    )
+    x_ref, sx_ref = result.data, result.scale
+
+    torch.testing.assert_close(x, x_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(sx, sx_ref, atol=0.0, rtol=0.0)
 
 if __name__ == "__main__":
     check_quantization_nvfp4_versus_reference(

@@ -69,7 +69,7 @@ void cublas_gemm_impl(
 
   int64_t ld_gelumat = (int64_t)ldd;
   
-
+  /** 
   cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_4F_E2M1, k, m, k);
   cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_4F_E2M1, k, n, k);
@@ -100,7 +100,6 @@ void cublas_gemm_impl(
   cublasLtMatmulDescSetAttribute(
           operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode));
   
-  /** 
   cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
   cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
 
@@ -132,7 +131,6 @@ void cublas_gemm_impl(
                                                 &epilogue, sizeof(epilogue));
   */
 
-  /** 
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
@@ -169,11 +167,15 @@ void cublas_gemm_impl(
                                                    &transB, sizeof(transB)));
 
   // Set math SM count
-  if (math_sm_count != 0) {
-    NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
-                                                     CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
-                                                     &math_sm_count, sizeof(math_sm_count)));
-  }
+  // if (math_sm_count != 0) {
+  //   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+  //                                                    CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+  //                                                    &math_sm_count, sizeof(math_sm_count)));
+  // }
+  math_sm_count = 20;
+  cublasLtMatmulDescSetAttribute(operationDesc,
+                                CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+                                &math_sm_count, sizeof(math_sm_count));
 
   // Fast accumulation is only supported for FP8.
   const int8_t fastAccuMode = (use_split_accumulator) ? 0 : 1;
@@ -191,9 +193,7 @@ void cublas_gemm_impl(
   cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
-  
-  **/
- 
+
   // Set scaling mode.
   cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
   cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;

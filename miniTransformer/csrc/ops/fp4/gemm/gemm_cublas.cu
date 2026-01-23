@@ -412,7 +412,7 @@ void block_scaled_matmul_nvfp4_impl(
   cudaDataType_t dataType = CUDA_R_4F_E2M1;
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, dataType, K, M, K));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, dataType, K, N, K));
-  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16F, M, N, M));
+  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, M, N, M));
 
   float alpha = 1.0f;
   float beta = 0.0f; // No bias

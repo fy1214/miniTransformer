@@ -9,7 +9,7 @@ from transformer_engine.common import recipe
 from transformer_engine.pytorch.custom_recipes import quantization_nvfp4
 from transformer_engine.pytorch.custom_recipes import utils
 
-from miniTransformer.module import Linear
+from miniTransformer.module.linear import Linear
 
 
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
@@ -586,4 +586,4 @@ def test_nvfp4_layernorm_linear_versus_reference(
 
 if __name__ == '__main__':
     test_nvfp4_linear_versus_reference(1024, 4096, False, torch.bfloat16, 3, True, True)
-    test_nvfp4_layernorm_linear_versus_reference(1024, 4096, False, torch.bfloat16, "RMSNorm", 1, True, True)
+    # test_nvfp4_layernorm_linear_versus_reference(1024, 4096, False, torch.bfloat16, "RMSNorm", 1, True, True)

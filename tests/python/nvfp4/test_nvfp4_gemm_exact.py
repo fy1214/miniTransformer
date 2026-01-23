@@ -76,7 +76,6 @@ def check_nvfp4_gemm_versus_reference(
         1, 0,
         out,
         accumulate,
-        False,
         workspace,
         workspace.shape[0],
     )

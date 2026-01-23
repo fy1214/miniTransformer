@@ -27,7 +27,6 @@ void cublas_gemm(
   std::optional<float> beta, 
   at::Tensor D,
   bool accumulate,
-  bool use_split_accumulator,
   const at::Tensor workspace_tensor,
   size_t workspace_size
 );

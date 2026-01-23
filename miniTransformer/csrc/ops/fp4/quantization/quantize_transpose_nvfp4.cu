@@ -32,6 +32,18 @@ struct TypeExtrema {
   static constexpr float max = std::numeric_limits<T>::max();
 };
 
+template <>
+struct TypeExtrema<fp4e2m1> {
+  static constexpr float max = 6.0f;
+  static constexpr float max_inverse = 1.0 / max;
+};
+
+template <>
+struct TypeExtrema<fp8e4m3> {
+  static constexpr float max = 448.0f;
+  static constexpr float max_inverse = 1.0 / max;
+};
+
 // Used in non-transpose variant
 // Compute per-block E4M3 encoding/decoding scaling factor
 __device__ __forceinline__ fp8e4m3 compute_decoding_scaling_factor(const float block_amax,

@@ -68,7 +68,8 @@ void cublas_gemm_impl(
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
 
   int64_t ld_gelumat = (int64_t)ldd;
-
+  
+  /** 
   cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_4F_E2M1, k, m, k);
   cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_4F_E2M1, k, n, k);
@@ -128,8 +129,9 @@ void cublas_gemm_impl(
   // set epilogue
   cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
                                                 &epilogue, sizeof(epilogue));
-  
-  /** 
+  */
+
+
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
@@ -148,18 +150,18 @@ void cublas_gemm_impl(
   if (A_type == CUDA_R_32F && B_type == CUDA_R_32F && D_type == CUDA_R_32F) {
     gemm_compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
   }
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescCreate(&operationDesc, gemm_compute_type, CUDA_R_32F));
 
   // Create matrix descriptors. Not setting any extra attributes.
   // First, set input and output type 
-  cublasOperation_t transa = CUBLAS_OP_T;
-  cublasOperation_t transb = CUBLAS_OP_N;
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, A_type, transA == CUBLAS_OP_N ? m : k,
                                                transA == CUBLAS_OP_N ? k : m, lda));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, B_type, transB == CUBLAS_OP_N ? k : n,
                                                transB == CUBLAS_OP_N ? n : k, ldb));
-
+  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, D_type, m, n, ldd));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Ddesc, D_type, m, n, ldd));
-
+  
+  // Set operation attributes
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescCreate(&operationDesc, gemm_compute_type, CUDA_R_32F));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA,
                                                    &transA, sizeof(transA)));
@@ -176,12 +178,9 @@ void cublas_gemm_impl(
   const int8_t fastAccuMode = (use_split_accumulator) ? 0 : 1;
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
                                                     &fastAccuMode, sizeof(fastAccuMode)));
-
-  // Scaling factors.
-  cublasLtMatmulMatrixScale_t scaling_mode_a;
-  cublasLtMatmulMatrixScale_t scaling_mode_b;
   
   // make sure alpha beta computation dtype remains fp32 by CUBLASLT_MATMUL_DESC_SCALE_TYPE
+  // Set scale type
   cublasDataType_t scale_type = CUDA_R_32F;
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
@@ -191,17 +190,10 @@ void cublas_gemm_impl(
   cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
-
-  void *A_scale_inverse = reinterpret_cast<void *>(A_scale->data_ptr());
-  void *B_scale_inverse = reinterpret_cast<void *>(B_scale->data_ptr());
-  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
-                                                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                                                    &A_scale_inverse, sizeof(A_scale_inverse)));
-  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
-                                                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                                                    &B_scale_inverse, sizeof(B_scale_inverse)));
-  scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-  scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+  
+  // Set scaling mode.
+  cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+  cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
 
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                        CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
@@ -210,12 +202,17 @@ void cublas_gemm_impl(
                                                     CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
                                                     &scaling_mode_b, sizeof(scaling_mode_b)));
   
-  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, D_type, m, n, ldd));
-
-  // set epilogue
-  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
-                                                   &epilogue, sizeof(epilogue)));
-
+  // Set scale pointers
+  void *A_scale_inverse = reinterpret_cast<void *>(A_scale->data_ptr());
+  void *B_scale_inverse = reinterpret_cast<void *>(B_scale->data_ptr());
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                                    &A_scale_inverse, sizeof(A_scale_inverse)));
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                                    &B_scale_inverse, sizeof(B_scale_inverse)));
+  
+  // Create preference
   // align the workspace to 256 B
   const int required_alignment = 256;
   const auto original_workspace_alignment = _getAlignment(reinterpret_cast<uintptr_t>(workspace));
@@ -243,7 +240,9 @@ void cublas_gemm_impl(
              "cuBLAS workspace pointer must be aligned to 256 bytes, got ",
              new_workspace_alignment);
   
-  */
+  // set epilogue
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                                   &epilogue, sizeof(epilogue)));
 
   const auto status =
       cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,

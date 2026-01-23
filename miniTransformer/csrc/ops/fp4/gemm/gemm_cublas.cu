@@ -69,7 +69,7 @@ void cublas_gemm_impl(
 
   int64_t ld_gelumat = (int64_t)ldd;
   
-  /** 
+
   cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_4F_E2M1, k, m, k);
   cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_4F_E2M1, k, n, k);
@@ -83,7 +83,7 @@ void cublas_gemm_impl(
                                    &transa, sizeof(transa));
   cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                    &transb, sizeof(transb));
-  
+  /**
   math_sm_count = 20;
   cublasLtMatmulDescSetAttribute(operationDesc,
                                  CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
@@ -131,7 +131,7 @@ void cublas_gemm_impl(
                                                 &epilogue, sizeof(epilogue));
   */
 
-
+  /** 
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
@@ -162,11 +162,12 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Ddesc, D_type, m, n, ldd));
   
   // Set operation attributes
-  NVTE_CHECK_CUBLAS(cublasLtMatmulDescCreate(&operationDesc, gemm_compute_type, CUDA_R_32F));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA,
                                                    &transA, sizeof(transA)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                    &transB, sizeof(transB)));
+  */
+ 
   // Set math SM count
   if (math_sm_count != 0) {
     NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,

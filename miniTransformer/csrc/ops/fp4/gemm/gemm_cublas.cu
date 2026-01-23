@@ -83,7 +83,7 @@ void cublas_gemm_impl(
                                    &transa, sizeof(transa));
   cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                    &transb, sizeof(transb));
-  /**
+  
   math_sm_count = 20;
   cublasLtMatmulDescSetAttribute(operationDesc,
                                  CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
@@ -99,7 +99,8 @@ void cublas_gemm_impl(
   const cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
   cublasLtMatmulDescSetAttribute(
           operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode));
-
+  
+  /** 
   cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
   cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
 
@@ -166,8 +167,7 @@ void cublas_gemm_impl(
                                                    &transA, sizeof(transA)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                    &transB, sizeof(transB)));
-  */
- 
+
   // Set math SM count
   if (math_sm_count != 0) {
     NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
@@ -192,6 +192,8 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
   
+  **/
+ 
   // Set scaling mode.
   cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
   cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;

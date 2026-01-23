@@ -132,7 +132,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 output_dtype=torch.uint8, 
                 scaling_dtype=torch.float8_e4m3fn, 
                 quant_tile_shape=(16, 16), 
-                with_2d_quantization=False,
+                with_2d_quantization=True,
                 with_rht=False
             ),
             g_params=QParams(
@@ -161,7 +161,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 output_dtype=torch.uint8, 
                 scaling_dtype=torch.float8_e4m3fn, 
                 quant_tile_shape=(16, 16), 
-                with_2d_quantization=False,
+                with_2d_quantization=True,
                 with_rht=False
             ),
             g_params=QParams(

@@ -69,6 +69,68 @@ void cublas_gemm_impl(
 
   int64_t ld_gelumat = (int64_t)ldd;
 
+  cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_4F_E2M1, k, m, k);
+  cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_4F_E2M1, k, n, k);
+  cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, m, n, m);
+  cublasLtMatrixLayoutCreate(&Ddesc, CUDA_R_16BF, m, n, m);
+
+  cublasOperation_t transa = CUBLAS_OP_T;
+  cublasOperation_t transb = CUBLAS_OP_N;
+
+  cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                   &transa, sizeof(transa));
+  cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                   &transb, sizeof(transb));
+  
+  int math_sm_count = 20;
+  cublasLtMatmulDescSetAttribute(operationDesc,
+                                 CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+                                 &math_sm_count, sizeof(math_sm_count));
+
+  const int8_t fastAccuMode = 0;
+  cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+                                 &fastAccuMode, sizeof(fastAccuMode));
+  
+  const cublasDataType_t scale_type = CUDA_R_32F;
+  cublasLtMatmulDescSetAttribute(
+          operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type));
+  const cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+  cublasLtMatmulDescSetAttribute(
+          operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode));
+
+  cublasLtMatmulMatrixScale_t scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+  cublasLtMatmulMatrixScale_t scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+
+  cublasLtMatmulDescSetAttribute(operationDesc,
+                                   CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                   &scaling_mode_a, sizeof(scaling_mode_a));
+  cublasLtMatmulDescSetAttribute(operationDesc,
+                                   CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                   &scaling_mode_b, sizeof(scaling_mode_b));
+
+  void *A_scale_inverse = reinterpret_cast<void *>(A_scale->data_ptr());
+  void *B_scale_inverse = reinterpret_cast<void *>(B_scale->data_ptr());
+  cublasLtMatmulDescSetAttribute(
+      operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &A_scale_inverse,
+      sizeof(A_scale_inverse));
+  cublasLtMatmulDescSetAttribute(
+      operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &B_scale_inverse,
+      sizeof(B_scale_inverse));
+
+  // 创建偏好设置
+  size_t workspaceSize = 1024 * 1024;
+  cublasLtMatmulPreferenceCreate(&preference);
+  cublasLtMatmulPreferenceSetAttribute(
+      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
+      sizeof(workspaceSize));
+
+  // set epilogue
+  cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+  cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                                &epilogue, sizeof(epilogue));
+  
+  /** 
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
@@ -90,6 +152,8 @@ void cublas_gemm_impl(
 
   // Create matrix descriptors. Not setting any extra attributes.
   // First, set input and output type 
+  cublasOperation_t transa = CUBLAS_OP_T;
+  cublasOperation_t transb = CUBLAS_OP_N;
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, A_type, transA == CUBLAS_OP_N ? m : k,
                                                transA == CUBLAS_OP_N ? k : m, lda));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, B_type, transB == CUBLAS_OP_N ? k : n,
@@ -129,8 +193,8 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
-  fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(A_scale->data_ptr());
-  fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(B_scale->data_ptr());
+  void *A_scale_inverse = reinterpret_cast<void *>(A_scale->data_ptr());
+  void *B_scale_inverse = reinterpret_cast<void *>(B_scale->data_ptr());
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
                                                     &A_scale_inverse, sizeof(A_scale_inverse)));
@@ -179,6 +243,8 @@ void cublas_gemm_impl(
   NVTE_CHECK(new_workspace_alignment % 256 == 0,
              "cuBLAS workspace pointer must be aligned to 256 bytes, got ",
              new_workspace_alignment);
+  
+  */
 
   const auto status =
       cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,
@@ -188,17 +254,16 @@ void cublas_gemm_impl(
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
 
-
   // D = alpha * (A * B) + beta * C
-  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
-                                   inputA->data_ptr(), Adesc,           /* A */
-                                   inputB->data_ptr(), Bdesc,           /* B */ 
-                                   static_cast<const void*>(&beta),     /* beta */
-                                   outputD->data_ptr(), Cdesc,          /* C */
-                                   outputD->data_ptr(), Ddesc,          /* D */
-                                   &heuristicResult.algo, /* algo */
-                                   aligned_workspace_ptr,        /* workspace */
-                                   workspaceSize, stream));      /* stream */
+  // NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
+  //                                  inputA->data_ptr(), Adesc,           /* A */
+  //                                  inputB->data_ptr(), Bdesc,           /* B */ 
+  //                                  static_cast<const void*>(&beta),     /* beta */
+  //                                  outputD->data_ptr(), Cdesc,          /* C */
+  //                                  outputD->data_ptr(), Ddesc,          /* D */
+  //                                  &heuristicResult.algo, /* algo */
+  //                                  aligned_workspace_ptr,        /* workspace */
+  //                                  workspaceSize, stream));      /* stream */
 
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceDestroy(preference));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(Ddesc));
@@ -212,10 +277,10 @@ void cublas_gemm_impl(
 constexpr float factor_inv = 1.0 / (6.0 * 6.0 * 448.0 * 448.0);
 
 // compute alpha *= amax_A * amax_B / factor
-void compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A,
-                                           const float *amax_B, float *alpha_out) {
+float compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float *amax_A, const float *amax_B) {
   // factor is defined in the enclosing namespace
-  *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
+  float alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_inv;
+  return alpha_out;
 }
 
 void cublas_gemm( 
@@ -341,7 +406,6 @@ void block_scaled_matmul_nvfp4_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
       matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_A_ptr,
       sizeof(scale_A_ptr))); // Swapped
-
   // Create matrix layouts
   // NVFP4: CUDA_R_4F_E2M1
   // With transa=T: A layout is (k, m), lda=k

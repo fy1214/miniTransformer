@@ -28,13 +28,19 @@ def check_quantization_nvfp4_versus_reference(
     torch.cuda.manual_seed(seed)
     # Input
     x = torch.randn((M, N), dtype=x_dtype, device=device)
+    global_amax_row = torch.max(torch.abs(x)).to(torch.float32).view(1)
+    global_amax_col = (
+        torch.max(torch.abs(x)).to(torch.float32).view(1)
+        if return_transpose
+        else global_amax_row
+    )
 
     qx = torch.empty((M, N // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
     sx = torch.empty((M, N // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
     qx_t = torch.empty((N, M // 2), dtype=x_dtype, device=device).to(nvfp4_output_t)
     sx_t = torch.empty((N, M // 16), dtype=x_dtype, device=device).to(nvfp4_scale_t)
 
-    fp4_gemm.quantize_transpose_nvfp4(x, qx, sx, qx_t, sx_t, with_2d_quantization, return_transpose)
+    fp4_gemm.quantize_transpose_nvfp4(x, global_amax_row, global_amax_col, qx, sx, qx_t, sx_t, with_2d_quantization, return_transpose)
 
     ref_op = Nvfp4TiledQuantizeRefOp()
     param = QParams(

@@ -218,6 +218,12 @@ inline float compute_nvfp4_per_tensor_scale_kernel(float alpha_in, const float a
   return alpha_out;
 }
 
+// GEMM for NVFP4: D = (A * scale_A) @ (B * scale_B)
+// A: (M, K//2) uint8 packed FP4 (2 elements per byte)
+// B: (N, K//2) uint8 packed FP4 (2 elements per byte)  
+// scale_A: FP8 E4M3 scales for A
+// scale_B: FP8 E4M3 scales for B
+// D: (M, N) BP16 
 void cublas_gemm( 
   const at::Tensor A,
   const at::Tensor A_scale,

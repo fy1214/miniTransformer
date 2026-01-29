@@ -79,8 +79,8 @@ def check_quantization_nvfp4_versus_reference(
     print("Reference quantized output:", qx_ref)
     print("Reference quantized scale:", sx_ref)
 
-    torch.testing.assert_close(qx_te, qx_ref, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(sx_te, sx_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(qx_te, qx_ref.view(dtype=torch.uint8), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(sx_te, sx_ref.view(dtype=torch.uint8), atol=0.0, rtol=0.0)
 
 if __name__ == "__main__":
     check_quantization_nvfp4_versus_reference(

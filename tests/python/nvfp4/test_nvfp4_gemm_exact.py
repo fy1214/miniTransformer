@@ -7,6 +7,7 @@ from transformer_engine.pytorch import NVFP4Quantizer
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
 from transformer_engine.pytorch.custom_recipes import utils
+from transformer_engine.pytorch.constants import TE_DType
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -47,7 +48,7 @@ def quantize_transpose_nvfp4(
     qx_amax = x_nvfp4_sut._amax_rowwise
     qx_amax_t = x_nvfp4_sut._amax_columnwise
 
-    return quantization.QuantizeResult(qx, sx, qx_t, sx_t, qx_amax, qx_amax_t)
+    return quantization.QuantizeResult(qx, sx, qx_t, sx_t, qx_amax, qx_amax_t), x_nvfp4_sut
 
 
 def check_nvfp4_gemm_versus_reference(
@@ -71,8 +72,8 @@ def check_nvfp4_gemm_versus_reference(
     x = torch.randn((M, K), device="cuda").to(x_dtype)
     w = torch.randn((N, K), device="cuda").to(w_dtype)
 
-    x_res = quantize_transpose_nvfp4(x, False, True)
-    w_res = quantize_transpose_nvfp4(w, True, True)
+    x_res, x_nvfp4_native = quantize_transpose_nvfp4(x, False, True)
+    w_res, w_nvfp4_native = quantize_transpose_nvfp4(w, True, True)
 
     # Setup out tensor if accumulate is True
     if accumulate:
@@ -84,7 +85,7 @@ def check_nvfp4_gemm_versus_reference(
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
-    y_native = fp4_gemm.cublas_gemm(
+    fp4_gemm.cublas_gemm(
         x_res.data,
         x_res.scale,
         x_res.global_amax_row.item(),
@@ -130,7 +131,36 @@ def check_nvfp4_gemm_versus_reference(
         qparams_x=qparam_x,
         qparams_w=qparam_w
     )
+
+    transa = True if not w_columnwise else False
+    transb = False if not x_columnwise else True
+    out_quantizer = None
+    bias = None
+    bias_dtype = TE_DType[torch.bfloat16]
+    use_gelu = False
+    gelu_input = None
+    use_grad = False
+    use_split_accumulator = False
     
+    y_native = tex.generic_gemm(
+        w_nvfp4_native,
+        transa,
+        x_nvfp4_native,
+        transb,
+        out.clone() if accumulate else None,
+        out_quantizer,
+        TE_DType[out_dtype],
+        bias,
+        bias_dtype,
+        use_gelu,
+        gelu_input,
+        use_grad,
+        workspace,
+        workspace.shape[0],
+        accumulate,
+        use_split_accumulator,
+    )[0]
+
     # just in case of accumulation, make sure y_ref and y_native are not the same tensor
     assert y_ref is not y_native, "y_ref and y_native should not be the same tensor"
     # Reset nans to zeros because torch.assert_close does not assume nans to be equal

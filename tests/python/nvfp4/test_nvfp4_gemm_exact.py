@@ -1,3 +1,5 @@
+from miniTransformer.ops import quantization
+from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 import torch
 import fp4_gemm
 
@@ -33,19 +35,19 @@ def quantize_transpose_nvfp4(
     )
     x_nvfp4_sut = nvfp4_quantizer.update_quantized(x, x_nvfp4_sut)
     assert x_nvfp4_sut._rowwise_data is not None
-    qx_te: torch.Tensor = x_nvfp4_sut._rowwise_data.view(dtype=torch.uint8)
+    qx: torch.Tensor = x_nvfp4_sut._rowwise_data.view(dtype=torch.uint8)
     assert x_nvfp4_sut._rowwise_scale_inv is not None
-    sx_te: torch.Tensor = x_nvfp4_sut._rowwise_scale_inv
-    qx_t_te = (
+    sx: torch.Tensor = x_nvfp4_sut._rowwise_scale_inv
+    qx_t = (
         x_nvfp4_sut._columnwise_data.view(dtype=torch.uint8)
         if x_nvfp4_sut._columnwise_data is not None
         else None
     )
-    sx_t_te = x_nvfp4_sut._columnwise_scale_inv
-    qx_amax_te = x_nvfp4_sut._amax_rowwise
+    sx_t = x_nvfp4_sut._columnwise_scale_inv
+    qx_amax = x_nvfp4_sut._amax_rowwise
+    qx_amax_t = x_nvfp4_sut._amax_columnwise
 
-
-    return qx_te, sx_te, qx_t_te, sx_t_te, qx_amax_te
+    return quantization.QuantizeResult(qx, sx, qx_t, sx_t, qx_amax, qx_amax_t)
 
 
 def check_nvfp4_gemm_versus_reference(
@@ -69,8 +71,8 @@ def check_nvfp4_gemm_versus_reference(
     x = torch.randn((M, K), device="cuda").to(x_dtype)
     w = torch.randn((N, K), device="cuda").to(w_dtype)
 
-    qx, sx, qx_t, sx_t, qmax = quantize_transpose_nvfp4(x, False, True)
-    qw, sw, qw_t, sw_t, wmax = quantize_transpose_nvfp4(w, True, True)
+    x_res = quantize_transpose_nvfp4(x, False, True)
+    w_res = quantize_transpose_nvfp4(w, True, True)
 
     # Setup out tensor if accumulate is True
     if accumulate:
@@ -82,14 +84,14 @@ def check_nvfp4_gemm_versus_reference(
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
-    out = fp4_gemm.cublas_gemm(
-        qx,
-        sx,
-        qmax.item(),
+    y_native = fp4_gemm.cublas_gemm(
+        x_res.data,
+        x_res.scale,
+        x_res.global_amax_row.item(),
         True,
-        qw,
-        sw,
-        wmax.item(),
+        w_res.data,
+        w_res.scale,
+        w_res.global_amax_row.item(),
         False,
         1, 0,
         out,
@@ -98,6 +100,46 @@ def check_nvfp4_gemm_versus_reference(
         workspace.shape[0],
     )
 
+    ref_op = Nvfp4TiledQuantizeRefOp()
+    qparam_x = quantization.QParams(
+        output_dtype=torch.uint8, 
+        scaling_dtype=torch.float8_e4m3fn, 
+        quant_tile_shape=(1, 16), 
+        with_2d_quantization=False,
+        with_rht=True
+    )
+    qparam_w = quantization.QParams(
+        output_dtype=torch.uint8, 
+        scaling_dtype=torch.float8_e4m3fn, 
+        quant_tile_shape=(16, 16), 
+        with_2d_quantization=True,
+        with_rht=False
+    )
+    y_ref = ref_op.qgemm(
+        x_res.data,
+        w_res.data,
+        None,
+        torch.bfloat16,
+        x_res.scale,
+        w_res.scale,
+        None,
+        out,
+        accumulate=accumulate,
+        global_amax_qx=x_res.global_amax_row,
+        global_amax_qw=w_res.global_amax_row,
+        qparams_x=qparam_x,
+        qparams_w=qparam_w
+    )
+    
+    # just in case of accumulation, make sure y_ref and y_native are not the same tensor
+    assert y_ref is not y_native, "y_ref and y_native should not be the same tensor"
+    # Reset nans to zeros because torch.assert_close does not assume nans to be equal
+    assert not torch.isnan(y_ref.float()).all(), "All elements are nan"
+    y_ref = torch.where(y_ref.isnan(), torch.zeros_like(y_ref), y_ref)
+    y_native = torch.where(y_native.isnan(), torch.zeros_like(y_native), y_native)
+
+    # Compare results with some tolerance
+    torch.testing.assert_close(y_native, y_ref, atol=8e-3, rtol=8e-3)
 
 if __name__ == "__main__":
     check_nvfp4_gemm_versus_reference(

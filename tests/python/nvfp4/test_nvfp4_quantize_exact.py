@@ -83,8 +83,8 @@ def check_quantization_nvfp4_versus_reference(
 if __name__ == "__main__":
     check_quantization_nvfp4_versus_reference(
         x_dtype=torch.bfloat16,
-        M=128,
-        N=128,
+        M=1024,
+        N=4096,
         return_transpose=True,
         with_2d_quantization=True,
     )

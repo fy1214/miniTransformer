@@ -3,16 +3,14 @@ import torch
 import fp4_gemm
 from typing import Optional
 from miniTransformer.ops import quantization
+from miniTransformer.utils import utils
 
-import transformer_engine_torch as tex
 from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.constants import TE_DType
 from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
 
-te_dtype = tex.DType.kFloat4E2M1
 use_cpp_allocator = False
 
 class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
@@ -35,13 +33,12 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         x_dtype = x.dtype
 
         nvfp4_quantizer = NVFP4Quantizer(
-            fp4_dtype=te_dtype,
             rowwise=True,
             columnwise=return_transpose,
             with_amax_reduction=False,
             amax_reduction_group=None,
             with_rht=qparams.with_rht,
-            with_post_rht_amax=False,
+            with_post_rht_amax=qparams.with_rht,
             with_2d_quantization=with_2d_quantization,
         )
         if use_cpp_allocator:
@@ -76,7 +73,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             return_transpose=return_transpose,
             with_2d_quantization=qparams.with_2d_quantization,
         )
-        return quantization.QuantizeResult(data=nvfp4_tensor, data_t=nvfp4_tensor)
+        return quantization.QuantizeResult(data=nvfp4_tensor, scale=None, data_t=nvfp4_tensor,)
 
     def qgemm(
         self,
@@ -116,5 +113,5 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             ub_type=None,
             extra_output=None,
             bulk_overlap=False
-        )
+        )[0]
         return gemm_out

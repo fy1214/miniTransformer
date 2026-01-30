@@ -57,14 +57,14 @@ class TestLinearExact:
         return linear
 
 
-    def test_linear_forward(self):
+    def test_linear_forward(self, qparam: QuantizeRecipe):
         linear = self.build_linear(1024, 4096)
         inp = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
         out = linear(inp, is_first_microbatch=True, fp8_output=False, inp_meta=None)
 
         print("Linear forward pass successful.")
     
-    def test_linear_backward(self):
+    def test_linear_backward(self, qparam: QuantizeRecipe):
         linear = self.build_linear(1024, 4096)
 
         # mock main_grad
@@ -80,5 +80,5 @@ class TestLinearExact:
 
 if __name__ == "__main__":
     test = TestLinearExact()
-    test.test_linear_forward()
-    test.test_linear_backward()
+    test.test_linear_forward(QuantizeRecipe.FP4_SUB_CHANNEL)
+    test.test_linear_backward(QuantizeRecipe.FP4_SUB_CHANNEL)

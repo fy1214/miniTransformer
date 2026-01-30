@@ -197,5 +197,10 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
         return get_qlinear_params_from_predefined(
 			QuantizeRecipe.FP4_SUB_CHANNEL_REF
 		)
+    if qat_params_idx == 4:
+		# default pow_2_scales=False
+        return get_qlinear_params_from_predefined(
+			QuantizeRecipe.FP4_SUB_CHANNEL
+		)
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

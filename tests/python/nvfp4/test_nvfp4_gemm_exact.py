@@ -116,18 +116,20 @@ def check_nvfp4_gemm_versus_reference(
         with_2d_quantization=True,
         with_rht=False
     )
+    x_res_ref = ref_op.quantize(x, qparam_x, True)
+    w_res_ref = ref_op.quantize(w, qparam_w, True)
     y_ref = ref_op.qgemm(
-        x_res.data,
-        w_res.data,
+        x_res_ref.data,
+        w_res_ref.data,
         None,
         torch.bfloat16,
-        x_res.scale,
-        w_res.scale,
+        x_res_ref.scale,
+        w_res_ref.scale,
         None,
         out,
         accumulate=accumulate,
-        global_amax_qx=x_res.global_amax_row,
-        global_amax_qw=w_res.global_amax_row,
+        global_amax_qx=x_res_ref.global_amax_row,
+        global_amax_qw=w_res_ref.global_amax_row,
         qparams_x=qparam_x,
         qparams_w=qparam_w
     )

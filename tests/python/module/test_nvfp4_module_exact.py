@@ -2,6 +2,7 @@
 #
 # See LICENSE for license information.
 
+from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
 import pytest
 import torch
 import transformer_engine.pytorch as te
@@ -153,12 +154,14 @@ def check_nvfp4_module_versus_reference(
     # Create native module
     print("\nCreate native module")
     if module_class == te.Linear:
+        qlinear_params = get_qlinear_params_from_predefined(QuantizeRecipe.FP4_SUB_CHANNEL)
         native_module = Linear(
             in_features=in_features,
             out_features=out_features,
             bias=bias,
             device=device,
             params_dtype=x_dtype,
+            qlinear_params=qlinear_params,
         )
     elif module_class == te.LayerNormLinear:
         native_module = te.LayerNormLinear(

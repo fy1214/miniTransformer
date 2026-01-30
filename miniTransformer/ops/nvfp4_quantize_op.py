@@ -73,7 +73,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             return_transpose=return_transpose,
             with_2d_quantization=qparams.with_2d_quantization,
         )
-        return quantization.QuantizeResult(data=nvfp4_tensor, scale=None, data_t=nvfp4_tensor,)
+        return quantization.QuantizeResult(data=nvfp4_tensor, scale=nvfp4_tensor, data_t=nvfp4_tensor, scale_t=nvfp4_tensor)
 
     def qgemm(
         self,

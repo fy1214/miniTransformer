@@ -267,7 +267,19 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         with_2d_quantization: bool,
         eps: float,  # pylint: disable=unused-argument
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Blockwise NVFP4 quantize; returns (qx, decode_scale).
 
+        Why quantize decode_scale is much larger than random scale (e.g. [88,448] vs [0,1]):
+        - decode_scale = vec_max / FLOAT4_E2M1_MAX * global_encode_scale
+          with global_encode_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / global_amax
+          = 2688 / global_amax.
+        - So decode_scale = vec_max * 448 / global_amax. The factor 448 (FLOAT8_E4M3_MAX)
+          comes from FP8 E4M3 range; scales are designed for encode/decode in FP8.
+        - vec_max = per-tile amax(|x|), global_amax = max(|x|). For randn, vec_max ~ 0.2--1 * global_amax,
+          hence decode_scale ~ 90--448. Random init uses rand()+eps in [0,1], so O(1).
+        - decode_scale is then clamped to [-448, 448] and stored as float8_e4m3fn.
+        """
         assert x.ndim == 2
         m, n = x.shape
         # Compute vec_max based on the original x (before reshape)

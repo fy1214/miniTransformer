@@ -2,7 +2,7 @@ import torch
 import pytest
 import time
 from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.nvfp4_qgemm_op_ref_triton import (
+from miniTransformer.ops.nvfp4_qgemm_op import (
     qgemm_cmp_triton_real,
     initialize_nvfp4_for_qgemm,
 )
@@ -12,14 +12,16 @@ class TestRefQgemmComparison:
     """Test cases comparing reference QGEMM implementations."""
 
     @pytest.mark.parametrize(
-        "M, K, N, pow_2_scales",
+        "M, K, N, pow_2_scales, seed",
         [
-            (256, 256, 256, False),  # NVFP4 mode, block_length=16
-            (8192, 8192, 8192, False),  # Larger matrix  
+            (256, 256, 256, False, 10),  # NVFP4 mode, block_length=16
+            (256, 256, 256, False, 1234),  # NVFP4 mode, block_length=16
+            (8192, 8192, 8192, False, 10),  # Larger matrix  
+            (8192, 8192, 8192, False, 1234),  # Larger matrix  
         ],
     )
     def test_ref_qgemm_vs_triton(
-        self, M, K, N, pow_2_scales
+        self, M, K, N, pow_2_scales, seed
     ):
         """
         Test comparing _ref_qgemm and _ref_qgemm_with_triton.
@@ -34,9 +36,9 @@ class TestRefQgemmComparison:
         out_dtype = torch.bfloat16
  
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = initialize_nvfp4_for_qgemm(
-            M, N, K, device=device, seed=10
+            M, N, K, device=device, seed=seed
         )
-        
+
         quantize_op = Nvfp4TiledQuantizeRefOp()
 
         # Warmup runs
@@ -159,8 +161,8 @@ class TestRefQgemmComparison:
         torch.testing.assert_close(
             y_ref.to(torch.float32),
             y_triton.to(torch.float32),
-            rtol=1e-1,  # 10% relative tolerance
-            atol=1e-1,  # 0.1 absolute tolerance
+            rtol=8e-3, 
+            atol=8e-3, 
             msg=f"_ref_qgemm and _ref_qgemm_with_triton outputs differ significantly for M={M}, K={K}, N={N}"
         )
 

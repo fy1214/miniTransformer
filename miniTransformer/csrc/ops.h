@@ -5,11 +5,13 @@
 #include <torch/all.h>
 
 void quantize_transpose_nvfp4(
-    const at::Tensor &input, 
-    at::Tensor *output,
-    at::Tensor *output_scale,
-    at::Tensor *output_transpose,
-    at::Tensor *output_scale_transpose,
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
+    at::Tensor &output,
+    at::Tensor &output_scale,
+    at::Tensor &output_transpose,
+    at::Tensor &output_scale_transpose,
     bool use_2d_quantization,
     bool return_transpose
 );
@@ -17,17 +19,16 @@ void quantize_transpose_nvfp4(
 void cublas_gemm( 
   const at::Tensor A,
   const at::Tensor A_scale,
-  const at::Tensor amax_A_tensor,
+  float amax_A,
   bool transa,
   const at::Tensor B,
   const at::Tensor B_scale,
-  const at::Tensor amax_B_tensor,
+  float amax_B,
   bool transb,
   float alpha,
   std::optional<float> beta, 
   at::Tensor D,
   bool accumulate,
-  bool use_split_accumulator,
   const at::Tensor workspace_tensor,
   size_t workspace_size
 );

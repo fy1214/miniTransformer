@@ -303,7 +303,9 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         sw: torch.Tensor,
         bias: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
+        grad: bool = False,
         accumulate: bool = False,
+        layout: str = "TN",
         qparams_x: Optional[QParams] = None,
         qparams_w: Optional[QParams] = None,
     ) -> torch.Tensor:

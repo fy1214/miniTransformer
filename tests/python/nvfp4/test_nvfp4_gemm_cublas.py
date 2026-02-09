@@ -1,94 +1,11 @@
 import torch
 import pytest
 import time
-from triton.tools.mxfp import MXFP4Tensor
-from miniTransformer.ops import quantization
 from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.ops.nvfp4_qgemm_op import (
-    qgemm_cmp_cublass_real
+    qgemm_cmp_cublass_real,
+    initialize_nvfp4_for_qgemm,
 )
-
-
-def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
-    """
-    Initialize NVFP4 format inputs for _ref_qgemm and _ref_qgemm_with_triton testing.
-    
-    Similar to initialize_block_scaled, but returns format compatible with qgemm interface:
-    - qx, qw: Packed uint8 tensors of shape (M, K//2) and (N, K//2)
-    - sx, sw: Scale tensors of shape (M, K//16) and (N, K//16), dtype float8_e4m3fn
-    - global_amax_qx, global_amax_qw: Global amax values
-    
-    Args:
-        M: Number of rows in input matrix
-        N: Number of columns in weight matrix
-        K: Inner dimension
-        device: Device to create tensors on (default: "cuda")
-        seed: Random seed for reproducibility (default: 10)
-        
-    Returns:
-        Tuple of (qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams):
-        - qx: Packed FP4 input tensor (M, K//2), uint8
-        - qw: Packed FP4 weight tensor (N, K//2), uint8
-        - sx: Scale tensor for x (M, K//16), float8_e4m3fn
-        - sw: Scale tensor for w (N, K//16), float8_e4m3fn
-        - global_amax_qx: Global amax for x, shape (1,)
-        - global_amax_qw: Global amax for w, shape (1,)
-        - qparams: Quantization parameters
-    """
-    torch.manual_seed(seed)
-    if device == "cuda":
-        torch.cuda.manual_seed(seed)
-    
-    VEC_SIZE = 16  
-    
-    x_ref = MXFP4Tensor(size=(M, K), device=device).random()
-    w_ref = MXFP4Tensor(size=(N, K), device=device).random()
-    
-    # Pack two fp4 elements per byte along K
-    qx = x_ref.to_packed_tensor(dim=1)  # (M, K//2), uint8
-    qw = w_ref.to_packed_tensor(dim=1)  # (N, K//2), uint8
-    
-    x_fp32 = x_ref.to(torch.float32)
-    w_fp32 = w_ref.to(torch.float32)
-    global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
-    global_amax_qw = torch.max(torch.abs(w_fp32)).to(torch.float32).view(1)
-    
-    epsilon = 1e-8
-    a_scale_2d = torch.rand([M, K // VEC_SIZE], device=device) + epsilon
-    b_scale_2d = torch.rand([N, K // VEC_SIZE], device=device) + epsilon
-
-    a_scale_2d = a_scale_2d.to(torch.float8_e4m3fn)
-    b_scale_2d = b_scale_2d.to(torch.float8_e4m3fn)
-
-    a_scale_shape_4d_shape = [M // 128, K // VEC_SIZE // 4, 32, 16]  # [M//128, K//64, 32, 16]
-    b_scale_shape_4d_shape = [N // 128, K // VEC_SIZE // 4, 32, 16]  # [N//128, K//64, 32, 16]
-
-    a_scale_4d = a_scale_2d.reshape(a_scale_shape_4d_shape)
-    b_scale_4d = b_scale_2d.reshape(b_scale_shape_4d_shape)
-
-    def pack_scale_from_4d(scale_4d, target_M, target_K):
-        M_chunk, K_chunk = scale_4d.shape[0], scale_4d.shape[1]
-        scale_4d_fp32 = scale_4d.to(torch.float32)
-        scale_5d = scale_4d_fp32.reshape(M_chunk, K_chunk, 32, 4, 4)
-        scale_5d = scale_5d.permute(0, 3, 2, 1, 4).contiguous()
-        scale_2d = scale_5d.reshape(target_M, target_K // 16)
-        return scale_2d
-    
-    sx = pack_scale_from_4d(a_scale_4d, M, K).to(torch.float8_e4m3fn)
-    sw = pack_scale_from_4d(b_scale_4d, N, K).to(torch.float8_e4m3fn)
-    
-    # create QParams
-    qparams = quantization.QParams(
-        scaling_dtype=torch.float8_e4m3fn,
-        output_dtype=torch.uint8,
-        eps=0.0,
-        pow_2_scales=False,
-        quant_tile_shape=(1, 16),
-        with_2d_quantization=False,
-        with_rht=False,
-    )
-
-    return qx, qw, sx, sw, a_scale_2d, b_scale_2d, global_amax_qx, global_amax_qw, qparams
 
 
 class TestRefQgemmCublasComparison:
@@ -127,10 +44,10 @@ class TestRefQgemmCublasComparison:
             if compute_capability[0] < 10:
                 pytest.skip(f"Block-scaled matmul requires compute capability 10.0+, got {compute_capability[0]}.{compute_capability[1]}")
 
-        qx, qw, sx, sw, sx_ref, sw_ref, global_amax_qx, global_amax_qw, qparams = initialize_nvfp4_for_qgemm(
+        qx, qw, sx_4d, sw_4d, sx, sw, global_amax_qx, global_amax_qw, qparams = initialize_nvfp4_for_qgemm(
             M, N, K, device=device, seed=10
         )
-        
+
         quantize_op = Nvfp4TiledQuantizeRefOp()
 
         # Warmup runs
@@ -138,13 +55,13 @@ class TestRefQgemmCublasComparison:
         for _ in range(warmup_runs):
             _ = quantize_op._ref_qgemm(
                 qx=qx, qw=qw, m_params=None, out_dtype=out_dtype,
-                sx=sx_ref, sw=sw_ref, bias=None, out=None, accumulate=False,
+                sx=sx, sw=sw, bias=None, out=None, accumulate=False,
                 pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
                 global_amax_qw=global_amax_qw, qparams_x=qparams, qparams_w=qparams,
             )
             _ = qgemm_cmp_cublass_real(
                 qx=qx, qw=qw, m_params=None, out_dtype=out_dtype,
-                sx=sx, sw=sw, bias=None, out=None, accumulate=False,
+                sx=sx_4d, sw=sw_4d, bias=None, out=None, accumulate=False,
                 pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
                 global_amax_qw=global_amax_qw, qparams_x=qparams, qparams_w=qparams
             )
@@ -162,8 +79,8 @@ class TestRefQgemmCublasComparison:
                 qw=qw,
                 m_params=None,
                 out_dtype=out_dtype,
-                sx=sx_ref,
-                sw=sw_ref,
+                sx=sx,
+                sw=sw,
                 bias=None,
                 out=None,
                 accumulate=False,
@@ -187,8 +104,8 @@ class TestRefQgemmCublasComparison:
                 qw=qw,
                 m_params=None,
                 out_dtype=out_dtype,
-                sx=sx,
-                sw=sw,
+                sx=sx_4d,
+                sw=sw_4d,
                 bias=None,
                 out=None,
                 accumulate=False,
@@ -287,10 +204,10 @@ class TestRefQgemmCublasComparison:
             if compute_capability[0] < 10:
                 pytest.skip(f"Block-scaled matmul requires compute capability 10.0+, got {compute_capability[0]}.{compute_capability[1]}")
 
-        qx, qw, sx, sw, sx_ref, sw_ref, global_amax_qx, global_amax_qw, qparams = initialize_nvfp4_for_qgemm(
+        qx, qw, sx_4d, sw_4d, sx, sw, global_amax_qx, global_amax_qw, qparams = initialize_nvfp4_for_qgemm(
             M, N, K, device=device, seed=10
         )
-        
+
         quantize_op = Nvfp4TiledQuantizeRefOp()
         pow_2_scales = False
 
@@ -300,7 +217,7 @@ class TestRefQgemmCublasComparison:
         # Test reference implementation
         y_ref = quantize_op._ref_qgemm(
             qx=qx, qw=qw, m_params=None, out_dtype=out_dtype,
-            sx=sx_ref, sw=sw_ref, bias=None, out=out.clone(), accumulate=True,
+            sx=sx, sw=sw, bias=None, out=out.clone(), accumulate=True,
             pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
             global_amax_qw=global_amax_qw, qparams_x=qparams, qparams_w=qparams,
         )
@@ -308,7 +225,7 @@ class TestRefQgemmCublasComparison:
         # Test cuBLAS implementation
         y_cublas = qgemm_cmp_cublass_real(
             qx=qx, qw=qw, m_params=None, out_dtype=out_dtype,
-            sx=sx, sw=sw, bias=None, out=out.clone(), accumulate=True,
+            sx=sx_4d, sw=sw_4d, bias=None, out=out.clone(), accumulate=True,
             pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
             global_amax_qw=global_amax_qw, qparams_x=qparams, qparams_w=qparams
         )
@@ -318,6 +235,11 @@ class TestRefQgemmCublasComparison:
         assert y_cublas.shape == (M, N), f"Expected shape ({M}, {N}), got {y_cublas.shape}"
         assert not torch.isnan(y_ref).any(), "_ref_qgemm output contains NaN values"
         assert not torch.isnan(y_cublas).any(), "qgemm_cmp_cublass_real output contains NaN values"
+
+
+        print(f"(pass M={M}, K={K}, N={N}, pow_2_scales={pow_2_scales})")
+        print(f"_ref_qgemm output: {y_ref}")
+        print(f"_ref_qgemm_with_triton output: {y_cublas}")
 
         # Compare results
         torch.testing.assert_close(

@@ -8,7 +8,6 @@ from miniTransformer.ops import quantization
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton.tools.mxfp import MXFP4Tensor
 from miniTransformer.ops.nvfp4_quantize_op_ref import cast_from_fp4x2
 from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 
@@ -40,6 +39,7 @@ def block_scaled_matmul_kernel(
         a_scale_desc,  
         b_desc,  
         b_scale_desc,  
+        alpha,
         c_desc,  
         M: tl.constexpr,  
         N: tl.constexpr,  
@@ -98,10 +98,25 @@ def block_scaled_matmul_kernel(
         offs_k_b += BLOCK_K // ELEM_PER_BYTE_B
         offs_scale_k += rep_k
 
+    accumulator = accumulator * alpha
     c_desc.store([offs_am, offs_bn], accumulator.to(output_dtype))
 
 # triton kernel wrapper
-def block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, dtype_dst, M, N, K, rep_m, rep_n, rep_k, configs):
+def block_scaled_matmul(
+    a_desc,
+    a_scale_desc,
+    b_desc,
+    b_scale_desc,
+    alpha: float,
+    dtype_dst,
+    M,
+    N,
+    K,
+    rep_m,
+    rep_n,
+    rep_k,
+    configs,
+):
     output = torch.empty((M, N), dtype=dtype_dst, device="cuda")
     if dtype_dst == torch.float32:
         dtype_dst = 0
@@ -122,6 +137,7 @@ def block_scaled_matmul(a_desc, a_scale_desc, b_desc, b_scale_desc, dtype_dst, M
         a_scale_desc,
         b_desc,
         b_scale_desc,
+        alpha,
         c_desc,
         M,
         N,
@@ -258,31 +274,16 @@ def qgemm_cmp_triton_real(
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K // ELEM_PER_BYTE_A])
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_N, BLOCK_K // ELEM_PER_BYTE_B])
 
-    sx_M, sx_K = sx.shape
-    sw_N, sw_K = sw.shape
-    
-    assert sx_M == M, f"sx first dimension mismatch: {sx_M} vs {M}"
-    assert sw_N == N, f"sw first dimension mismatch: {sw_N} vs {N}"
-    assert sx_K == K // 16, f"sx second dimension mismatch: {sx_K} vs {K//16}, K={K}"
-    assert sw_K == K // 16, f"sw second dimension mismatch: {sw_K} vs {K//16}, K={K}"
-
+    # sx, sw: 4D (M//128, K//64, 32, 16) and (N//128, K//64, 32, 16) from init; use directly, no permute
     a_scale_shape = [M // 128, K // VEC_SIZE // 4, 32, 16]  # [M//128, K//64, 32, 16]
-    b_scale_shape = [N // 128, K // VEC_SIZE // 4, 32, 16]  # [N//128, K//64, 32, 16]
+    b_scale_shape = [N // 128, K // VEC_SIZE // 4, 32, 16]
+    
+  # Convert 2D -> 4D for triton/cuBLAS
+    sx_4d = swizzle_scale(sx, M, K).to(torch.float8_e4m3fn)
+    sw_4d = swizzle_scale(sw, N, K).to(torch.float8_e4m3fn)
 
-
-    sx_fp32 = sx.to(torch.float32).to(device) if sx.dtype != torch.float32 else sx.to(device)
-    sw_fp32 = sw.to(torch.float32).to(device) if sw.dtype != torch.float32 else sw.to(device)
-
-    sx_reshaped = sx_fp32.reshape(M // 128, 4, 32, K // 64, 4)
-    sx_reshaped = sx_reshaped.permute(0, 3, 2, 1, 4).contiguous()
-    sx_reshaped = sx_reshaped.reshape(a_scale_shape)
-
-    sw_reshaped = sw_fp32.reshape(N // 128, 4, 32, K // 64, 4)
-    sw_reshaped = sw_reshaped.permute(0, 3, 2, 1, 4).contiguous()
-    sw_reshaped = sw_reshaped.reshape(b_scale_shape)
-
-    sx_reshaped = sx_reshaped.to(torch.float8_e4m3fn)
-    sw_reshaped = sw_reshaped.to(torch.float8_e4m3fn)
+    sx_reshaped = sx_4d.to(torch.float8_e4m3fn).to(device)
+    sw_reshaped = sw_4d.to(torch.float8_e4m3fn).to(device)
 
     rep_m = BLOCK_M // 128
     rep_n = BLOCK_N // 128
@@ -310,21 +311,19 @@ def qgemm_cmp_triton_real(
         "VEC_SIZE": VEC_SIZE,
     }
 
+    # Global alpha for NVFP4: (global_amax_qx * global_amax_qw) / (6*6*448*448). Use 1.0 if pow_2_scales or K==0.
+    if not pow_2_scales and K > 0 and global_amax_qx is not None and global_amax_qw is not None:
+        factor = 6.0 * 6.0 * 448.0 * 448.0
+        alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
+    else:
+        alpha = 1.0
 
-    output_dtype_for_kernel = torch.float16 
+    output_dtype_for_kernel = torch.float16
     output = block_scaled_matmul(
         a_desc, a_scale_desc, b_desc, b_scale_desc,
+        alpha,
         output_dtype_for_kernel, M, N, K, rep_m, rep_n, rep_k, configs
     )
-
-    # Apply global scaling for NVFP4 mode
-    if not pow_2_scales and K > 0:
-        assert global_amax_qx is not None
-        assert global_amax_qw is not None
-        factor = 6.0 * 6.0 * 448.0 * 448.0
-        partial_alpha = global_amax_qx * global_amax_qw
-        alpha = torch.div(partial_alpha, factor).squeeze(-1)
-        output = alpha * output
 
     # Handle accumulation
     if accumulate:
@@ -356,15 +355,15 @@ def qgemm_cmp_cublass_real(
     cuBLAS block-scaled QGEMM implementation using fp4_gemm.block_scaled_matmul_nvfp4.
     
     This implementation uses cuBLAS's hardware-accelerated block-scaled matmul for NVFP4 format.
-    It converts 2D scales (M, K//16) to the 4D layout expected by cuBLAS (M//128, K//64, 32, 16).
+    sx, sw must be 4D (M//128, K//64, 32, 16) and (N//128, K//64, 32, 16); use directly, no permute.
     
     Args:
         qx: Packed FP4 input tensor (M, K//2), uint8
         qw: Packed FP4 weight tensor (N, K//2), uint8
         m_params: Matrix multiplication parameters
         out_dtype: Output data type
-        sx: Scale tensor for x (M, K//16), float8_e4m3fn
-        sw: Scale tensor for w (N, K//16), float8_e4m3fn
+        sx: Scale tensor for x, 4D (M//128, K//64, 32, 16), float8_e4m3fn
+        sw: Scale tensor for w, 4D (N//128, K//64, 32, 16), float8_e4m3fn
         bias: Optional bias tensor (not supported, must be None)
         out: Optional output tensor for accumulation
         accumulate: Whether to accumulate into output tensor
@@ -388,54 +387,15 @@ def qgemm_cmp_cublass_real(
     assert qx.dtype == torch.uint8, f"qx must be uint8, got {qx.dtype}"
     assert qw.dtype == torch.uint8, f"qw must be uint8, got {qw.dtype}"
     
-    # Validate scale shapes
-    sx_M, sx_K = sx.shape
-    sw_N, sw_K = sw.shape
-    assert sx_M == M, f"sx first dimension mismatch: {sx_M} vs {M}"
-    assert sw_N == N, f"sw first dimension mismatch: {sw_N} vs {N}"
-    assert sx_K == K // 16, f"sx second dimension mismatch: {sx_K} vs {K//16}, K={K}"
-    assert sw_K == K // 16, f"sw second dimension mismatch: {sw_K} vs {K//16}, K={K}"
-    
-    # Convert 2D scales (M, K//16) to 4D layout (M//128, K//64, 32, 16) for cuBLAS
-    # This is the reverse of pack_scale_from_4d in initialize_nvfp4_for_qgemm
+    # sx, sw: 4D (M//128, K//64, 32, 16) and (N//128, K//64, 32, 16) from init; use directly, no permute
     VEC_SIZE = 16
-    M_chunk = M // 128
-    K_chunk = K // 64  # K // VEC_SIZE // 4
-    
-    def unpack_scale_to_4d(scale_2d, target_M, target_K):
-        """
-        Convert 2D scale (M, K//16) to 4D layout (M//128, K//64, 32, 16).
-        This is the reverse operation of pack_scale_from_4d.
-        
-        pack_scale_from_4d does:
-        1. Reshape 4D (M_chunk, K_chunk, 32, 16) -> 5D (M_chunk, K_chunk, 32, 4, 4)
-        2. Permute (0, 3, 2, 1, 4) -> (M_chunk, 4, 32, K_chunk, 4)
-        3. Reshape -> 2D (M, K//16)
-        
-        So we reverse:
-        1. Reshape 2D (M, K//16) -> 5D (M_chunk, 4, 32, K_chunk, 4)
-        2. Permute (0, 3, 2, 1, 4) -> (M_chunk, K_chunk, 32, 4, 4) [reverse of permute(0,3,2,1,4) is permute(0,3,2,1,4)]
-        3. Reshape -> 4D (M_chunk, K_chunk, 32, 16)
-        """
-        M_chunk = target_M // 128
-        K_chunk = target_K // 64
-        scale_2d_fp32 = scale_2d.to(torch.float32)
-        # Reshape 2D to 5D: (M, K//16) -> (M_chunk, 4, 32, K_chunk, 4)
-        scale_5d = scale_2d_fp32.reshape(M_chunk, 4, 32, K_chunk, 4)
-        # Reverse permute: permute(0, 3, 2, 1, 4) maps (M_chunk, 4, 32, K_chunk, 4) -> (M_chunk, K_chunk, 32, 4, 4)
-        # The reverse of permute(0, 3, 2, 1, 4) is permute(0, 3, 2, 1, 4) itself (it's symmetric)
-        scale_5d = scale_5d.permute(0, 3, 2, 1, 4).contiguous()
-        # Reshape 5D to 4D: (M_chunk, K_chunk, 32, 4, 4) -> (M_chunk, K_chunk, 32, 16)
-        scale_4d = scale_5d.reshape(M_chunk, K_chunk, 32, 16)
-        return scale_4d
-    
-    # Convert scales from 2D to 4D layout
-    sx_4d = unpack_scale_to_4d(sx, M, K)
-    sw_4d = unpack_scale_to_4d(sw, N, K)
-    
-    # Convert to FP8 E4M3 and flatten for cuBLAS
-    sx_4d = sx_4d.to(torch.float8_e4m3fn)
-    sw_4d = sw_4d.to(torch.float8_e4m3fn)
+    a_scale_shape = [M // 128, K // 64, 32, 16]
+    b_scale_shape = [N // 128, K // 64, 32, 16]
+    assert sx.shape == tuple(a_scale_shape), f"sx shape {sx.shape} vs {a_scale_shape}"
+    assert sw.shape == tuple(b_scale_shape), f"sw shape {sw.shape} vs {b_scale_shape}"
+
+    sx_4d = sx.to(torch.float8_e4m3fn).to(device)
+    sw_4d = sw.to(torch.float8_e4m3fn).to(device)
     sx_cublas = sx_4d.contiguous().flatten()
     sw_cublas = sw_4d.contiguous().flatten()
     
@@ -446,19 +406,19 @@ def qgemm_cmp_cublass_real(
     # Prepare output tensor (cuBLAS outputs FP16)
     output = torch.empty((M, N), dtype=torch.float16, device=device)
     
-    # Call cuBLAS block-scaled matmul
+    # Call cuBLAS block-scaled matmul (extension expects 8 args: ..., workspace_size, alpha)
     fp4_gemm.block_scaled_matmul_nvfp4(
-        qx, qw, output, sx_cublas, sw_cublas, workspace_tensor, workspace_size
+        qx, qw, output, sx_cublas, sw_cublas, workspace_tensor, workspace_size, 1.0
     )
     
     # Apply global scaling for NVFP4 mode
-    if not pow_2_scales and K > 0:
-        assert global_amax_qx is not None, "global_amax_qx must be provided for NVFP4 mode"
-        assert global_amax_qw is not None, "global_amax_qw must be provided for NVFP4 mode"
-        factor = 6.0 * 6.0 * 448.0 * 448.0
-        partial_alpha = global_amax_qx * global_amax_qw
-        alpha = torch.div(partial_alpha, factor).squeeze(-1)
-        output = alpha * output
+    # if not pow_2_scales and K > 0:
+    #     assert global_amax_qx is not None, "global_amax_qx must be provided for NVFP4 mode"
+    #     assert global_amax_qw is not None, "global_amax_qw must be provided for NVFP4 mode"
+    #     factor = 6.0 * 6.0 * 448.0 * 448.0
+    #     partial_alpha = global_amax_qx * global_amax_qw
+    #     alpha = torch.div(partial_alpha, factor).squeeze(-1)
+    #     output = alpha * output
     
     # Handle accumulation
     if accumulate:
@@ -469,74 +429,63 @@ def qgemm_cmp_cublass_real(
         output = output.to(out_dtype)
         return output
 
+def pack_scale_from_4d(scale_4d, target_M, target_K):
+    """
+    4D scale (M//128, K//64, 32, 16) -> 2D (M, K//16) for _ref_qgemm.
+    Triton/cuBLAS use 4D directly.
+    """
+    scale_4d_fp32 = scale_4d.to(torch.float32)
+    scale_2d = scale_4d_fp32.reshape(target_M, target_K // 16).contiguous()
+    return scale_2d
+
+
+def swizzle_scale(scale_2d, target_M, target_K):
+    """
+    2D scale (M, K//16) -> 4D (M//128, K//64, 32, 16) for triton/cuBLAS.
+    Inverse of pack_scale_from_4d.
+    """
+    num_chunk_m, num_chunk_k = target_M // 128, (target_K // 16) // 4
+    u = scale_2d.reshape(num_chunk_m, 4, 32, num_chunk_k, 4)
+    return u.permute(0, 3, 2, 1, 4).reshape(
+        num_chunk_m, num_chunk_k, 32, 16
+    )
+
+
 def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
     """
-    Initialize NVFP4 format inputs for _ref_qgemm and _ref_qgemm_with_triton testing.
+    Initialize NVFP4 format inputs for _ref_qgemm and qgemm_cmp_triton_real testing.
     
-    Similar to initialize_block_scaled, but returns format compatible with qgemm interface:
-    - qx, qw: Packed uint8 tensors of shape (M, K//2) and (N, K//2)
-    - sx, sw: Scale tensors of shape (M, K//16) and (N, K//16), dtype float8_e4m3fn
-    - global_amax_qx, global_amax_qw: Global amax values
+    Same flow as linear.py for data: FP32 tensors + quantize_op.quantize.
+    - x: randn (M, K); w: init like linear (normal mean=0, std=0.023).
+    - Scales: from Nvfp4TiledQuantizeRefOp.quantize() output (2D), converted to 4D for triton/cuBLAS.
+      - sx_4d/sw_4d: 4D (M//128, K//64, 32, 16) for triton/cuBLAS (via swizzle_scale).
+      - sx/sw: 2D (M, K//16) for _ref_qgemm (directly from quantize output).
     
-    Args:
-        M: Number of rows in input matrix
-        N: Number of columns in weight matrix
-        K: Inner dimension
-        device: Device to create tensors on (default: "cuda")
-        seed: Random seed for reproducibility (default: 10)
-        
     Returns:
-        Tuple of (qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams):
-        - qx: Packed FP4 input tensor (M, K//2), uint8
-        - qw: Packed FP4 weight tensor (N, K//2), uint8
-        - sx: Scale tensor for x (M, K//16), float8_e4m3fn
-        - sw: Scale tensor for w (N, K//16), float8_e4m3fn
-        - global_amax_qx: Global amax for x, shape (1,)
-        - global_amax_qw: Global amax for w, shape (1,)
-        - qparams: Quantization parameters
+        (qx, qw, sx_4d, sw_4d, sx, sw, global_amax_qx, global_amax_qw, qparams)
+        sx_4d/sw_4d: 4D for triton/cuBLAS; sx/sw: 2D for _ref_qgemm.
     """
     torch.manual_seed(seed)
     if device == "cuda":
         torch.cuda.manual_seed(seed)
     
-    VEC_SIZE = 16  
+    VEC_SIZE = 16
     
-    x_ref = MXFP4Tensor(size=(M, K), device=device).random()
-    w_ref = MXFP4Tensor(size=(N, K), device=device).random()
+    # Linear-style: FP32 input + weight, then quantize (like linear.py)
+    x_fp32 = torch.randn(M, K, device=device, dtype=torch.float32)
+    w_fp32 = torch.empty(N, K, device=device, dtype=torch.float32)
+    torch.nn.init.normal_(w_fp32, mean=0.0, std=0.023)
     
-    # Pack two fp4 elements per byte along K
-    qx = x_ref.to_packed_tensor(dim=1)  # (M, K//2), uint8
-    qw = w_ref.to_packed_tensor(dim=1)  # (N, K//2), uint8
-    
-    x_fp32 = x_ref.to(torch.float32)
-    w_fp32 = w_ref.to(torch.float32)
-    global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
-    global_amax_qw = torch.max(torch.abs(w_fp32)).to(torch.float32).view(1)
-    
-
-    a_scale_shape_4d = [M // 128, K // VEC_SIZE // 4, 32, 16]  # [M//128, K//64, 32, 16]
-    b_scale_shape_4d = [N // 128, K // VEC_SIZE // 4, 32, 16]  # [N//128, K//64, 32, 16]
-    
-    epsilon = 1e-8
-    a_scale_4d = torch.rand(a_scale_shape_4d, device=device) + epsilon
-    b_scale_4d = torch.rand(b_scale_shape_4d, device=device) + epsilon
-    
-    a_scale_4d = a_scale_4d.to(torch.float8_e4m3fn)
-    b_scale_4d = b_scale_4d.to(torch.float8_e4m3fn)
-    
-    def pack_scale_from_4d(scale_4d, target_M, target_K):
-        M_chunk, K_chunk = scale_4d.shape[0], scale_4d.shape[1]
-        scale_4d_fp32 = scale_4d.to(torch.float32)
-        scale_5d = scale_4d_fp32.reshape(M_chunk, K_chunk, 32, 4, 4)
-        scale_5d = scale_5d.permute(0, 3, 2, 1, 4).contiguous()
-        scale_2d = scale_5d.reshape(target_M, target_K // 16)
-        return scale_2d
-    
-    sx = pack_scale_from_4d(a_scale_4d, M, K).to(torch.float8_e4m3fn)
-    sw = pack_scale_from_4d(b_scale_4d, N, K).to(torch.float8_e4m3fn)
-    
-    # create QParams
-    qparams = quantization.QParams(
+    x_params = quantization.QParams(
+        scaling_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.uint8,
+        eps=0.0,
+        pow_2_scales=False,
+        quant_tile_shape=(1, 16),
+        with_2d_quantization=False,
+        with_rht=False,
+    )
+    w_params = quantization.QParams(
         scaling_dtype=torch.float8_e4m3fn,
         output_dtype=torch.uint8,
         eps=0.0,
@@ -546,5 +495,33 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
         with_rht=False,
     )
     
+    quantize_op = Nvfp4TiledQuantizeRefOp()
+    qresult_x = quantize_op.quantize(x_fp32, x_params, return_transpose=False)
+    qresult_w = quantize_op.quantize(w_fp32, w_params, return_transpose=False)
+    
+    qx = qresult_x.data
+    qw = qresult_w.data
+    global_amax_qx = qresult_x.global_amax_row
+    global_amax_qw = qresult_w.global_amax_row
+    if global_amax_qx is None:
+        global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
+    if global_amax_qw is None:
+        global_amax_qw = torch.max(torch.abs(w_fp32)).to(torch.float32).view(1)
+    if global_amax_qx.numel() > 1:
+        global_amax_qx = global_amax_qx.max().view(1)
+    if global_amax_qw.numel() > 1:
+        global_amax_qw = global_amax_qw.max().view(1)
+    
+    # Scales from Nvfp4TiledQuantizeRefOp: quantize produces 2D scales, convert to 4D for triton/cuBLAS
+    sx_2d = qresult_x.scale  # (M, K//16)
+    sw_2d = qresult_w.scale  # (N, K//16)
+    
+
+    # For _ref_qgemm, use 2D scales directly (from quantize output)
+    sx = sx_2d.to(torch.float8_e4m3fn)
+    sw = sw_2d.to(torch.float8_e4m3fn)
+
+    
+    qparams = x_params
     return qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams
 

@@ -51,3 +51,56 @@ void cutlass_gemm(
   const at::Tensor& B_sf,
   const at::Tensor& alpha
 );
+
+
+// quarter quantization
+void four_six_fp4_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_ptr,
+    float scale_override
+);
+
+void rtn_fp4_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_ptr,
+    float scale_override
+);
+
+void eden_fp4_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    const at::Tensor& inp,
+    const at::Tensor& amax_ptr,
+    float scale_override,
+    long seed
+);
+
+void group_transform_128_eden_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max, bool transpose);
+
+void dequant_tp_had_quant_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& x_micro_scales,
+    at::Tensor& x_global_scale,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max);

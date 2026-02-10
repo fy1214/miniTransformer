@@ -116,11 +116,9 @@ def setup_extensions() -> setuptools.Extension:
 
     include_dirs = [
         str(extensions_dir),
-        # cutlass include directories
-        #str(root_dir / "third-party" / "cutlass" / "include"),
-        #str(root_dir / "third-party" / "cutlass" / "include" / "cute"),
-        #str(root_dir / "third-party" / "cutlass" / "include" / "cutlass"),
-        #str(root_dir / "third-party" / "cutlass" / "tools" / "util" / "include"),
+        # CUTLASS include directories(TODO: Need General Modification )
+        "/workspace/cutlass/include",
+        "/workspace/cutlass/tools/util/include",
     ]
 
     # construct the extension

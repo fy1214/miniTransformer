@@ -3,7 +3,7 @@ import pytest
 import time
 from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.ops.nvfp4_qgemm_op import (
-    qgemm_cmp_triton_real,
+    qgemm_tl,
     initialize_nvfp4_for_qgemm,
 )
 
@@ -50,7 +50,7 @@ class TestRefQgemmComparison:
                 pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
                 global_amax_qw=global_amax_qw, qparams_x=qparams, qparams_w=qparams,
             )
-            _ = qgemm_cmp_triton_real(
+            _ = qgemm_tl(
                 qx=qx, qw=qw, m_params=None, out_dtype=out_dtype,
                 sx=sx, sw=sw, bias=None, out=None, accumulate=False,
                 pow_2_scales=pow_2_scales, global_amax_qx=global_amax_qx,
@@ -85,12 +85,12 @@ class TestRefQgemmComparison:
             torch.cuda.synchronize()
         ref_time = (time.time() - start_time) / num_runs
 
-        # Benchmark qgemm_cmp_triton_real
+        # Benchmark qgemm_tl
         if device == "cuda":
             torch.cuda.synchronize()
         start_time = time.time()
         for _ in range(num_runs):
-            y_triton = qgemm_cmp_triton_real(
+            y_triton = qgemm_tl(
                 qx=qx,
                 qw=qw,
                 m_params=None,

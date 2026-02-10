@@ -423,3 +423,4 @@ void block_scaled_matmul_nvfp4(
       &A, &B, &output, &scale_A, &scale_B,
       workspace_tensor.data_ptr(), workspace_size, stream);
 }
+

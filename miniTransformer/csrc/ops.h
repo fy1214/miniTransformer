@@ -42,3 +42,12 @@ void block_scaled_matmul_nvfp4(
   const at::Tensor workspace_tensor,
   size_t workspace_size
 );
+
+void cutlass_gemm(
+  at::Tensor& D,
+  const at::Tensor& A,
+  const at::Tensor& B,
+  const at::Tensor& A_sf,
+  const at::Tensor& B_sf,
+  const at::Tensor& alpha
+);

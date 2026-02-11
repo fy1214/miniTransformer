@@ -28,9 +28,9 @@ def _group_transform_128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         h,
         x.detach(),
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
-        transpose=transpose,
+        fp4_max,
+        fp8_max,
+        transpose,
     )
 
 
@@ -50,8 +50,8 @@ def _dequant_tp_had_quant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         x_group_scales,
         x_tensor_scale,
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
+        fp4_max,
+        fp8_max,
     )
 
 

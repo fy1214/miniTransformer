@@ -83,7 +83,7 @@ def test_nvfp4_quarter_fp4(m, n, four_over_six, expected):
 
 
 @pytest.mark.parametrize("m,n", [(1024, 1024), (1024, 4096), (4096, 2048)])
-@pytest.mark.parametrize("transpose,expected", [(False, 3.38), (True, 3.52)])
+@pytest.mark.parametrize("transpose,expected", [(False, 3.37), (True, 3.37)])
 def test_eden_identity(m, n, transpose, expected):
     x = torch.randn((4096, 2048), device="cuda", dtype=torch.bfloat16)
     dq = quant_with_transform(x.to(torch.bfloat16), transpose=transpose)

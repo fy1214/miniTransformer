@@ -90,7 +90,7 @@ __global__ void four_six_fp4_kernel(
     float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
 
     // six
-    std::vector<float> candidates = {6.f, 4.f};
+    float candidates[] = {6.f, 4.f};
     QuantResult results[NumCandidates];
     float scores[NumCandidates];
     float best = INFINITY;

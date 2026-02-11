@@ -348,6 +348,6 @@ void group_transform_128_eden_binding(
         reinterpret_cast<unsigned int *>(max_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(x.data_ptr()),
-        *seed.data_ptr(),  fp4_max, fp8_max,
+        *reinterpret_cast<float *>(seed.data_ptr()),  fp4_max, fp8_max,
         x.size(0), x.size(1), transpose);
 }

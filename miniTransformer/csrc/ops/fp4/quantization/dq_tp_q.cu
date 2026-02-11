@@ -4,6 +4,12 @@
 
 #include <cstdio>
 #include <cuda_bf16.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
+#include <ATen/cuda/Exceptions.h>
+#include <torch/extension.h>
+#include <torch/torch.h>  
+
 #include "../../../util/quarter/utils.cuh"
 #include "../../../util/quarter/vec.cuh"
 

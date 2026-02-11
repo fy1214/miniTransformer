@@ -261,32 +261,31 @@ void dequant_tp_had_quant_binding(
     float fp4_max, float fp8_max)
 {
 
-    TORCH_CHECK(x.ndim() == 2, "x must be 2D");
-    TORCH_CHECK(x.shape(0) % 128 == 0, "x.shape(0) must be multiple of 128");
-    TORCH_CHECK(x.shape(1) % 64 == 0, "x.shape(1) must be multiple of 64");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.size(0) % 128 == 0, "x.shape(0) must be multiple of 128");
+    TORCH_CHECK(x.size(1) % 64 == 0, "x.shape(1) must be multiple of 64");
     TORCH_CHECK(h.dtype() == at::ScalarType::BFloat16, "Input tensor h must be of type bfloat16");
 
-    TORCH_CHECK(y.shape(1) == x.shape(0) / 2, "Invalid y shape");
-    TORCH_CHECK(y.shape(0) == x.shape(1) * 2, "Invalid y shape");
-    TORCH_CHECK(group_scales.shape(1) == x.shape(0) / 16, "Invalid group_scales shape");
-    TORCH_CHECK(group_scales.shape(0) == x.shape(1) * 2, "Invalid group_scales shape");
+    TORCH_CHECK(y.size(1) == x.size(0) / 2, "Invalid y shape");
+    TORCH_CHECK(y.size(0) == x.size(1) * 2, "Invalid y shape");
+    TORCH_CHECK(group_scales.size(1) == x.size(0) / 16, "Invalid group_scales shape");
+    TORCH_CHECK(group_scales.size(0) == x.size(1) * 2, "Invalid group_scales shape");
 
-    TORCH_CHECK(x_micro_scales.shape(0) == x.shape(0), "Invalid x_micro_scales shape");
-    TORCH_CHECK(x_micro_scales.shape(1) == x.shape(1) / 8, "Invalid x_micro_scales shape");
+    TORCH_CHECK(x_micro_scales.size(0) == x.size(0), "Invalid x_micro_scales shape");
+    TORCH_CHECK(x_micro_scales.size(1) == x.size(1) / 8, "Invalid x_micro_scales shape");
 
-    TORCH_CHECK(scratch.shape(0) == x.size() / 8, "Invalid scratch shape");
     TORCH_CHECK(scratch.dtype() == at::ScalarType::BFloat16, "Invalid scratch dtype");
 
     dequant_tp_had_quant(
-        y.data_ptr(),
+        reinterpret_cast<__nv_fp4x2_storage_t*>(y.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(group_scales.data_ptr()),
-        tensor_scale.data_ptr(),
+        reinterpret_cast<float*>(tensor_scale.data_ptr()),
         reinterpret_cast<nv_bfloat16*>(scratch.data_ptr()),
-        max_scale.data_ptr(),
+        reinterpret_cast<unsigned int *>(max_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(h.data_ptr()),
-        x.data_ptr(),
+        reinterpret_cast<const __nv_fp4x2_storage_t *>(x.data_ptr()),
         reinterpret_cast<const __nv_fp8_e4m3*>(x_micro_scales.data_ptr()),
-        x_global_scale.data_ptr(),
+        reinterpret_cast<const float *>(x_global_scale.data_ptr()),
         *seed.data_ptr(),  fp4_max, fp8_max,
-        x.shape(0), x.shape(1) * 2);
+        x.size(0), x.size(1) * 2);
 }

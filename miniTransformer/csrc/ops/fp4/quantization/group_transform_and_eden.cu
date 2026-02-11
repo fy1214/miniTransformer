@@ -320,35 +320,34 @@ void group_transform_128_eden_binding(
     float fp4_max, float fp8_max, bool transpose)
 {
 
-    TORCH_CHECK(x.ndim() == 2, "Input must be 2D");
-    TORCH_CHECK(x.shape(0) % 128 == 0, "Input height must be a multiple of 128");
-    TORCH_CHECK(x.shape(1) % 128 == 0, "Input width must be a multiple of 128");
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(x.size(0) % 128 == 0, "Input height must be a multiple of 128");
+    TORCH_CHECK(x.size(1) % 128 == 0, "Input width must be a multiple of 128");
     TORCH_CHECK(h.dtype() == at::ScalarType::BFloat16, "Input tensor h must be of type bfloat16");
     TORCH_CHECK(x.dtype() == at::ScalarType::BFloat16, "Input tensor x must be of type bfloat16");
 
     if (transpose) {
-        TORCH_CHECK(y.shape(1) == x.shape(0) / 2, "Invalid shape for y");
-        TORCH_CHECK(y.shape(0) == x.shape(1), "Invalid shape for y");
-        TORCH_CHECK(group_scales.shape(1) == x.shape(0) / 16, "Invalid shape for group_scales");
-        TORCH_CHECK(group_scales.shape(0) == x.shape(1), "Invalid shape for group_scales");
+        TORCH_CHECK(y.size(1) == x.size(0) / 2, "Invalid shape for y");
+        TORCH_CHECK(y.size(0) == x.size(1), "Invalid shape for y");
+        TORCH_CHECK(group_scales.size(1) == x.size(0) / 16, "Invalid shape for group_scales");
+        TORCH_CHECK(group_scales.size(0) == x.size(1), "Invalid shape for group_scales");
     } else {
-        TORCH_CHECK(y.shape(0) == x.shape(0), "Invalid shape for y");
-        TORCH_CHECK(y.shape(1) == x.shape(1) / 2, "Invalid shape for y");
-        TORCH_CHECK(group_scales.shape(0) == x.shape(0), "Invalid shape for group_scales");
-        TORCH_CHECK(group_scales.shape(1) == x.shape(1) / 16, "Invalid shape for group_scales");
+        TORCH_CHECK(y.size(0) == x.size(0), "Invalid shape for y");
+        TORCH_CHECK(y.size(1) == x.size(1) / 2, "Invalid shape for y");
+        TORCH_CHECK(group_scales.size(0) == x.size(0), "Invalid shape for group_scales");
+        TORCH_CHECK(group_scales.size(1) == x.size(1) / 16, "Invalid shape for group_scales");
     }
 
-    TORCH_CHECK(scratch.shape(0) == x.size() / 16, "Invalid shape for scratch");
     TORCH_CHECK(scratch.dtype() == at::ScalarType::BFloat16, "Invalid dtype for scratch");
 
     group_transform_128_eden(
-        y.data_ptr(),
+        reinterpret_cast<__nv_fp4x2_storage_t*>(y.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(group_scales.data_ptr()),
-        tensor_scale.data_ptr(),
+        reinterpret_cast<float*>(tensor_scale.data_ptr()),
         reinterpret_cast<nv_bfloat16*>(scratch.data_ptr()),
-        max_scale.data_ptr(),
+        reinterpret_cast<unsigned int *>(max_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(h.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(x.data_ptr()),
         *seed.data_ptr(),  fp4_max, fp8_max,
-        x.shape(0), x.shape(1), transpose);
+        x.size(0), x.size(1), transpose);
 }

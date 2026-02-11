@@ -80,7 +80,7 @@ struct get_candidate_helper<> {
     }
 };
 
-template<float... Candidates>
+template<int NumCandidates>
 __global__ void four_six_fp4_kernel(
     __nv_fp4x4_e2m1* y_ptr, 
     __nv_fp8_e4m3* scale_ptr, 
@@ -110,12 +110,13 @@ __global__ void four_six_fp4_kernel(
     float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
 
     // six
+    std::vector<float> candidates = {6.f, 4.f};
     QuantResult results[NumCandidates];
     float scores[NumCandidates];
     float best = INFINITY;
     QuantResult res;
     for (int i = 0; i < NumCandidates; ++i) {
-        results[i] = quantize(full_abs_max, get_candidate_helper<Candidates...>::get(i) * inv_scale_override, scale, x);
+        results[i] = quantize(full_abs_max, candidates[i] * inv_scale_override, scale, x);
         scores[i] = quant_error(x, results[i], scale);
         if (scores[i] < best) {
             best = scores[i];
@@ -141,7 +142,7 @@ void four_six_fp4(
     int n_vecs = nelem / 8;
     int block_size = 256;
     int n_blocks = (n_vecs + block_size - 1) / block_size;
-    four_six_fp4_kernel<6.f, 4.f><<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, 1.f / scale_override, n_vecs);
+    four_six_fp4_kernel<2><<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, 1.f / scale_override, n_vecs);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -158,7 +159,7 @@ void rtn_fp4(
     int n_vecs = nelem / 8;
     int block_size = 256;
     int n_blocks = (n_vecs + block_size - 1) / block_size;
-    four_six_fp4_kernel<6.f><<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, 1.f / scale_override, n_vecs);
+    four_six_fp4_kernel<1><<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, 1.f / scale_override, n_vecs);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -171,7 +172,7 @@ void four_six_fp4_binding(
     float scale_override
     )
 {
-    TORCH_CHECK(out.shape(0) == inp.shape(0), "Output and input must have the same number of rows");
+    TORCH_CHECK(out.size(0) == inp.size(0), "Output and input must have the same number of rows");
     TORCH_CHECK(inp.dtype() == at::kBFloat16, "Input must be bfloat16");
 
     const size_t total_elements = inp.numel();
@@ -179,9 +180,9 @@ void four_six_fp4_binding(
     four_six_fp4(
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
-        global_scale.data_ptr(),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
-        amax_ptr.data_ptr(),
+        reinterpret_cast<const float*>(amax_ptr.data_ptr()),
         scale_override, total_elements);
 }
 
@@ -194,7 +195,7 @@ void rtn_fp4_binding(
     float scale_override
     )
 {
-    TORCH_CHECK(out.shape(0) == inp.shape(0), "Output and input must have the same number of rows");
+    TORCH_CHECK(out.size(0) == inp.size(0), "Output and input must have the same number of rows");
     TORCH_CHECK(inp.dtype() == at::ScalarType::BFloat16, "Input must be bfloat16");
 
     const size_t total_elements = inp.numel();
@@ -202,8 +203,8 @@ void rtn_fp4_binding(
     rtn_fp4(
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
-        global_scale.data_ptr(),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
-        amax_ptr.data_ptr(),
+        reinterpret_cast<const float*>(amax_ptr.data_ptr()),
         scale_override, total_elements);
 }

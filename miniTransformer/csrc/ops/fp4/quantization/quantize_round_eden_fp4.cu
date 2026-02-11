@@ -121,13 +121,13 @@ void eden_fp4_binding(
     long seed
 )
 {
-    TORCH_CHECK(out.shape(0) == inp.shape(0), "Output and input must have the same number of rows");
+    TORCH_CHECK(out.size(0) == inp.size(0), "Output and input must have the same number of rows");
     TORCH_CHECK(inp.dtype() == at::ScalarType::BFloat16, "Input must be bfloat16");
 
     eden_fp4(
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
-        amax_ptr.data_ptr(),
+        reinterpret_cast<const float*>(amax_ptr.data_ptr()),
         scale_override, seed, inp.numel());
 }

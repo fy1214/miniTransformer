@@ -286,6 +286,6 @@ void dequant_tp_had_quant_binding(
         reinterpret_cast<const __nv_fp4x2_storage_t *>(x.data_ptr()),
         reinterpret_cast<const __nv_fp8_e4m3*>(x_micro_scales.data_ptr()),
         reinterpret_cast<const float *>(x_global_scale.data_ptr()),
-        *seed.data_ptr(),  fp4_max, fp8_max,
+        *reinterpret_cast<float *>(seed.data_ptr()),  fp4_max, fp8_max,
         x.size(0), x.size(1) * 2);
 }

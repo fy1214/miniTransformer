@@ -61,25 +61,6 @@ __forceinline__ __device__ float quant_error(bf16x8 x, const QuantResult& q, flo
     return local_error;
 }
 
-
-template<float... Others>
-struct get_candidate_helper;
-
-template<float Value, float... Others>
-struct get_candidate_helper<Value, Others...> {
-    static __forceinline__ __device__ float get(int i) {
-        if (i == 0) return Value;
-        return get_candidate_helper<Others...>::get(i - 1);
-    }
-};
-
-template<>
-struct get_candidate_helper<> {
-    static __forceinline__ __device__ float get(int i) {
-        __builtin_unreachable();
-    }
-};
-
 template<int NumCandidates>
 __global__ void four_six_fp4_kernel(
     __nv_fp4x4_e2m1* y_ptr, 
@@ -90,7 +71,6 @@ __global__ void four_six_fp4_kernel(
     float inv_scale_override, 
     int nvecs
 ) {
-    constexpr int NumCandidates = sizeof...(Candidates);
     float global_abs_max = *amax_ptr;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if(idx >= nvecs) return;

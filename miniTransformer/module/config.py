@@ -5,10 +5,10 @@ import os
 import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
-from miniTransformer.ops.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from ..ops.quantization import QParams, MMParams
-from miniTransformer.ops import quantization
+from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.quantiztion.quantization import QParams, MMParams
+from miniTransformer.quantiztion import quantization
 
 logger = logging.getLogger(__name__)
 

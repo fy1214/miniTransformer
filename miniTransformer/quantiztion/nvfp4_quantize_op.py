@@ -2,7 +2,7 @@ import math
 import torch
 import fp4_gemm
 from typing import Optional
-from miniTransformer.ops import quantization
+from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 
 from transformer_engine.pytorch import NVFP4Quantizer

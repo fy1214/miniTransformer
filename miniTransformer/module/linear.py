@@ -419,7 +419,7 @@ class _QuantizedLinear(torch.autograd.Function):
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
         # For wgrad, we will set the dtype to float32
-        out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else torch.float32
+        out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
         wgrad = ctx.quantize_op.qgemm(
             qdy_t,

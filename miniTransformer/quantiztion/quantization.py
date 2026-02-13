@@ -8,6 +8,16 @@ from typing import Optional, Protocol, Tuple
 from ..utils import utils
 
 
+@enum.unique
+class ParamType(enum.Enum):
+    """quantization type for linear layers."""
+
+    # Non-quantize
+    X = "x"
+    WEIGHT = "weight"
+    Y = "y"
+
+
 @dataclasses.dataclass(frozen=True)
 class QParams:
     """Quantization parameters.
@@ -30,6 +40,7 @@ class QParams:
     quant_tile_shape: Tuple[int, int] | None = None
     with_2d_quantization:  bool = False
     with_rht: bool = False
+    param_type: ParamType = ParamType.X
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,8 +68,8 @@ class QuantizeResult:
     scale: torch.Tensor
     data_t: torch.Tensor | None = None
     scale_t: torch.Tensor | None = None
-    global_amax_row: torch.Tensor | None = None
-    global_amax_col: torch.Tensor | None = None
+    tensor_scale: torch.Tensor | None = None
+    tensor_scale_t: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -78,9 +89,9 @@ class QuantizeResultCache:
         assert self.data is not None
         assert self.scale is not None
         return QuantizeResult(
-            data=self.data, 
-            scale=self.scale, 
-            data_t=self.data_t, 
+            data=self.data,
+            scale=self.scale,
+            data_t=self.data_t,
             scale_t=self.scale_t,
             global_amax_row=self.global_amax_row,
             global_amax_col=self.global_amax_col
@@ -96,6 +107,10 @@ class QuantizeInputMetaBase:
 
 
 class QuantizeOpBase():
+
+    @staticmethod
+    def compute_global_amax(self, x: torch.Tensor):
+        return torch.max(torch.abs(x)).to(torch.float32).view(1)
 
     def quantize(
         self,
@@ -126,13 +141,15 @@ class QuantizeOpBase():
         out_dtype: torch.dtype,
         sx: torch.Tensor,
         sw: torch.Tensor,
-        bias: torch.Tensor | None = None,
-        out: torch.Tensor | None = None,
-        accumulate: bool = False,
-        global_amax_qx: torch.Tensor | None = None,
-        global_amax_qw: torch.Tensor | None = None,
-        qparams_x: Optional[QParams] = None,
-        qparams_w: Optional[QParams] = None,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        grad: bool,
+        accumulate: bool,
+        layout: str,
+        global_amax_qx: torch.Tensor,
+        global_amax_qw: torch.Tensor,
+        qparams_x: Optional[QParams],
+        qparams_w: Optional[QParams],
     ) -> torch.Tensor:
         """Quantized GEMM interface.
 
@@ -306,6 +323,8 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         grad: bool = False,
         accumulate: bool = False,
         layout: str = "TN",
+        global_amax_qx: torch.Tensor | None = None,
+        global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[QParams] = None,
         qparams_w: Optional[QParams] = None,
     ) -> torch.Tensor:

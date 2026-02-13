@@ -1,8 +1,8 @@
 import torch
 import fp4_gemm
 
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.quantization import QParams
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.quantiztion.quantization import QParams
 
 from transformer_engine.pytorch import NVFP4Quantizer
 import transformer_engine_torch as tex

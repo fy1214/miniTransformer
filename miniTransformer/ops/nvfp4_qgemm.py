@@ -11,7 +11,7 @@ from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantize
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 import fp4_gemm
-from ..triton.gemm_tl import block_scaled_matmul
+from miniTransformer.triton.gemm_tl import block_scaled_matmul
 
 
 def qgemm_cmp_triton_ref(

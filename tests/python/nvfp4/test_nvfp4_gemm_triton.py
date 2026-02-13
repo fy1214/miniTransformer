@@ -1,8 +1,8 @@
 import torch
 import pytest
 import time
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.nvfp4_qgemm_op import (
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.ops.nvfp4_qgemm import (
     qgemm_tl,
     initialize_nvfp4_for_qgemm,
 )

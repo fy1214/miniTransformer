@@ -122,23 +122,23 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
             x_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(1, 16),  
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
                 with_rht=True
             ),
             w_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(16, 16), 
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(16, 16),
                 with_2d_quantization=True,
                 with_rht=False
             ),
             g_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(1, 16),  
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
                 with_rht=True
             ),
@@ -151,23 +151,23 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
             x_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(1, 16),  
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
                 with_rht=True
             ),
             w_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(16, 16), 
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(16, 16),
                 with_2d_quantization=True,
                 with_rht=False
             ),
             g_params=QParams(
-                output_dtype=torch.uint8, 
-                scaling_dtype=torch.float8_e4m3fn, 
-                quant_tile_shape=(1, 16),  
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
                 with_rht=True
             ),
@@ -193,14 +193,14 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
             QuantizeRecipe.INT4_SUB_CHANNEL
         )
     if qat_params_idx == 3:
-		# default pow_2_scales=False
+        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
-			QuantizeRecipe.FP4_SUB_CHANNEL_REF
-		)
+            QuantizeRecipe.FP4_SUB_CHANNEL_REF
+        )
     if qat_params_idx == 4:
-		# default pow_2_scales=False
+        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
-			QuantizeRecipe.FP4_SUB_CHANNEL
-		)
+            QuantizeRecipe.FP4_SUB_CHANNEL
+        )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

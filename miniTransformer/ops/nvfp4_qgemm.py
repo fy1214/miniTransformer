@@ -359,8 +359,8 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
     
     qx = qresult_x.data
     qw = qresult_w.data
-    global_amax_qx = qresult_x.global_amax_row
-    global_amax_qw = qresult_w.global_amax_row
+    global_amax_qx = qresult_x.tensor_scale
+    global_amax_qw = qresult_w.tensor_scale_t
     if global_amax_qx is None:
         global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
     if global_amax_qw is None:

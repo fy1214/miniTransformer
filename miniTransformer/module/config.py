@@ -8,7 +8,7 @@ from typing import Dict, Optional, Mapping, Sequence, Type
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quarter_op import Nvfp4QuarterQuantizeOp
-from miniTransformer.quantiztion.quantization import QParams, MMParams
+from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType
 from miniTransformer.quantiztion import quantization
 
 logger = logging.getLogger(__name__)
@@ -157,21 +157,24 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                param_type=ParamType.X
             ),
             w_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=True,
-                with_rht=False
+                with_rht=False,
+                param_type=ParamType.WEIGHT
             ),
             g_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                param_type=ParamType.Y
             ),
             quantize_op=Nvfp4QuarterQuantizeOp(),
             allgather_quantize=False,

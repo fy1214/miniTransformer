@@ -109,7 +109,7 @@ class QuantizeInputMetaBase:
 class QuantizeOpBase():
 
     @staticmethod
-    def compute_global_amax(self, x: torch.Tensor):
+    def compute_global_amax(x: torch.Tensor):
         return torch.max(torch.abs(x)).to(torch.float32).view(1)
 
     def quantize(

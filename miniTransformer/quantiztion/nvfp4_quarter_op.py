@@ -44,6 +44,11 @@ def _fp4_mm_fake(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w
     return torch.empty((x_fp4.shape[0], w_fp4.shape[0]), device=x_fp4.device, dtype=torch.bfloat16)
 
 
+@torch.compile(dynamic=False)
+def abs_max(x):
+    return x.abs().max().to(torch.float32)
+
+
 class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
 
     def __init__(self):
@@ -65,7 +70,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         return_transpose: bool,
         with_2d_quantization: bool
     ):
-        global_amax = self.compute_global_amax(x)
+        global_amax = abs_max(x)
         had = get_hadamard_matrix(128, x.dtype, x.device)
 
         with utils.nvtx_annotate("Quant", color="yellow"):

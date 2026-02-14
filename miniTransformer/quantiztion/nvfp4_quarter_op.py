@@ -33,7 +33,7 @@ def rerotate_hadamard(hadamard_matrix):
 
 @torch.library.custom_op("clover::fp4_mm", mutates_args=())
 def _fp4_mm(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    return fp4_gemm.matmul_nvf4_bf16_tn(
+    return fp4_gemm.cutlass_gemm(
         y, x_fp4, w_fp4,
         x_mx, w_mx,
         alpha=alpha)

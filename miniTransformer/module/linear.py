@@ -368,8 +368,8 @@ class _QuantizedLinear(torch.autograd.Function):
             qresult_dy.scale,
             qresult_dy.data_t,
             qresult_dy.scale_t,
-            qresult_dy.global_amax_row,
-            qresult_dy.global_amax_col,
+            qresult_dy.tensor_scale,
+            qresult_dy.tensor_scale_t,
         )
 
         # If memory saving is enabled, we need to AllGather the full

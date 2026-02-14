@@ -77,21 +77,21 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
             quant_weight = quant_fp4(x, amax=global_amax, scale_override=self.forward_scale_override, four_over_six=self.four_over_six)
 
             if return_transpose:
-                if qparams.param_type == quantization.ParamType.X:
+                if qparams.param_type == quantization.ParamType.Y:
+                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
+                        x=quant_weight.fp4,
+                        h=had,
+                        scale_override=self.backward_scale_override,
+                        transpose=True if qparams.param_type == quantization.ParamType.Y else False,
+                        scratch_amax=self.scratch_amax
+                    )
+                else:
                     xt_ht_fp4, xt_ht_ms, xt_ht_ts = dequant_tp_had_eden(
                         x=quant_weight.fp4,
                         x_group_scales=quant_weight.micro_scales,
                         x_tensor_scale=global_amax,
                         h=had,
                         scale_override=self.backward_scale_override,
-                        scratch_amax=self.scratch_amax
-                    )
-                else:
-                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
-                        x=quant_weight.fp4,
-                        h=had,
-                        scale_override=self.backward_scale_override,
-                        transpose=True if qparams.param_type == quantization.ParamType.Y else False,
                         scratch_amax=self.scratch_amax
                     )
 

@@ -239,7 +239,7 @@ class _QuantizedLinear(torch.autograd.Function):
             tp_group=tp_group,
         )
 
-        qx, sx, qx_global_amax_row = qresult_x.data, qresult_x.scale, qresult_x.global_amax_row
+        qx, sx, qx_global_amax_row = qresult_x.data, qresult_x.scale, qresult_x.tensor_scale
 
         # Quantize w only for is_first_microbatch is True or None
         update_quantize_weights = is_first_microbatch or is_first_microbatch is None
@@ -248,17 +248,17 @@ class _QuantizedLinear(torch.autograd.Function):
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=True
             )
-            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.global_amax_row
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
             # save quantized weight cache between microbatches
             weight_qresult_cache.data = qresult_w.data
             weight_qresult_cache.scale = qresult_w.scale
             weight_qresult_cache.data_t = qresult_w.data_t
             weight_qresult_cache.scale_t = qresult_w.scale_t
-            weight_qresult_cache.global_amax_row = qresult_w.global_amax_row
-            weight_qresult_cache.global_amax_col = qresult_w.global_amax_col
+            weight_qresult_cache.global_amax_row = qresult_w.tensor_scale
+            weight_qresult_cache.global_amax_col = qresult_w.tensor_scale_t
         else:
             qresult_w = weight_qresult_cache.to_qresult()
-            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.global_amax_row
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
             assert qw is not None, "quantized weight cache should not be None"
 
         # Forward pass GEMM
@@ -296,10 +296,10 @@ class _QuantizedLinear(torch.autograd.Function):
             qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col = (
                 qresult_x.data_t,
                 qresult_x.scale_t,
-                qresult_x.global_amax_col,
+                qresult_x.tensor_scale_t,
                 qresult_w.data_t,
                 qresult_w.scale_t,
-                qresult_w.global_amax_col,
+                qresult_w.tensor_scale_t,
             )
 
             # If memory saving is enabled, we only save a shard of the qx_t tensor.

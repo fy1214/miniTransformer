@@ -27,7 +27,12 @@ git submodule update --init --recursive
 NVTE_BUILD_DEBUG=1 pip3 install --no-build-isolation .
 ```
 
-然后编译miniTransformer `python setup.py install`
+然后编译miniTransformer
+
+```shell
+git submodule update --init
+python setup.py install
+```
 
 
 ## 流程运行

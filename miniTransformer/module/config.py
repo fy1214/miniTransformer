@@ -7,6 +7,7 @@ from typing import Dict, Optional, Mapping, Sequence, Type
 
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.quantiztion.nvfp4_quarter_op import Nvfp4QuarterQuantizeOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams
 from miniTransformer.quantiztion import quantization
 
@@ -107,6 +108,7 @@ class QuantizeRecipe(enum.Enum):
     NON_QUANTIZE = "non_quantize"
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
     FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
+    FP4_SUB_CHANNEL_QUARTER = "fp4_subchannel_scaling_quarter"
     FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
 
 
@@ -146,6 +148,34 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
         # fmt: on
+    elif QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=True
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=True,
+                with_rht=False
+            ),
+            g_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=True
+            ),
+            quantize_op=Nvfp4QuarterQuantizeOp(),
+            allgather_quantize=False,
+        )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
         return QLinearParams(
             quantize=True,
@@ -201,6 +231,10 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
         # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL
+        )
+    if qat_params_idx == 5:
+        return get_qlinear_params_from_predefined(
+            QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER
         )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

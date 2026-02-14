@@ -74,7 +74,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
 
         with utils.nvtx_annotate("Quant", color="yellow"):
             if qparams.param_type == quantization.ParamType.Y:
-                xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
+                x_ht_fp4, x_ht_ms, x_ht_ts = quant_had_eden(
                     x=x,
                     h=had,
                     scale_override=self.backward_scale_override,
@@ -103,11 +103,11 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
                     )
 
         nvfp4_tensor = quantization.QuantizeResult(
-            data=quant_weight.fp4,
-            scale=quant_weight.micro_scales,
+            data=x_ht_fp4 if qparams.param_type == quantization.ParamType.Y else quant_weight.fp4,
+            scale=x_ht_ms if qparams.param_type == quantization.ParamType.Y else quant_weight.micro_scales,
             data_t=xt_ht_fp4,
             scale_t=xt_ht_ms,
-            tensor_scale=global_amax,
+            tensor_scale=x_ht_ts if qparams.param_type == quantization.ParamType.Y else global_amax,
             tensor_scale_t=xt_ht_ts
         )
 
@@ -164,8 +164,8 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         y = torch.empty([m, n], dtype=torch.bfloat16, device=qx.device)
 
         # GEMM for FP4
-        sx_sl = swizzle_scale(sx, sx.shape[0], sx.shape[1])
-        sw_sl = swizzle_scale(sw, sx.shape[0], sw.shape[1])
+        sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
+        sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
         _fp4_mm(y, qx, qw, sx_sl, sw_sl, global_amax_qx * global_amax_qw)
 
         #TODO: fuse accumulate into GEMM

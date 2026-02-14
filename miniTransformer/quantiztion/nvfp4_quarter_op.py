@@ -35,8 +35,7 @@ def rerotate_hadamard(hadamard_matrix):
 def _fp4_mm(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return fp4_gemm.cutlass_gemm(
         y, x_fp4, w_fp4,
-        x_mx, w_mx,
-        alpha=alpha)
+        x_mx, w_mx, alpha)
 
 
 @_fp4_mm.register_fake
@@ -165,7 +164,9 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         y = torch.empty([m, n], dtype=torch.bfloat16, device=qx.device)
 
         # GEMM for FP4
-        _fp4_mm(y, qx, qw, swizzle_scale(sx, m, n), swizzle_scale(sw, m, n), global_amax_qx * global_amax_qw)
+        sx_sl = swizzle_scale(sx, sx.shape[0], sx.shape[1])
+        sw_sl = swizzle_scale(sw, sx.shape[0], sw.shape[1])
+        _fp4_mm(y, qx, qw, sx_sl, sw_sl, global_amax_qx * global_amax_qw)
 
         #TODO: fuse accumulate into GEMM
         if accumulate:

@@ -74,15 +74,23 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         had = get_hadamard_matrix(128, x.dtype, x.device)
 
         with utils.nvtx_annotate("Quant", color="yellow"):
-            quant_weight = quant_fp4(x, amax=global_amax, scale_override=self.forward_scale_override, four_over_six=self.four_over_six)
+            if qparams.param_type == quantization.ParamType.Y:
+                xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
+                    x=x,
+                    h=had,
+                    scale_override=self.backward_scale_override,
+                    scratch_amax=self.scratch_amax
+                )
+            else:
+                quant_weight = quant_fp4(x, amax=global_amax, scale_override=self.forward_scale_override, four_over_six=self.four_over_six)
 
             if return_transpose:
                 if qparams.param_type == quantization.ParamType.Y:
                     xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
-                        x=quant_weight.fp4,
+                        x=x,
                         h=had,
                         scale_override=self.backward_scale_override,
-                        transpose=True if qparams.param_type == quantization.ParamType.Y else False,
+                        transpose=True,
                         scratch_amax=self.scratch_amax
                     )
                 else:

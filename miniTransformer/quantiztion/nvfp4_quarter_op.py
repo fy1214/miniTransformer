@@ -32,15 +32,15 @@ def rerotate_hadamard(hadamard_matrix):
 
 
 @torch.library.custom_op("clover::fp4_mm", mutates_args=())
-def _fp4_mm(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+def _fp4_mm(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return fp4_gemm.matmul_nvf4_bf16_tn(
-        x_fp4, w_fp4,
+        y, x_fp4, w_fp4,
         x_mx, w_mx,
         alpha=alpha)
 
 
 @_fp4_mm.register_fake
-def _fp4_mm_fake(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+def _fp4_mm_fake(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return torch.empty((x_fp4.shape[0], w_fp4.shape[0]), device=x_fp4.device, dtype=torch.bfloat16)
 
 

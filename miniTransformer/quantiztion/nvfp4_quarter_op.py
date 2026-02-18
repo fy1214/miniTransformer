@@ -137,6 +137,44 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         )
         return nvfp4_tensor
 
+    def dequantize(self, x_e2m1: torch.Tensor, x_e4m3: torch.Tensor, alpha: float):
+        device = x_e2m1.device
+
+        x_e2m1_i32 = x_e2m1.view(dtype=torch.uint8).to(dtype=torch.int32)
+        x_e2m1_unpacked = torch.stack(
+            [x_e2m1_i32 & 0xF, (x_e2m1_i32 >> 4) & 0xF], dim=-1
+        ).flatten(start_dim=-2)
+
+        grid_dq = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        x_fp4_dq = grid_dq[x_e2m1_unpacked]
+        scales_dq = x_e4m3.to(torch.float32)
+        scales_dq = scales_dq.unflatten(dim=-1, sizes=(-1, 1))
+        x_dq = (x_fp4_dq.unflatten(dim=-1, sizes=(-1, 16)) * scales_dq).flatten(
+            start_dim=-2
+        ) * alpha
+        return x_dq
+
     def qgemm(
         self,
         qx: torch.Tensor,

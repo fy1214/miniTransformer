@@ -32,26 +32,11 @@ def build_linear(
     layer_number = 0
 
     linear = Linear(
-        in_features,
-        out_features,
-        sequence_parallel,
-        fuse_wgrad_accumulation,
-        tp_group,
-        tp_size,
-        get_rng_state_tracker,
-        rng_tracker_name,
-        init_method,
-        bias,
-        return_bias,
-        params_dtype,
-        parallel_mode,
-        parameters_split,
-        device,
-        ub_overlap_rs,
-        ub_overlap_ag,
-        ub_name,
-        # JQ: hybrid additional args
-        layer_number
+        in_features=in_features,
+        out_features=out_features,
+        bias=bias,
+        device=device,
+        params_dtype=torch.bfloat16,
     )
     # mock main_grad
     linear.weight.main_grad = torch.zeros_like(linear.weight.data, dtype=torch.float32)

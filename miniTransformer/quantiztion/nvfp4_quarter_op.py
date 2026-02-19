@@ -71,12 +71,14 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
     ):
         global_amax = abs_max(x)
         had = get_hadamard_matrix(128, x.dtype, x.device)
+        # Re-randomize the rotation
+        had_t = rerotate_hadamard(had)
 
         with utils.nvtx_annotate("Quant", color="yellow"):
             if qparams.param_type == quantization.ParamType.Y:
                 x_ht_fp4, x_ht_ms, x_ht_ts = quant_had_eden(
                     x=x,
-                    h=had,
+                    h=had_t,
                     scale_override=self.backward_scale_override,
                     scratch_amax=self.scratch_amax
                 )
@@ -87,7 +89,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
                 if qparams.param_type == quantization.ParamType.Y:
                     xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
                         x=x,
-                        h=had,
+                        h=had_t,
                         scale_override=self.backward_scale_override,
                         transpose=True,
                         scratch_amax=self.scratch_amax
@@ -96,8 +98,8 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
                     xt_ht_fp4, xt_ht_ms, xt_ht_ts = dequant_tp_had_eden(
                         x=quant_weight.fp4,
                         x_group_scales=quant_weight.micro_scales,
-                        x_tensor_scale=global_amax,
-                        h=had,
+                        x_tensor_scale=quant_weight.tensor_scale,
+                        h=had_t,
                         scale_override=self.backward_scale_override,
                         scratch_amax=self.scratch_amax
                     )

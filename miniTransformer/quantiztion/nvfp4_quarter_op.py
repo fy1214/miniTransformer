@@ -107,7 +107,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
             scale=x_ht_ms if qparams.param_type == quantization.ParamType.Y else quant_weight.micro_scales,
             data_t=xt_ht_fp4,
             scale_t=xt_ht_ms,
-            tensor_scale=x_ht_ts if qparams.param_type == quantization.ParamType.Y else global_amax,
+            tensor_scale=x_ht_ts if qparams.param_type == quantization.ParamType.Y else quant_weight.tensor_scale,
             tensor_scale_t=xt_ht_ts
         )
 

@@ -6,6 +6,8 @@ import pytest
 import torch
 
 import miniTransformer.ops.quarter_quant as quartet2
+from miniTransformer.quantiztion.nvfp4_quarter_op import Nvfp4QuarterQuantizeOp
+from miniTransformer.quantiztion.quantization import QParams, ParamType
 
 torch.random.manual_seed(42)
 
@@ -55,6 +57,24 @@ def quant_fp4(x, four_over_six=False):
     q, s, t = quartet2.quant_fp4(x, 1.0, amax, four_over_six=four_over_six)
     return _dq_fp4(q, s, t)
 
+def quant_fp4_ref(x, four_over_six=False):
+    ref_op = Nvfp4QuarterQuantizeOp()
+    param = QParams(
+        output_dtype=torch.uint8,
+        scaling_dtype=torch.float8_e4m3fn,
+        quant_tile_shape=(1, 16),
+        with_2d_quantization=False,
+        with_rht=True,
+        param_type=ParamType.X
+    )
+    result = ref_op.quantize(
+        x,
+        param,
+        True,
+        False,
+    )
+    return _dq_fp4(result.data, result.scale, result.tensor_scale)
+
 
 @torch.compile(fullgraph=True)
 def quant_with_transform(x, transpose=False):
@@ -76,6 +96,7 @@ def test_nvfp4_quarter_fp4(m, n, four_over_six, expected):
     x = torch.randn((m, n), dtype=torch.bfloat16, device="cuda")
 
     dq = quant_fp4(x.to(torch.bfloat16), four_over_six)
+    dq_ref = quant_fp4_ref(x.to(torch.bfloat16), four_over_six)
     quad_err = ((x - dq).pow(2).sum(dim=-1) / x.pow(2).sum(dim=-1)).mean()
     eff_bitwidth = (-torch.log2(quad_err) / 2).item()
 
@@ -96,4 +117,5 @@ def test_eden_identity(m, n, transpose, expected):
 
 
 if __name__ == "__main__":
-   pytest.main([__file__, "-v", "-s"])
+   #pytest.main([__file__, "-v", "-s"])
+   test_nvfp4_quarter_fp4(1024, 4096, True, 3.52)

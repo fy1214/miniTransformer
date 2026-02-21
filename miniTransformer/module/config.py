@@ -148,7 +148,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
         # fmt: on
-    elif QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER:
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER:
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,

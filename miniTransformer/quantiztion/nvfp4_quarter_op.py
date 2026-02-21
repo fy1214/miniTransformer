@@ -57,6 +57,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         self.backward_scale_override = (17 / 16) * 0.93
         self.four_over_six = True
         self.scratch_amax = torch.empty((), dtype=torch.int32, device='cuda')
+        self.disable_backward_quant = False
 
     @property
     def supports_allgather(self) -> bool:
@@ -195,6 +196,11 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
     ) -> torch.Tensor:
+
+        if grad and self.disable_backward_quant:
+            x = self.dequantize(qx, sx, global_amax_qx)
+            w = self.dequantize(qw, sw, global_amax_qw)
+            return x @ w.T
 
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]

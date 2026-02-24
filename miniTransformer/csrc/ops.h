@@ -104,3 +104,29 @@ void dequant_tp_had_quant_binding(
     at::Tensor& x_global_scale,
     at::Tensor& seed,
     float fp4_max, float fp8_max);
+
+
+void rht_128_eden_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max, bool transpose);
+
+
+void rht128_requant_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& x_micro_scales,
+    at::Tensor& x_global_scale,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max);

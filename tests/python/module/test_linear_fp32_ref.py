@@ -61,10 +61,11 @@ def ref_in_fp32(H, x, y, head, w1, w2, w3):
 
 
 def eval(res, ref):
-    quad_err = (res - ref).pow(2).mean() / ref.pow(2).mean()
-    eff_bitwidth = (-torch.log2(quad_err) / 2).item()
-    cosine = (res.flatten() @ ref.flatten()) / (ref.flatten() @ ref.flatten())
-    return quad_err, eff_bitwidth, cosine
+    with torch.no_grad():
+        quad_err = (res - ref).pow(2).mean() / ref.pow(2).mean()
+        eff_bitwidth = (-torch.log2(quad_err) / 2).item()
+        cosine = (res.flatten() @ ref.flatten()) / (ref.flatten() @ ref.flatten())
+        return quad_err, eff_bitwidth, cosine
 
 
 def print_error(name, quad_err, eff_bitwidth, cosine):
@@ -153,7 +154,17 @@ def test_backward_accuracy(steps, expected):
     assert cmin < w3e[2] < cmax
 
 
-# def test_compile_fwd():
-#     W = build_linear(128, 256)
-#     def fwd(x): return W(x)
-#     torch.compile(fwd, fullgraph=True)(torch.randn(1, 128, 128, device='cuda', dtype=torch.bfloat16))
+def test_compile_fwd():
+    W = build_linear(128, 256)
+    def fwd(x): return W(x)
+    torch.compile(fwd, fullgraph=True)(torch.randn(1, 128, 128, device='cuda', dtype=torch.bfloat16))
+
+
+def test_result_fwd():
+    W = build_linear(128, 256)
+    x = torch.randn((1, 512, 128), device="cuda", dtype=torch.bfloat16)
+    y = W(x)
+    y_ref = x @ W.weight.T
+    se, bits, cos = eval(y, y_ref)
+    assert cos > 0.999
+    assert bits > 2.8

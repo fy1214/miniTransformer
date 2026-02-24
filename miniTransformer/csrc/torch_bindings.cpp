@@ -21,4 +21,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("eden_fp4", &eden_fp4_binding, "Eden FP4 quantization (CUDA)");
     m.def("group_transform_128_eden", &group_transform_128_eden_binding, "Group Transform 128 Eden (CUDA)");
     m.def("dequant_tp_had_quant", &dequant_tp_had_quant_binding, "Dequant TP Had Quant (CUDA)");
+    m.def("rht_128_eden", &rht_128_eden_binding, "rht 128 eden (CUDA)");
+    m.def("rht128_requant", &rht128_requant_binding, "rht 128 requant (CUDA)");
 }

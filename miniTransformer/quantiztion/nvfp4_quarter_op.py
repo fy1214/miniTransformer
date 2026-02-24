@@ -5,7 +5,7 @@ from typing import Optional
 from scipy.linalg import hadamard
 
 from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
-from miniTransformer.ops.quarter_quant import quant_fp4, dequant_tp_had_eden, quant_had_eden
+from miniTransformer.ops.quarter_quant import quant_fp4, rht128_quant_eden, rht128_requant
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 
@@ -57,6 +57,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         self.backward_scale_override = (17 / 16) * 0.93
         self.four_over_six = True
         self.scratch_amax = torch.empty((), dtype=torch.int32, device='cuda')
+        self.had = get_hadamard_matrix(128, torch.bfloat16, 'cuda')
         self.disable_backward_quant = False
 
     @property
@@ -71,15 +72,14 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         with_2d_quantization: bool
     ):
         global_amax = abs_max(x)
-        had = get_hadamard_matrix(128, x.dtype, x.device)
         # Re-randomize the rotation
-        had_t = rerotate_hadamard(had)
+        had = rerotate_hadamard(self.had)
 
         with utils.nvtx_annotate("Quant", color="yellow"):
             if qparams.param_type == quantization.ParamType.Y:
-                x_ht_fp4, x_ht_ms, x_ht_ts = quant_had_eden(
+                x_ht_fp4, x_ht_ms, x_ht_ts = rht128_quant_eden(
                     x=x,
-                    h=had_t,
+                    h=had[:16, :],
                     scale_override=self.backward_scale_override,
                     scratch_amax=self.scratch_amax
                 )
@@ -88,19 +88,19 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
 
             if return_transpose:
                 if qparams.param_type == quantization.ParamType.Y:
-                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = quant_had_eden(
+                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = rht128_quant_eden(
                         x=x,
-                        h=had_t,
+                        h=had[:16, :],
                         scale_override=self.backward_scale_override,
                         transpose=True,
                         scratch_amax=self.scratch_amax
                     )
                 else:
-                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = dequant_tp_had_eden(
+                    xt_ht_fp4, xt_ht_ms, xt_ht_ts = rht128_requant(
                         x=quant_weight.fp4,
                         x_group_scales=quant_weight.micro_scales,
                         x_tensor_scale=quant_weight.tensor_scale,
-                        h=had_t,
+                        h=had[:16, :],
                         scale_override=self.backward_scale_override,
                         scratch_amax=self.scratch_amax
                     )

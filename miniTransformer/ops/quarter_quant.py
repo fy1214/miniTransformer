@@ -55,11 +55,11 @@ def _dequant_tp_had_quant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
     )
 
 
-@torch.library.custom_op("quartet2::rht128_eden", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
+@torch.library.custom_op("clover::rht128_eden", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
 def _transform_rht128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
                            scratch_scales: torch.Tensor, scratch_max: torch.Tensor,
                            h: torch.Tensor, x: torch.Tensor, seed: torch.Tensor, fp4_max: float, fp8_max: float, transpose: bool) -> None:
-    fp4_gemm.rht128_eden(
+    fp4_gemm.rht_128_eden(
         o,
         s.view(torch.uint8),
         t,
@@ -74,7 +74,7 @@ def _transform_rht128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
     )
 
 
-@torch.library.custom_op("quartet2::had128_requant", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
+@torch.library.custom_op("clover::had128_requant", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
 def _rht128_requant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
                     scratch_scales: torch.Tensor, scratch_max: torch.Tensor,
                     h: torch.Tensor, x: torch.Tensor, x_group_scales: torch.Tensor, x_tensor_scale: torch.Tensor,

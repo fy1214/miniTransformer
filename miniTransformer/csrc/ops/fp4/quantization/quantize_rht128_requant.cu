@@ -325,7 +325,7 @@ void rht128_requant_binding(
     TORCH_CHECK(h.dtype() == at::ScalarType::BFloat16, "Input tensor h must be of type bfloat16");
 
     TORCH_CHECK(y.size(1) == x.size(0) / 2, "Invalid shape for y");
-    TORCH_CHECK(y.size(0) == x.size(1), "Invalid shape for y");
+    TORCH_CHECK(y.size(0) == x.size(1) * 2, "Invalid shape for y");
     TORCH_CHECK(group_scales.size(1) == x.size(0) / 16, "Invalid shape for group_scales");
     TORCH_CHECK(group_scales.size(0) == x.size(1) * 2, "Invalid shape for group_scales");
 

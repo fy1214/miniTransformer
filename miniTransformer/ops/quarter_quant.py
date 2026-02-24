@@ -68,9 +68,9 @@ def _transform_rht128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         h,
         x.detach(),
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
-        transpose=transpose,
+        fp4_max,
+        fp8_max,
+        transpose,
     )
 
 
@@ -90,8 +90,8 @@ def _rht128_requant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         x_group_scales,
         x_tensor_scale,
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
+        fp4_max,
+        fp8_max,
     )
 
 

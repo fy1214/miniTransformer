@@ -223,39 +223,62 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_group_transform_128_e
     }
 }
 
-__global__ void eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, int groups, float inv_fp8_max) {
+__global__ void eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols) {
     using bf16x8 = GenericVector<nv_bfloat16, 8>;
     using fp32x8 = GenericVector<float, 8>;
     using fp8x8 = GenericVector<__nv_fp8_e4m3, 8>;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= groups) return;
+    int col = 8*(threadIdx.x + blockIdx.x * blockDim.x);
+    int row = threadIdx.y + blockIdx.y * 64;
+    if (col >= cols || row >= rows) return;
     uint4 rng = philox<10>(seed, threadIdx.x, blockIdx.x);
     cudaGridDependencySynchronize();
 
     float max_scale = __uint_as_float(*max_scale_ptr);
     float global_scale = max_scale * inv_fp8_max;
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    if (threadIdx.x == 0 && blockIdx.x == 0 && threadIdx.y == 0 && blockIdx.y == 0) {
         global_scale_ptr[0] = global_scale;
     }
-    float factor = global_scale != 0 ? 1.f / global_scale : 0.f;
-    bf16x8 src_scales = bf16x8::load(scales_bf16 + i * 8);
+    float factor = global_scale != 0 ? reciprocal_approximate_ftz(global_scale) : 0.f;
+    bf16x8 src_scales[2];
+    src_scales[0] = bf16x8::load(scales_bf16 + col + row * cols);
+    src_scales[1] = bf16x8::load(scales_bf16 + col + (row+32) * cols);
     fp8x8 dst_scales;
-    fp32x8 pre_sr;
-    for (int k = 0; k < 8; ++k) {
-        float src_scale = static_cast<float>(src_scales[k]);
-        pre_sr[k] = src_scale * factor;
+    fp32x8 pre_sr[2];
+    for (int g = 0; g < 2; ++g) {
+        for (int k = 0; k < 8; ++k) {
+            float src_scale = static_cast<float>(src_scales[g][k]);
+            pre_sr[g][k] = src_scale * factor;
+        }
     }
-    dst_scales[0] = stochastic_rounding(pre_sr[0], rng.x);
-    dst_scales[1] = stochastic_rounding(pre_sr[1], rng.y);
-    dst_scales[2] = stochastic_rounding(pre_sr[2], rng.z);
-    dst_scales[3] = stochastic_rounding(pre_sr[3], rng.w);
-    rng = philox<10>(seed + 1, threadIdx.x, blockIdx.x);
-    dst_scales[4] = stochastic_rounding(pre_sr[4], rng.x);
-    dst_scales[5] = stochastic_rounding(pre_sr[5], rng.y);
-    dst_scales[6] = stochastic_rounding(pre_sr[6], rng.z);
-    dst_scales[7] = stochastic_rounding(pre_sr[7], rng.w);
 
-    dst_scales.store(scales_fp8 + i * 8);
+    auto lo = [](unsigned int a) -> unsigned short {
+        return a & 0xffff;
+    };
+    auto hi = [](unsigned int a) -> unsigned short {
+        return (a >> 16) & 0xffff;
+    };
+
+    dst_scales[0] = stochastic_rounding(pre_sr[0][0], lo(rng.x));
+    dst_scales[1] = stochastic_rounding(pre_sr[0][1], lo(rng.y));
+    dst_scales[2] = stochastic_rounding(pre_sr[0][2], lo(rng.z));
+    dst_scales[3] = stochastic_rounding(pre_sr[0][3], lo(rng.w));
+    dst_scales[4] = stochastic_rounding(pre_sr[1][0], hi(rng.x));
+    dst_scales[5] = stochastic_rounding(pre_sr[1][1], hi(rng.y));
+    dst_scales[6] = stochastic_rounding(pre_sr[1][2], hi(rng.z));
+    dst_scales[7] = stochastic_rounding(pre_sr[1][3], hi(rng.w));
+    // with sf swizzling, row+32 corresponds to elements 4-7, so this works out
+    dst_scales.store(scales_fp8 + cvt_quant_to_fp4_get_sf_out_offset(row, col, cols / 4));
+
+    rng = philox<10>(seed + 1, threadIdx.x, blockIdx.x);
+    dst_scales[0] = stochastic_rounding(pre_sr[0][4], lo(rng.x));
+    dst_scales[1] = stochastic_rounding(pre_sr[0][5], lo(rng.y));
+    dst_scales[2] = stochastic_rounding(pre_sr[0][6], lo(rng.z));
+    dst_scales[3] = stochastic_rounding(pre_sr[0][7], lo(rng.w));
+    dst_scales[4] = stochastic_rounding(pre_sr[1][4], hi(rng.x));
+    dst_scales[5] = stochastic_rounding(pre_sr[1][5], hi(rng.y));
+    dst_scales[6] = stochastic_rounding(pre_sr[1][6], hi(rng.z));
+    dst_scales[7] = stochastic_rounding(pre_sr[1][7], hi(rng.w));
+    dst_scales.store(scales_fp8 + cvt_quant_to_fp4_get_sf_out_offset(row, col + 4, cols / 4));
 }
 
 void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols) {

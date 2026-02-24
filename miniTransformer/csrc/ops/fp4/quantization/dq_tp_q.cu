@@ -212,8 +212,7 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_dequant_tp_quant_kern
     }
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, int groups, float inv_fp8_max);
-
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols);
 void dequant_tp_quant_launcher(
     __nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
     nv_bfloat16* scratch_scales, unsigned* max_scale, const nv_bfloat16* h,
@@ -235,7 +234,7 @@ void dequant_tp_quant_launcher(
     cutlass_dequant_tp_quant_kernel<<<sms * blocks, dim3(32, NUM_WARPS), smem>>>(
         y, scratch_scales, max_scale, h, x, x_scales, x_global_scale, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, groups, 1.f / fp8_max);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, N, M / 16);
 }
 
 void dequant_tp_had_quant(

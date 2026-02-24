@@ -258,7 +258,7 @@ __global__ void eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* glo
     dst_scales.store(scales_fp8 + i * 8);
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, int groups, float inv_fp8_max) {
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols) {
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute[0].val.programmaticStreamSerializationAllowed = 1;
@@ -266,11 +266,11 @@ void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_
     cudaLaunchConfig_t config;
     config.attrs = attribute;
     config.numAttrs = 1;
-    config.blockDim = dim3(128);
-    config.gridDim = dim3((groups + 127)/128);
+    config.blockDim = dim3(8, 32, 1);
+    config.gridDim = dim3(cuda::ceil_div(cols, 8*8), rows / 64, 1);
     config.dynamicSmemBytes = 0;
     config.stream = nullptr;
-    CUDA_CHECK(cudaLaunchKernelEx(&config, eden_convert_scales_kernel, scales_fp8, global_scale_ptr, scales_bf16, max_scale_ptr, seed, groups, inv_fp8_max));
+    CUDA_CHECK(cudaLaunchKernelEx(&config, eden_convert_scales_kernel, scales_fp8, global_scale_ptr, scales_bf16, max_scale_ptr, seed, inv_fp8_max, rows, cols));
 }
 
 template<bool TransposeA>
@@ -293,7 +293,7 @@ void group_transform_128_eden_launcher(
 
     cutlass_group_transform_128_eden_kernel<TransposeA><<<sms * blocks, dim3(32, NUM_WARPS), smem>>>(y, scratch_scales, max_scale, h, x, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, groups, 1.f / fp8_max);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, TransposeA ? N : M, TransposeA ? M / 16 : N / 16);
 }
 
 void group_transform_128_eden(

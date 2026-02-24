@@ -69,6 +69,7 @@ def setup_extensions() -> setuptools.Extension:
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT162_OPERATORS__",
         "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+        "-include", "/usr/include/semaphore.h ",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "-std=c++17",

@@ -5,6 +5,12 @@
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <cuda/barrier>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
+#include <ATen/cuda/Exceptions.h>
+#include <torch/extension.h>
+#include <torch/torch.h>
+
 #include "../../../util/quarter/had128_utils.cuh"
 
 //! \brief transform with sign-randomized hadamard matrix of size 128.

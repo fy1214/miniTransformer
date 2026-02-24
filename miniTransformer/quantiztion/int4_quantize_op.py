@@ -1,6 +1,6 @@
 import torch
 from typing import Optional
-from miniTransformer.ops import quantization
+from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 
 

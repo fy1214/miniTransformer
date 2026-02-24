@@ -3,15 +3,15 @@ import pytest
 import time
 from typing import Optional, Tuple
 from miniTransformer.utils import utils
-from miniTransformer.ops import quantization
+from miniTransformer.quantiztion import quantization
 
-from miniTransformer.ops.nvfp4_quantize_op_ref import cast_from_fp4x2
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import cast_from_fp4x2
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 import fp4_gemm
-from .triton.nvfp4.gemm_tl import block_scaled_matmul
+from miniTransformer.triton.gemm_tl import block_scaled_matmul
 
 
 def qgemm_cmp_triton_ref(
@@ -359,8 +359,8 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
     
     qx = qresult_x.data
     qw = qresult_w.data
-    global_amax_qx = qresult_x.global_amax_row
-    global_amax_qw = qresult_w.global_amax_row
+    global_amax_qx = qresult_x.tensor_scale
+    global_amax_qw = qresult_w.tensor_scale_t
     if global_amax_qx is None:
         global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
     if global_amax_qw is None:

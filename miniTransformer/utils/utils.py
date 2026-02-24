@@ -1,6 +1,8 @@
 import torch
 from contextlib import contextmanager
 from typing import Callable, Tuple
+import nvtx
+import contextlib
 
 
 HIGH_PRECISION_FLOAT_DTYPES = (
@@ -12,6 +14,12 @@ HIGH_PRECISION_FLOAT_DTYPES = (
 
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
+
+def nvtx_annotate(name: str, color: str = "green"):
+    if torch.compiler.is_compiling():
+        return contextlib.nullcontext()
+    else:
+        return nvtx.annotate(name, color=color)
 
 def is_rank_0():
     return (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0

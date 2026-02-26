@@ -119,7 +119,8 @@ void eden_fp4_binding(
     eden_fp4(
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const float*>(amax_ptr.data_ptr()),
-        scale_override, *reinterpret_cast<float *>(seed.data_ptr()), inp.numel());
+        scale_override, *reinterpret_cast<float *>(seed.data_ptr()), inp.size(0), inp.size(1));
 }

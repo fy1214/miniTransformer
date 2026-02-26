@@ -17,15 +17,7 @@
 #include "../../../util/quarter/utils.cuh"
 #include "../../../util/quarter/vec.cuh"
 
-__global__ void eden_fp4_kernel(
-    __nv_fp4x4_e2m1* y_ptr, 
-    __nv_fp8_e4m3* scale_ptr, 
-    const nv_bfloat16* x_ptr, 
-    const float* amax_ptr, 
-    float scale_override, 
-    std::uint64_t seed, 
-    int nvecs
-) {
+__global__ void eden_fp4_kernel(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr, const nv_bfloat16* x_ptr, const float* amax_ptr, float scale_override, std::uint64_t seed, int nvecs, int cols) {
     constexpr int HADAMARD_DIM = 128;
 
     using bf16x8 = GenericVector<nv_bfloat16, 8>;
@@ -38,6 +30,9 @@ __global__ void eden_fp4_kernel(
     float scales_max = 255.99f;
     float val_max = 6.f / scale_override;
     float scale = global_abs_max == 0 ?  1.f : global_abs_max / scales_max / val_max;
+    if (idx == 0) {
+        global_scale_ptr[0] = scale;
+    }
 
     // per-group abs-maxes
     bf16x8 x = bf16x8::load(x_ptr + 8 * idx);
@@ -89,26 +84,22 @@ __global__ void eden_fp4_kernel(
     __nv_fp8_e4m3 sr = stochastic_rounding(fixed_scale, rng.x);
 
     if (idx % 2 == 0) {
-        scale_ptr[idx / 2] = sr;
+        int col = (idx / 2) % cols;
+        int row = (idx / 2) / cols;
+        auto tgt = cvt_quant_to_fp4_get_sf_out_offset(row, col, cols / 4);
+        scale_ptr[tgt] = sr;
     }
 
     result.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * idx);
 }
 
-void eden_fp4(
-    __nv_fp4x4_e2m1* y_ptr, 
-    __nv_fp8_e4m3* scale_ptr, 
-    const nv_bfloat16* x_ptr, 
-    const float* amax_ptr, 
-    float scale_override, 
-    long seed, 
-    size_t nelem
-) {
-    if (nelem % 8 != 0) throw std::runtime_error("eden_fp4_fake: nelem must be divisible by 8");
-    int n_vecs = nelem / 8;
+void eden_fp4(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr, const nv_bfloat16* x_ptr, const float* amax_ptr, float scale_override, long seed, long rows, long cols) {
+    if (cols % 128 != 0) throw std::runtime_error("eden_fp4: cols must be divisible by 128");
+    if (rows % 128 != 0) throw std::runtime_error("eden_fp4: rows must be divisible by 128");
+    int n_vecs = (rows * cols) / 8;
     int block_size = 256;
     int n_blocks = (n_vecs + block_size - 1) / block_size;
-    eden_fp4_kernel<<<n_blocks, block_size>>>(y_ptr, scale_ptr, x_ptr, amax_ptr, scale_override, seed, n_vecs);
+    eden_fp4_kernel<<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, scale_override, seed, n_vecs, cols / 16);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -118,7 +109,7 @@ void eden_fp4_binding(
     const at::Tensor& inp,
     const at::Tensor& amax_ptr,
     float scale_override,
-    long seed
+    at::Tensor& seed
 )
 {
     TORCH_CHECK(out.size(0) == inp.size(0), "Output and input must have the same number of rows");
@@ -129,5 +120,5 @@ void eden_fp4_binding(
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const float*>(amax_ptr.data_ptr()),
-        scale_override, seed, inp.numel());
+        scale_override, *reinterpret_cast<float *>(seed.data_ptr()), inp.numel());
 }

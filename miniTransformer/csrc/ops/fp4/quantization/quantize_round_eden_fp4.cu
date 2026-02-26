@@ -106,6 +106,7 @@ void eden_fp4(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_sc
 void eden_fp4_binding(
     at::Tensor& out,
     at::Tensor& scales,
+    at::Tensor& global_scale,
     const at::Tensor& inp,
     const at::Tensor& amax_ptr,
     float scale_override,

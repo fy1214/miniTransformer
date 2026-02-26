@@ -75,10 +75,11 @@ void rtn_fp4_binding(
 void eden_fp4_binding(
     at::Tensor& out,
     at::Tensor& scales,
+    at::Tensor& global_scale,
     const at::Tensor& inp,
     const at::Tensor& amax_ptr,
     float scale_override,
-    long seed
+    at::Tensor& seed
 );
 
 void group_transform_128_eden_binding(

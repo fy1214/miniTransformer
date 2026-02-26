@@ -93,8 +93,8 @@ class QuantizeResultCache:
             scale=self.scale,
             data_t=self.data_t,
             scale_t=self.scale_t,
-            global_amax_row=self.global_amax_row,
-            global_amax_col=self.global_amax_col
+            tensor_scale=self.global_amax_row,
+            tensor_scale_t=self.global_amax_col
         )
 
 

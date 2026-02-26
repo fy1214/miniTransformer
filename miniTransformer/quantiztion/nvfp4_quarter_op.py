@@ -23,7 +23,8 @@ def get_hadamard_matrix(group_size: int, dtype: torch.dtype, device: torch.devic
         )
 
 
-def rerotate_hadamard(hadamard_matrix):
+def rerotate_hadamard(hadamard_matrix, seed=42):
+    torch.manual_seed(seed)
     signs = torch.randint(
             0, 2, (hadamard_matrix.size(0),),
             device=hadamard_matrix.device,
@@ -226,12 +227,10 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
         m, n = qx.shape[0], qw.shape[0]
 
-        y = torch.empty([m, n], dtype=torch.bfloat16, device=qx.device)
-
         # GEMM for FP4
-        sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
-        sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
-        _fp4_mm(y, qx, qw, sx_sl, sw_sl, global_amax_qx * global_amax_qw)
+        #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
+        #sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
+        y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
 
         #TODO: fuse accumulate into GEMM
         if accumulate:

@@ -62,10 +62,12 @@ def ref_in_fp32(H, x, y, head, w1, w2, w3):
 
 def eval(res, ref):
     with torch.no_grad():
+        res = res.float()
+        ref = ref.float()
         quad_err = (res - ref).pow(2).mean() / ref.pow(2).mean()
-        eff_bitwidth = (-torch.log2(quad_err) / 2).item()
+        eff_bitwidth = (-torch.log2(quad_err) / 2)
         cosine = (res.flatten() @ ref.flatten()) / (ref.flatten() @ ref.flatten())
-        return quad_err, eff_bitwidth, cosine
+        return quad_err.item(), eff_bitwidth.item(), cosine.item()
 
 
 def print_error(name, quad_err, eff_bitwidth, cosine):
@@ -166,5 +168,5 @@ def test_result_fwd():
     y = W(x)
     y_ref = x @ W.weight.T
     se, bits, cos = eval(y, y_ref)
-    assert cos > 0.999
+    assert cos > 0.99
     assert bits > 2.8

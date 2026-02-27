@@ -396,8 +396,8 @@ class _QuantizedLinear(torch.autograd.Function):
 
         # GEMM dgrad
         if disable_backward_quant:
-            w = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
-            dgrad = dy @ w
+            dq_w = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
+            dgrad = dy @ dq_w
         else:
             dgrad = ctx.quantize_op.qgemm(
                 qdy,
@@ -439,8 +439,8 @@ class _QuantizedLinear(torch.autograd.Function):
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
         if disable_backward_quant:
-            x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
-            wgrad = dy.T @ x
+            dq_x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
+            wgrad = dy.T @ dq_x
         else:
             wgrad = ctx.quantize_op.qgemm(
                 qdy_t,

@@ -24,6 +24,8 @@ from miniTransformer.utils.utils import (
 
 logger = logging.getLogger(__name__)
 
+disable_backward_quant = False
+
 class _NonQuantizedLinear(torch.autograd.Function):
     """Non-quantized Linear function (FP32, FP16, BF16)
 
@@ -309,15 +311,26 @@ class _QuantizedLinear(torch.autograd.Function):
                 # the original full qx_t tensor because of reference counting
                 qx_t = torch.chunk(qx_t, tp_size, dim=0)[ctx.tp_rank].detach().clone()
 
-            ctx.save_for_backward(
-                qx_t,
-                sx_t,
-                qx_global_amax_col,
-                qw_t,
-                sw_t,
-                qw_global_amax_col,
-                w,
-            )
+            if disable_backward_quant:
+                ctx.save_for_backward(
+                    qx,
+                    sx,
+                    qx_global_amax_row,
+                    qw,
+                    sw,
+                    qw_global_amax_row,
+                    w,
+                )
+            else:
+                ctx.save_for_backward(
+                    qx_t,
+                    sx_t,
+                    qx_global_amax_col,
+                    qw_t,
+                    sw_t,
+                    qw_global_amax_col,
+                    w,
+                )
 
         # Reduce scatter for row and sequence parallel
         if parallel_mode == "row" and sequence_parallel:
@@ -382,23 +395,27 @@ class _QuantizedLinear(torch.autograd.Function):
             )
 
         # GEMM dgrad
-        dgrad = ctx.quantize_op.qgemm(
-            qdy,
-            qw_t,
-            ctx.qlinear_params.mm_dgrad,
-            out_dtype_dgrad,
-            sdy,
-            sw_t,
-            None,
-            None,
-            grad=True,
-            accumulate=False,
-            layout="NN",
-            global_amax_qx=qdy_global_amax_row,
-            global_amax_qw=qw_global_amax_col,
-            qparams_x=ctx.qlinear_params.g_params,
-            qparams_w=ctx.qlinear_params.w_params,
-        )
+        if disable_backward_quant:
+            w = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
+            dgrad = dy @ w
+        else:
+            dgrad = ctx.quantize_op.qgemm(
+                qdy,
+                qw_t,
+                ctx.qlinear_params.mm_dgrad,
+                out_dtype_dgrad,
+                sdy,
+                sw_t,
+                None,
+                None,
+                grad=True,
+                accumulate=False,
+                layout="NN",
+                global_amax_qx=qdy_global_amax_row,
+                global_amax_qw=qw_global_amax_col,
+                qparams_x=ctx.qlinear_params.g_params,
+                qparams_w=ctx.qlinear_params.w_params,
+            )
 
         # If memory saving is enabled and we have a qx_t handle, Wait for qx_t AllGather to finish
         if qx_t_handle is not None:
@@ -421,23 +438,27 @@ class _QuantizedLinear(torch.autograd.Function):
         # For wgrad, we will set the dtype to float32
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
-        wgrad = ctx.quantize_op.qgemm(
-            qdy_t,
-            qx_t,
-            ctx.qlinear_params.mm_wgrad,
-            out_dtype_wgrad,
-            sdy_t,
-            sx_t,
-            None,
-            out=w.main_grad if ctx.fuse_wgrad_accumulation else None,  # main_grad is fp32 dtype
-            grad=True,
-            accumulate=accumulate_wgrad_into_param_main_grad,
-            layout="NT",
-            global_amax_qx=qdy_global_amax_col,
-            global_amax_qw=qx_global_amax_col,
-            qparams_x=ctx.qlinear_params.g_params,
-            qparams_w=ctx.qlinear_params.x_params,
-        )
+        if disable_backward_quant:
+            x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
+            wgrad = dy.T @ x
+        else:
+            wgrad = ctx.quantize_op.qgemm(
+                qdy_t,
+                qx_t,
+                ctx.qlinear_params.mm_wgrad,
+                out_dtype_wgrad,
+                sdy_t,
+                sx_t,
+                None,
+                out=w.main_grad if ctx.fuse_wgrad_accumulation else None,  # main_grad is fp32 dtype
+                grad=True,
+                accumulate=accumulate_wgrad_into_param_main_grad,
+                layout="NT",
+                global_amax_qx=qdy_global_amax_col,
+                global_amax_qw=qx_global_amax_col,
+                qparams_x=ctx.qlinear_params.g_params,
+                qparams_w=ctx.qlinear_params.x_params,
+            )
         # Handle wgrad accumulation for mcore if needed
         wgrad = _QuantizedLinear.reset_wgrad_if_needed(ctx, w, wgrad)
 

@@ -77,7 +77,6 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         self.had = get_hadamard_matrix(128, torch.bfloat16, 'cuda')
         # Re-randomize the rotation
         self.had_t = rerotate_hadamard(self.had)
-        self.disable_backward_quant = False
 
     @property
     def supports_allgather(self) -> bool:
@@ -221,11 +220,6 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
     ) -> torch.Tensor:
-
-        if grad and self.disable_backward_quant:
-            x = self.dequantize(qx, sx, global_amax_qx)
-            w = self.dequantize(qw, sw, global_amax_qw)
-            return x @ w.T
 
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]

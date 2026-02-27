@@ -1,4 +1,6 @@
 from collections import namedtuple
+from enum import Enum
+
 import torch
 
 import fp4_gemm
@@ -13,6 +15,11 @@ def _four_six_fp4_op(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor, x: torch
 @torch.library.custom_op("clover::rtn", mutates_args=("o", "s", "t"))
 def _rtn_fp4_op(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor, x: torch.Tensor, amax: torch.Tensor, scale_override: float) -> None:
     fp4_gemm.rtn_fp4(o, s, t, x.detach(), amax, scale_override)
+
+
+@torch.library.custom_op("clover::eden", mutates_args=("o", "s", "t"))
+def _eden_fp4_op(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor, x: torch.Tensor, amax: torch.Tensor, scale_override: float, seed: torch.Tensor) -> None:
+    fp4_gemm.eden_fp4(o, s, t, x.detach(), amax, scale_override, seed)
 
 
 @torch.library.custom_op("clover::group_transform_eden", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
@@ -55,11 +62,11 @@ def _dequant_tp_had_quant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
     )
 
 
-@torch.library.custom_op("quartet2::rht128_eden", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
+@torch.library.custom_op("clover::rht128_eden", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
 def _transform_rht128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
                            scratch_scales: torch.Tensor, scratch_max: torch.Tensor,
                            h: torch.Tensor, x: torch.Tensor, seed: torch.Tensor, fp4_max: float, fp8_max: float, transpose: bool) -> None:
-    fp4_gemm.rht128_eden(
+    fp4_gemm.rht_128_eden(
         o,
         s.view(torch.uint8),
         t,
@@ -68,13 +75,13 @@ def _transform_rht128_eden(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         h,
         x.detach(),
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
-        transpose=transpose,
+        fp4_max,
+        fp8_max,
+        transpose,
     )
 
 
-@torch.library.custom_op("quartet2::had128_requant", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
+@torch.library.custom_op("clover::had128_requant", mutates_args=("o", "s", "t", "scratch_scales", "scratch_max"))
 def _rht128_requant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
                     scratch_scales: torch.Tensor, scratch_max: torch.Tensor,
                     h: torch.Tensor, x: torch.Tensor, x_group_scales: torch.Tensor, x_tensor_scale: torch.Tensor,
@@ -90,8 +97,8 @@ def _rht128_requant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
         x_group_scales,
         x_tensor_scale,
         seed,
-        fp4_max=fp4_max,
-        fp8_max=fp8_max,
+        fp4_max,
+        fp8_max,
     )
 
 
@@ -99,22 +106,36 @@ def _rht128_requant(o: torch.Tensor, s: torch.Tensor, t: torch.Tensor,
 NVFP4Quant = namedtuple("NVFP4Quant", ["fp4", "micro_scales", "tensor_scale"])
 
 
-def quant_fp4(x, scale_override: float, amax: torch.Tensor = None, four_over_six=False) -> NVFP4Quant:
+class NVFP4QuantMode(Enum):
+    RNE = 0
+    FOUR_SIX = 1
+    EDEN = 2
+
+
+def quant_fp4(x, *, scale_override: float, amax: torch.Tensor = None, mode=NVFP4QuantMode.RNE, seed: torch.Tensor=None) -> NVFP4Quant:
     q = torch.empty((x.shape[0], x.shape[1] // 2), device=x.device, dtype=torch.uint8)
     s = torch.empty((x.shape[0], x.shape[1] // 16), device=x.device, dtype=torch.float8_e4m3fn)
     assert x.dtype == torch.bfloat16
     assert x.is_cuda
     assert x.is_contiguous()
+    assert x.shape[0] % 128 == 0
+    assert x.shape[1] % 128 == 0
 
     if amax is None:
         amax = torch.max(torch.abs(x)).to(torch.float32)
     else:
         assert amax.dtype == torch.float32
     global_scale = torch.empty((), device=x.device, dtype=torch.float32)
-    if four_over_six:
+    if mode == NVFP4QuantMode.FOUR_SIX:
         _four_six_fp4_op(q, s, global_scale, x, amax, scale_override)
-    else:
+    elif mode == NVFP4QuantMode.RNE:
         _rtn_fp4_op(q, s, global_scale, x, amax, scale_override)
+    elif mode == NVFP4QuantMode.EDEN:
+        assert seed is not None
+        _eden_fp4_op(q, s, global_scale, x, amax, scale_override, seed)
+    else:
+        raise ValueError(f"Unknown NVFP4QuantMode: {mode}")
+
     return NVFP4Quant(q, s, global_scale)
 
 

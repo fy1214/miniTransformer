@@ -1,11 +1,10 @@
-import math
+from flashinfer import mm_fp4
 import torch
 import fp4_gemm
 from typing import Optional
 from scipy.linalg import hadamard
 
-from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
-from miniTransformer.ops.quarter_quant import quant_fp4, rht128_quant_eden, rht128_requant
+from miniTransformer.ops.quarter_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 
@@ -32,10 +31,28 @@ def rerotate_hadamard(hadamard_matrix):
 
 
 @torch.library.custom_op("clover::fp4_mm", mutates_args=())
-def _fp4_mm(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    return fp4_gemm.cutlass_gemm(
-        y, x_fp4, w_fp4,
-        x_mx, w_mx, alpha)
+def _fp4_mm(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    m, packed_k = x_fp4.shape
+    k = packed_k * 2
+    n = w_fp4.shape[0]
+    BLOCK = 16
+    out = torch.empty([m, n], device=x_fp4.device, dtype=torch.bfloat16)
+
+    mm_fp4(
+        x_fp4,
+        w_fp4.T,
+        x_mx.view(-1, k // BLOCK),
+        w_mx.view(-1, k // BLOCK).T,
+        alpha,
+        torch.bfloat16,
+        out,
+        block_size=BLOCK,
+        use_8x4_sf_layout=False,
+        backend="cudnn",
+        use_nvfp4=True,
+    )
+
+    return out
 
 
 @_fp4_mm.register_fake
@@ -50,19 +67,24 @@ def abs_max(x):
 
 class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
 
-    def __init__(self):
+    def __init__(self, for_over_six=True):
         super().__init__()
 
         self.forward_scale_override = 1.0
         self.backward_scale_override = (17 / 16) * 0.93
-        self.four_over_six = True
+        self.mode = NVFP4QuantMode.FOUR_SIX if for_over_six else NVFP4QuantMode.RNE
         self.scratch_amax = torch.empty((), dtype=torch.int32, device='cuda')
         self.had = get_hadamard_matrix(128, torch.bfloat16, 'cuda')
+        # Re-randomize the rotation
+        self.had_t = rerotate_hadamard(self.had)
         self.disable_backward_quant = False
 
     @property
     def supports_allgather(self) -> bool:
         return False
+
+    def update_had_t(self):
+        self.had_t = rerotate_hadamard(self.had)
 
     def _quantize(
         self,
@@ -72,25 +94,23 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         with_2d_quantization: bool
     ):
         global_amax = abs_max(x)
-        # Re-randomize the rotation
-        had = rerotate_hadamard(self.had)
 
         with utils.nvtx_annotate("Quant", color="yellow"):
             if qparams.param_type == quantization.ParamType.Y:
                 x_ht_fp4, x_ht_ms, x_ht_ts = rht128_quant_eden(
                     x=x,
-                    h=had[:16, :],
+                    h=self.had_t[:16, :],
                     scale_override=self.backward_scale_override,
                     scratch_amax=self.scratch_amax
                 )
             else:
-                quant_weight = quant_fp4(x, amax=global_amax, scale_override=self.forward_scale_override, four_over_six=self.four_over_six)
+                quant_weight = quant_fp4(x, amax=global_amax, scale_override=self.forward_scale_override, mode=self.mode)
 
             if return_transpose:
                 if qparams.param_type == quantization.ParamType.Y:
                     xt_ht_fp4, xt_ht_ms, xt_ht_ts = rht128_quant_eden(
                         x=x,
-                        h=had[:16, :],
+                        h=self.had_t[:16, :],
                         scale_override=self.backward_scale_override,
                         transpose=True,
                         scratch_amax=self.scratch_amax
@@ -100,7 +120,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
                         x=quant_weight.fp4,
                         x_group_scales=quant_weight.micro_scales,
                         x_tensor_scale=quant_weight.tensor_scale,
-                        h=had[:16, :],
+                        h=self.had_t[:16, :],
                         scale_override=self.backward_scale_override,
                         scratch_amax=self.scratch_amax
                     )
@@ -138,6 +158,11 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
             return_transpose=return_transpose,
             with_2d_quantization=qparams.with_2d_quantization,
         )
+
+        # Y is the last one quantize, so we update had_t here
+        if qparams.param_type == quantization.ParamType.Y:
+            self.update_had_t()
+
         return nvfp4_tensor
 
     def dequantize(self, x_e2m1: torch.Tensor, x_e4m3: torch.Tensor, alpha: float):
@@ -207,12 +232,10 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
         m, n = qx.shape[0], qw.shape[0]
 
-        y = torch.empty([m, n], dtype=torch.bfloat16, device=qx.device)
-
         # GEMM for FP4
-        sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
-        sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
-        _fp4_mm(y, qx, qw, sx_sl, sw_sl, global_amax_qx * global_amax_qw)
+        #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
+        #sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
+        y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
 
         #TODO: fuse accumulate into GEMM
         if accumulate:

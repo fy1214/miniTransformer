@@ -370,15 +370,12 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
     if global_amax_qw.numel() > 1:
         global_amax_qw = global_amax_qw.max().view(1)
     
-    # Scales from Nvfp4TiledQuantizeRefOp: quantize produces 2D scales, convert to 4D for triton/cuBLAS
     sx_2d = qresult_x.scale  # (M, K//16)
     sw_2d = qresult_w.scale  # (N, K//16)
-    
-    # For _ref_qgemm, use 2D scales directly (from quantize output)
+
     sx = sx_2d.to(torch.float8_e4m3fn)
     sw = sw_2d.to(torch.float8_e4m3fn)
 
-    
     qparams = x_params
     return qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams
 

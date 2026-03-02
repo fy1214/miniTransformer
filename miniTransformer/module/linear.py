@@ -14,6 +14,7 @@ from miniTransformer.distributed.distributed import (
     set_tensor_model_parallel_attributes,
 )
 from miniTransformer.quantiztion import quantization
+from miniTransformer.utils.monitor_util import print_memory_usage
 from miniTransformer.utils.utils import (
     is_rank_0,
     init_method_constant,

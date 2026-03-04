@@ -48,7 +48,7 @@ def _fp4_mm(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: 
         out,
         block_size=BLOCK,
         use_8x4_sf_layout=False,
-        backend="cudnn",
+        backend="cutlass",
         use_nvfp4=True,
     )
 

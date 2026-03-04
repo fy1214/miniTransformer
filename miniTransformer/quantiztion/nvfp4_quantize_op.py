@@ -40,6 +40,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             with_rht=qparams.with_rht,
             with_post_rht_amax=qparams.with_rht,
             with_2d_quantization=with_2d_quantization,
+            stochastic_rounding=qparams.stochastic_rounding
         )
         if use_cpp_allocator:
             nvfp4_tensor = nvfp4_quantizer(x)

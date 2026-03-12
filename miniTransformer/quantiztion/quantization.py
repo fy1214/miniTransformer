@@ -40,6 +40,7 @@ class QParams:
     quant_tile_shape: Tuple[int, int] | None = None
     with_2d_quantization:  bool = False
     with_rht: bool = False
+    stochastic_rounding: bool = False
     param_type: ParamType = ParamType.X
 
 

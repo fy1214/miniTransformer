@@ -48,7 +48,7 @@ def _fp4_mm(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: 
         out,
         block_size=BLOCK,
         use_8x4_sf_layout=False,
-        backend="cudnn",
+        backend="cutlass",
         use_nvfp4=True,
     )
 
@@ -244,7 +244,7 @@ class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
         #TODO: fuse accumulate into GEMM
         if accumulate:
             assert out is not None, "Output tensor must be provided for accumulation."
-            out = (out.to(torch.float32) + y).to(out_dtype)
+            out.add_(y)
             return out
         else:
             y = y.to(out_dtype)

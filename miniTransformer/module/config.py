@@ -128,21 +128,24 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                stochastic_rounding=False,
             ),
             w_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(16, 16),
                 with_2d_quantization=True,
-                with_rht=False
+                with_rht=False,
+                stochastic_rounding = False
             ),
             g_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                stochastic_rounding=True,
             ),
             quantize_op=Nvfp4TiledQuantizeOp(),
             allgather_quantize=False,

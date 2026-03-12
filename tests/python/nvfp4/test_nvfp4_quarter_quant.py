@@ -54,7 +54,7 @@ def _dq_fp4(x_e2m1: torch.Tensor, x_e4m3: torch.Tensor, alpha: float):
 @torch.compile(fullgraph=True)
 def quant_fp4(x, four_over_six=False):
     amax = torch.max(torch.abs(x)).to(torch.float32)
-    q, s, t = quartet2.quant_fp4(x, 1.0, amax, four_over_six=four_over_six)
+    q, s, t = quartet2.quant_fp4(x, scale_override=1.0, amax=amax, mode=four_over_six)
     return _dq_fp4(q, s, t)
 
 def quant_fp4_ref(x, four_over_six=False):

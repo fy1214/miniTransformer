@@ -102,6 +102,9 @@ class _NonQuantizedLinear(torch.autograd.Function):
             ctx.tp_size = tp_size
             ctx.parallel_mode = parallel_mode
             ctx.x_shape = x_shape
+            ctx.is_first_microbatch = is_first_microbatch
+            ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.activation_dtype = activation_dtype
 
             ctx.save_for_backward(
                 x,
@@ -150,7 +153,25 @@ class _NonQuantizedLinear(torch.autograd.Function):
 
         # GEMM wgrad
         # TODO need to support wgrad accumulation
+        if ctx.is_first_microbatch is not None:
+            accumulate_wgrad_into_param_main_grad = (
+                ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
+            )
+        else:
+            accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
+
+        # For wgrad, we will set the dtype to float32
+        out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
+
         wgrad = torch.matmul(dy.t(), x)
+
+        if accumulate_wgrad_into_param_main_grad:
+            if ctx.fuse_wgrad_accumulation:
+                w.main_grad.add_(wgrad)
+                wgrad = w.main_grad
+
+        # Handle wgrad accumulation for mcore if needed
+        wgrad = _QuantizedLinear.reset_wgrad_if_needed(ctx, w, wgrad)
 
         # Wait for communication to finish
         if handle is not None:
@@ -320,6 +341,7 @@ class _QuantizedLinear(torch.autograd.Function):
                     qw,
                     sw,
                     qw_global_amax_row,
+                    x,
                     w,
                 )
             else:
@@ -330,6 +352,7 @@ class _QuantizedLinear(torch.autograd.Function):
                     qw_t,
                     sw_t,
                     qw_global_amax_col,
+                    x,
                     w,
                 )
 
@@ -348,7 +371,7 @@ class _QuantizedLinear(torch.autograd.Function):
         # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, w) = ctx.saved_tensors
+        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, x, w) = ctx.saved_tensors
 
         assert qw_t is not None and sw_t is not None
         assert qx_t is not None and sx_t is not None
@@ -442,6 +465,10 @@ class _QuantizedLinear(torch.autograd.Function):
         if disable_backward_quant:
             dq_x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
             wgrad = dy.T @ dq_x
+            if accumulate_wgrad_into_param_main_grad:
+                if ctx.fuse_wgrad_accumulation:
+                    w.main_grad.add_(wgrad)
+                    wgrad = w.main_grad
         else:
             wgrad = ctx.quantize_op.qgemm(
                 qdy_t,
@@ -677,6 +704,7 @@ class Linear(LayerLinearBaseModule):
         ub_name: Optional[str] = None,
         # JQ: hybrid addtional args
         layer_number: Optional[int] = None,
+        save_original_input: bool = False,
         qlinear_params: Optional[config.QLinearParams] = None,
     ) -> None:
         super().__init__(tp_group, tp_size, sequence_parallel)
@@ -697,6 +725,7 @@ class Linear(LayerLinearBaseModule):
         self.ub_name = ub_name
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
+        self.save_original_input = save_original_input
         # JQ: hybrid addtional
         self.layer_name = ub_name
         self.layer_number = layer_number

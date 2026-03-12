@@ -268,8 +268,13 @@ class _QuantizedLinear(torch.autograd.Function):
 
         # Quantize w only for is_first_microbatch is True or None
         update_quantize_weights = is_first_microbatch or is_first_microbatch is None
-        if update_quantize_weights and not quantize_op.should_update_quantize_weights:
+        if quantize_op.should_update_quantize_weights:
             # Quantize w (with optional transpose)
+            qresult_w = quantize_op.quantize(
+                w, qlinear_params.w_params, return_transpose=True
+            )
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
+        elif update_quantize_weights:
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=True
             )

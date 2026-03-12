@@ -348,7 +348,6 @@ class _QuantizedLinear(torch.autograd.Function):
                     qw,
                     sw,
                     qw_global_amax_row,
-                    x,
                     w,
                 )
             else:

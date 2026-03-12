@@ -107,7 +107,12 @@ class QuantizeInputMetaBase:
 
 
 
-class QuantizeOpBase():
+class QuantizeOpBase:
+
+    """
+    Check QuantizeOp whether you could save weight quantize result for the microbatch
+    """
+    should_update_quantize_weights: bool = False
 
     @staticmethod
     def compute_global_amax(x: torch.Tensor):

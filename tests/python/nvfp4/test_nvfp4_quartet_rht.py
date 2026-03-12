@@ -3,7 +3,7 @@ import torch
 from quartet2.rht import transform_128, transform_rht128, swizzle_hadamard
 from quartet2.quant import quant_had_eden, rht128_quant_eden
 
-from miniTransformer.quantiztion.nvfp4_quarter_op import get_hadamard_matrix
+from miniTransformer.quantiztion.nvfp4_quartet_op import get_hadamard_matrix
 
 torch.random.manual_seed(42)
 

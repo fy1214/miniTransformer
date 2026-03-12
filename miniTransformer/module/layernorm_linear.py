@@ -3,6 +3,7 @@ import torch
 from typing import Callable, Dict, Optional, Tuple, Union, Any
 from miniTransformer.module import config
 from miniTransformer.module.linear import Linear
+from miniTransformer.utils.env import should_switch_to_hybrid_linear
 
 try:
     import transformer_engine as te  # type: ignore
@@ -245,7 +246,7 @@ class LayerNormLinear(Linear):
 
         # use_te_norm is None by default, and will be set to True if we should switch to hybrid linear
         if use_te_norm is None:
-            use_te_norm = config.should_switch_to_hybrid_linear()
+            use_te_norm = should_switch_to_hybrid_linear()
 
         if use_te_norm:
             self.layer_norm_weight = make_te_norm(

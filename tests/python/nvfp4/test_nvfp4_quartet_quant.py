@@ -5,11 +5,20 @@ import time
 import pytest
 import torch
 
-import miniTransformer.ops.quarter_quant as quartet2
-from miniTransformer.quantiztion.nvfp4_quarter_op import Nvfp4QuarterQuantizeOp
+import miniTransformer.ops.quartet_quant as quartet2
+from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.quantization import QParams, ParamType
 
 torch.random.manual_seed(42)
+
+
+def unblock(blocked_scales, rows, cols):
+    n_row_blocks, n_col_blocks = rows // 128, (cols // 16) // 4
+    rearranged = blocked_scales.reshape(-1, 32, 4, 4)
+    rearranged = rearranged.permute(0, 2, 1, 3).reshape(-1, n_col_blocks, 128, 4)
+    rearranged = rearranged.permute(0, 2, 1, 3)
+    # Reverse: view(n_row_blocks, 128, n_col_blocks, 4)
+    return rearranged.reshape(n_row_blocks * 128, n_col_blocks * 4)
 
 
 def _dq_fp4(x_e2m1: torch.Tensor, x_e4m3: torch.Tensor, alpha: float):
@@ -43,12 +52,13 @@ def _dq_fp4(x_e2m1: torch.Tensor, x_e4m3: torch.Tensor, alpha: float):
         device=device,
     )
     x_fp4_dq = grid_dq[x_e2m1_unpacked]
+
     scales_dq = x_e4m3.to(torch.float32)
-    scales_dq = scales_dq.unflatten(dim=-1, sizes=(-1, 1))
-    x_dq = (x_fp4_dq.unflatten(dim=-1, sizes=(-1, 16)) * scales_dq).flatten(
+    scales_dq = unblock(scales_dq, x_e2m1.shape[0], x_e2m1.shape[1] * 2)
+    x_dq = (x_fp4_dq.unflatten(dim=-1, sizes=(-1, 16)) * scales_dq[..., None]).flatten(
         start_dim=-2
     ) * alpha
-    return x_dq
+    return x_dq.to(torch.bfloat16)
 
 
 @torch.compile(fullgraph=True)
@@ -58,7 +68,7 @@ def quant_fp4(x, four_over_six=False):
     return _dq_fp4(q, s, t)
 
 def quant_fp4_ref(x, four_over_six=False):
-    ref_op = Nvfp4QuarterQuantizeOp()
+    ref_op = Nvfp4QuartetQuantizeOp()
     param = QParams(
         output_dtype=torch.uint8,
         scaling_dtype=torch.float8_e4m3fn,

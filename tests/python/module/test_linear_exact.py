@@ -81,5 +81,5 @@ class TestLinearExact:
 
 if __name__ == "__main__":
     test = TestLinearExact()
-    test.test_linear_forward(QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER)
-    test.test_linear_backward(QuantizeRecipe.FP4_SUB_CHANNEL_QUARTER)
+    test.test_linear_forward(QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET)
+    test.test_linear_backward(QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET)

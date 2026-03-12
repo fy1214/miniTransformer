@@ -4,7 +4,7 @@ import fp4_gemm
 from typing import Optional
 from scipy.linalg import hadamard
 
-from miniTransformer.ops.quarter_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
+from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 
@@ -74,11 +74,11 @@ def unblock(blocked_scales, rows, cols):
     return rearranged.reshape(n_row_blocks * 128, n_col_blocks * 4)
 
 
-class Nvfp4QuarterQuantizeOp(quantization.QuantizeOpBase):
+class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
 
     def __init__(self, for_over_six=True):
         super().__init__()
-
+        self.should_update_quantize_weights = True
         self.forward_scale_override = 1.0
         self.backward_scale_override = (17 / 16) * 0.93
         self.mode = NVFP4QuantMode.FOUR_SIX if for_over_six else NVFP4QuantMode.RNE

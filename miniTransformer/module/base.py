@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional, Union
 
 from . import config
 from ..distributed.distributed import get_distributed_world_size
+from ..utils.env import get_keep_in_bf16_layer_numbers
 from ..utils.utils import get_default_init_method #, FP8GlobalStateManager
 
 
@@ -174,7 +175,7 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
 
         if qlinear_params is None:
             qlinear_params = config.get_qlinear_params_from_env_qat_params()
-        if layer_number in config.get_keep_in_bf16_layer_numbers():
+        if layer_number in get_keep_in_bf16_layer_numbers():
             return config.QLinearParams(quantize=False)
         else:
             if layer_name is not None:

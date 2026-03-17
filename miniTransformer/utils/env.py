@@ -15,5 +15,5 @@ def get_keep_in_bf16_layer_numbers():
         return [int(s) for s in keep_in_bf16_layer_numbers.split(",")]
 
 def should_keep_backward_in_bf16():
-    disable_backward_quant = os.getenv("DISABLE_BACKWARD_QUANT", False)
-    return disable_backward_quant
+    disable_backward_quant = int(os.getenv("DISABLE_BACKWARD_QUANT", "0"))
+    return disable_backward_quant == 1

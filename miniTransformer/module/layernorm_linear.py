@@ -300,7 +300,7 @@ class LayerNormLinear(Linear):
         inp = inp.contiguous()
 
         # Run normalization without fusion
-        ln_out = self.norm(inp)
+        ln_out = self.layer_norm_weight(inp)
         input_meta = None
 
         # Run the linear layer by calling parent's forward

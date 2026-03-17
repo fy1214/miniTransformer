@@ -69,6 +69,7 @@ def setup_extensions() -> setuptools.Extension:
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT162_OPERATORS__",
         "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+        "-include", "/usr/include/semaphore.h ",
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "-std=c++17",
@@ -92,7 +93,7 @@ def setup_extensions() -> setuptools.Extension:
         if version < (12, 6):
             raise RuntimeError(f"HYBRID requires CUDA 12.6 or newer. Got {version}")
         # add nvcc flags for specific architectures
-        cuda_archs = os.getenv("HYBRID_CUDA_ARCHS", "89;90;90a;100a;103a")
+        cuda_archs = os.getenv("HYBRID_CUDA_ARCHS", "100a;103a")
         for arch in cuda_archs.split(";"):
             nvcc_flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
 
@@ -117,8 +118,10 @@ def setup_extensions() -> setuptools.Extension:
     include_dirs = [
         str(extensions_dir),
         # CUTLASS include directories(TODO: Need General Modification )
-        "/workspace/cutlass/include",
-        "/workspace/cutlass/tools/util/include",
+        str(root_dir / "third-party" / "cutlass" / "include"),
+        str(root_dir / "third-party" / "cutlass" / "include" / "cute"),
+        str(root_dir / "third-party" / "cutlass" / "include" / "cutlass"),
+        str(root_dir / "third-party" / "cutlass" / "tools" / "util" / "include"),
     ]
 
     # construct the extension

@@ -1,5 +1,5 @@
-from miniTransformer.ops import quantization
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 import torch
 import fp4_gemm
 

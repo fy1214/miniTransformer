@@ -8,8 +8,8 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from miniTransformer.ops.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.nvfp4_qgemm_op import (
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+from miniTransformer.ops.nvfp4_qgemm import (
     initialize_nvfp4_for_qgemm,
     swizzle_scale,
 )

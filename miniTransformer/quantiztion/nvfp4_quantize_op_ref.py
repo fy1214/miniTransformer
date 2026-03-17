@@ -3,7 +3,7 @@ import torch
 import fp4_gemm
 from typing import Optional, Tuple
 from miniTransformer.utils import utils
-from miniTransformer.ops import quantization
+from miniTransformer.quantiztion import quantization
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn

@@ -1,8 +1,6 @@
 import torch
 import pytest
-import time
-from typing import Optional, Tuple
-from miniTransformer.utils import utils
+from typing import Optional
 from miniTransformer.quantiztion import quantization
 
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import cast_from_fp4x2
@@ -11,7 +9,7 @@ from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantize
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 import fp4_gemm
-from miniTransformer.triton.gemm_tl import block_scaled_matmul
+from miniTransformer.ops.triton.gemm_tl import block_scaled_matmul
 
 
 def qgemm_cmp_triton_ref(

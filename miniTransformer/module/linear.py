@@ -14,7 +14,7 @@ from miniTransformer.distributed.distributed import (
     set_tensor_model_parallel_attributes,
 )
 from miniTransformer.quantiztion import quantization
-from miniTransformer.utils.monitor_util import print_memory_usage
+from miniTransformer.utils.env import should_keep_backward_in_bf16
 from miniTransformer.utils.utils import (
     is_rank_0,
     init_method_constant,
@@ -25,7 +25,6 @@ from miniTransformer.utils.utils import (
 
 logger = logging.getLogger(__name__)
 
-disable_backward_quant = False
 
 class _NonQuantizedLinear(torch.autograd.Function):
     """Non-quantized Linear function (FP32, FP16, BF16)
@@ -72,6 +71,7 @@ class _NonQuantizedLinear(torch.autograd.Function):
         is_grad_enabled: bool,
         is_first_microbatch: bool | None,
         fuse_wgrad_accumulation: bool,
+        disable_backward_quant: bool
     ) -> torch.Tensor:
         # Set dtypes, shapes and bias
         x_shape = x.shape
@@ -230,6 +230,7 @@ class _QuantizedLinear(torch.autograd.Function):
         is_grad_enabled: bool,
         is_first_microbatch: bool | None,
         fuse_wgrad_accumulation: bool,
+        disable_backward_quant: bool
     ) -> torch.Tensor:
 
         # Get quantization op
@@ -267,8 +268,13 @@ class _QuantizedLinear(torch.autograd.Function):
 
         # Quantize w only for is_first_microbatch is True or None
         update_quantize_weights = is_first_microbatch or is_first_microbatch is None
-        if update_quantize_weights:
+        if quantize_op.should_update_quantize_weights:
             # Quantize w (with optional transpose)
+            qresult_w = quantize_op.quantize(
+                w, qlinear_params.w_params, return_transpose=True
+            )
+            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
+        elif update_quantize_weights:
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=True
             )
@@ -316,6 +322,7 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.is_first_microbatch = is_first_microbatch
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.activation_dtype = activation_dtype
+            ctx.disable_backward_quant = disable_backward_quant
 
             qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col = (
                 qresult_x.data_t,
@@ -341,7 +348,6 @@ class _QuantizedLinear(torch.autograd.Function):
                     qw,
                     sw,
                     qw_global_amax_row,
-                    x,
                     w,
                 )
             else:
@@ -352,7 +358,6 @@ class _QuantizedLinear(torch.autograd.Function):
                     qw_t,
                     sw_t,
                     qw_global_amax_col,
-                    x,
                     w,
                 )
 
@@ -371,7 +376,7 @@ class _QuantizedLinear(torch.autograd.Function):
         # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, x, w) = ctx.saved_tensors
+        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, w) = ctx.saved_tensors
 
         assert qw_t is not None and sw_t is not None
         assert qx_t is not None and sx_t is not None
@@ -419,7 +424,7 @@ class _QuantizedLinear(torch.autograd.Function):
             )
 
         # GEMM dgrad
-        if disable_backward_quant:
+        if ctx.disable_backward_quant:
             dq_w = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
             dgrad = dy @ dq_w
         else:
@@ -462,7 +467,7 @@ class _QuantizedLinear(torch.autograd.Function):
         # For wgrad, we will set the dtype to float32
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
-        if disable_backward_quant:
+        if ctx.disable_backward_quant:
             dq_x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
             wgrad = dy.T @ dq_x
             if accumulate_wgrad_into_param_main_grad:
@@ -730,6 +735,8 @@ class Linear(LayerLinearBaseModule):
         self.layer_name = ub_name
         self.layer_number = layer_number
 
+        self.disable_backward_quant = should_keep_backward_in_bf16()
+
         # JQ: just set hybrid recipe
         # Set quantization parameters
         self.qlinear_params = self.set_qlinear_params(
@@ -992,6 +999,7 @@ class Linear(LayerLinearBaseModule):
             torch.is_grad_enabled(),
             is_first_microbatch,
             self.fuse_wgrad_accumulation,
+            self.disable_backward_quant
         )
         out = linear_fn(*args)
 

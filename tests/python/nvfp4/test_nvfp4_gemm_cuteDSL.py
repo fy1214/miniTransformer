@@ -1,12 +1,9 @@
-import os
-import sys
 import time
 import pytest
 import torch
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp

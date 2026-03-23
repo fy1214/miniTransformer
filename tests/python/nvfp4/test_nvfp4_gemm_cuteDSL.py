@@ -1,5 +1,6 @@
 import time
 import pytest
+from sympy import true
 import torch
 
 import cutlass
@@ -78,7 +79,20 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     )
     return cute_f8_torch_tensor_cpu.cuda()
 
-def _run_cutedsl_nvfp4_gemm_ref(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+def _run_cutedsl_nvfp4_gemm_ref(
+    qx,
+    qw,
+    sx,
+    sw,
+    M,
+    N,
+    K,
+    alpha,
+    out_dtype,
+    device,
+    return_fp32: bool = False,
+    has_swizzle: bool = True,
+):
 
     l = 1
     a_ref_f4 = qx.view(torch.float4_e2m1fn_x2) 
@@ -86,8 +100,12 @@ def _run_cutedsl_nvfp4_gemm_ref(qx, qw, sx, sw, M, N, K, alpha, out_dtype, devic
 
     sx_f8 = sx.to(torch.float8_e4m3fn) if sx.dtype != torch.float8_e4m3fn else sx
     sw_f8 = sw.to(torch.float8_e4m3fn) if sw.dtype != torch.float8_e4m3fn else sw
-    scale_a = to_blocked(sx_f8).to(device)
-    scale_b = to_blocked(sw_f8).to(device)
+    if has_swizzle:
+        scale_a = to_blocked(sx_f8).to(device)
+        scale_b = to_blocked(sw_f8).to(device)
+    else:
+        scale_a = sx_f8.to(device)
+        scale_b = sw_f8.to(device)
 
     res = torch._scaled_mm(
         a_ref_f4,
@@ -95,9 +113,12 @@ def _run_cutedsl_nvfp4_gemm_ref(qx, qw, sx, sw, M, N, K, alpha, out_dtype, devic
         scale_a,
         scale_b,
         bias=None,
-        out_dtype=out_dtype,
+        out_dtype=torch.float32,
     )
-    return (res.float() * alpha).to(out_dtype)
+    y_fp32 = res * alpha
+    if return_fp32:
+        return y_fp32
+    return y_fp32.to(out_dtype)
 
 def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
     """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
@@ -156,7 +177,7 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
 
 
 def _run_cutedsl_nvfp4_gemm_optimized(
-    qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False
+    qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False, has_swizzle=True
 ):
     """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
     import cutlass.cute as cute
@@ -183,13 +204,16 @@ def _run_cutedsl_nvfp4_gemm_optimized(
     else:
         c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
 
-    def _ref_2d_to_cute_sf(data_2d, mn):
+    def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
         ref = create_ref_scale_factor_tensor(l, mn, sf_k)
         ref.copy_(data_2d.unsqueeze(-1).to(ref.dtype).cpu())
-        return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+        if has_swizzle:
+            return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+        else:
+            return ref.flatten().to(device)
 
-    sfa_tensor = _ref_2d_to_cute_sf(sx, M)
-    sfb_tensor = _ref_2d_to_cute_sf(sw, N)
+    sfa_tensor = _ref_2d_to_cute_sf(sx, M, has_swizzle)
+    sfb_tensor = _ref_2d_to_cute_sf(sw, N, has_swizzle)
 
     a_ptr = make_ptr(ab_dtype, a_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     b_ptr = make_ptr(ab_dtype, b_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -221,10 +245,10 @@ class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize(
         "M, K, N, seed",
         [
-            # (256, 256, 256, 10),
-            # (256, 256, 256, 1234),
-            # (8192, 8192, 8192, 22),
-            # (8192, 8192, 8192, 1234),
+            (256, 256, 256, 10),
+            (256, 256, 256, 1234),
+            (8192, 8192, 8192, 22),
+            (8192, 8192, 8192, 1234),
         ],
     )
     def test_cutedsl_nvfp4_normal(self, M, K, N, seed):
@@ -235,31 +259,17 @@ class TestCuTeDSLNvfp4Gemm:
             initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
         )
 
-        quantize_op = Nvfp4TiledQuantizeRefOp()
+        factor = 6.0 * 6.0 * 448.0 * 448.0
+        alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
+        alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
 
-        y_ref = quantize_op._ref_qgemm(
-            qx=qx,
-            qw=qw,
-            m_params=None,
-            out_dtype=out_dtype,
-            sx=sx,
-            sw=sw,
-            bias=None,
-            out=None,
-            accumulate=False,
-            pow_2_scales=False,
-            global_amax_qx=global_amax_qx,
-            global_amax_qw=global_amax_qw,
-            qparams_x=qparams,
-            qparams_w=qparams,
+        # Reference implementation: block layout + torch._scaled_mm + alpha
+        y_ref = _run_cutedsl_nvfp4_gemm_ref(
+            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device
         )
 
         assert y_ref.shape == (M, N)
         assert y_ref.dtype == out_dtype
-
-        factor = 6.0 * 6.0 * 448.0 * 448.0
-        alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
-        alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
 
         start = time.time()
         D_cute = _run_cutedsl_nvfp4_gemm(
@@ -306,7 +316,8 @@ class TestCuTeDSLNvfp4Gemm:
     )
     @pytest.mark.parametrize("accumulate", [True, False])
     @pytest.mark.parametrize("acc_dtype", [torch.float32, torch.bfloat16])
-    def test_cutedsl_nvfp4_optimized(self, M, K, N, seed, accumulate, acc_dtype):
+    @pytest.mark.parametrize("has_swizzle", [True, False])
+    def test_cutedsl_nvfp4_optimized(self, M, K, N, seed, accumulate, acc_dtype, has_swizzle):
         device = "cuda"
         out_dtype = acc_dtype
         out_init = torch.randn((M, N), dtype=out_dtype, device=device) if accumulate else None
@@ -315,36 +326,23 @@ class TestCuTeDSLNvfp4Gemm:
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = (
             initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
         )
-        
-        quantize_op = Nvfp4TiledQuantizeRefOp()
-
-        y_ref = quantize_op._ref_qgemm(
-            qx=qx,
-            qw=qw,
-            m_params=None,
-            out_dtype=out_dtype,
-            sx=sx,
-            sw=sw,
-            bias=None,
-            out=out_init,
-            accumulate=accumulate,
-            pow_2_scales=False,
-            global_amax_qx=global_amax_qx,
-            global_amax_qw=global_amax_qw,
-            qparams_x=qparams,
-            qparams_w=qparams,
-        )
-
-        assert y_ref.shape == (M, N)
-        assert y_ref.dtype == out_dtype
 
         factor = 6.0 * 6.0 * 448.0 * 448.0
         alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
         alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
 
+        y_ref = _run_cutedsl_nvfp4_gemm_ref(
+            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, return_fp32=accumulate, has_swizzle=has_swizzle
+        )
+        if accumulate:
+            y_ref = (y_ref + out_init.float()).to(out_dtype)
+
+        assert y_ref.shape == (M, N)
+        assert y_ref.dtype == out_dtype
+
         start = time.time()
         D_cute = _run_cutedsl_nvfp4_gemm_optimized(
-            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, out=out_init_dsl, accumulate=accumulate
+            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, out=out_init_dsl, accumulate=accumulate, has_swizzle=has_swizzle
         )
 
         if device == "cuda":

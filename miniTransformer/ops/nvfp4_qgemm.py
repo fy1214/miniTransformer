@@ -315,6 +315,77 @@ def swizzle_scale(scale_2d, target_M, target_K):
     )
 
 
+def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
+    """
+    Initialize NVFP4 format inputs for _ref_qgemm and qgemm_tl testing.
+
+    Same flow as linear.py for data: FP32 tensors + quantize_op.quantize.
+    - x: randn (M, K); w: init like linear (normal mean=0, std=0.023).
+    - Scales: from Nvfp4TiledQuantizeRefOp.quantize() output (2D), converted to 4D for triton/cuBLAS.
+      - sx_4d/sw_4d: 4D (M//128, K//64, 32, 16) for triton/cuBLAS (via swizzle_scale).
+      - sx/sw: 2D (M, K//16) for _ref_qgemm (directly from quantize output).
+
+    Returns:
+        (qx, qw, sx_4d, sw_4d, sx, sw, global_amax_qx, global_amax_qw, qparams)
+        sx_4d/sw_4d: 4D for triton/cuBLAS; sx/sw: 2D for _ref_qgemm.
+    """
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed(seed)
+
+    VEC_SIZE = 16
+
+    # Linear-style: FP32 input + weight, then quantize (like linear.py)
+    x_fp32 = torch.randn(M, K, device=device, dtype=torch.float32)
+    w_fp32 = torch.empty(N, K, device=device, dtype=torch.float32)
+    torch.nn.init.normal_(w_fp32, mean=0.0, std=0.023)
+
+    x_params = quantization.QParams(
+        scaling_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.uint8,
+        eps=0.0,
+        pow_2_scales=False,
+        quant_tile_shape=(1, 16),
+        with_2d_quantization=False,
+        with_rht=False,
+    )
+    w_params = quantization.QParams(
+        scaling_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.uint8,
+        eps=0.0,
+        pow_2_scales=False,
+        quant_tile_shape=(1, 16),
+        with_2d_quantization=False,
+        with_rht=False,
+    )
+
+    quantize_op = Nvfp4TiledQuantizeRefOp()
+    qresult_x = quantize_op.quantize(x_fp32, x_params, return_transpose=False)
+    qresult_w = quantize_op.quantize(w_fp32, w_params, return_transpose=False)
+
+    qx = qresult_x.data
+    qw = qresult_w.data
+    global_amax_qx = qresult_x.tensor_scale
+    global_amax_qw = qresult_w.tensor_scale_t
+    if global_amax_qx is None:
+        global_amax_qx = torch.max(torch.abs(x_fp32)).to(torch.float32).view(1)
+    if global_amax_qw is None:
+        global_amax_qw = torch.max(torch.abs(w_fp32)).to(torch.float32).view(1)
+    if global_amax_qx.numel() > 1:
+        global_amax_qx = global_amax_qx.max().view(1)
+    if global_amax_qw.numel() > 1:
+        global_amax_qw = global_amax_qw.max().view(1)
+
+    sx_2d = qresult_x.scale  # (M, K//16)
+    sw_2d = qresult_w.scale  # (N, K//16)
+
+    sx = sx_2d.to(torch.float8_e4m3fn)
+    sw = sw_2d.to(torch.float8_e4m3fn)
+
+    qparams = x_params
+    return qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams
+
+
 def create_ref_scale_factor_tensor(l, mn, sf_k):
     """
     Create the reference scale factor tensor (mn, sf_k, l) in ref layout.

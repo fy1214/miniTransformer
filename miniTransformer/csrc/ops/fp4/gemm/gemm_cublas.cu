@@ -291,6 +291,7 @@ void block_scaled_matmul_nvfp4_impl(
     const at::Tensor *scale_B,
     void *workspace,
     size_t workspaceSize,
+    float alpha,
     cudaStream_t stream) {
   const int M = A->size(0);
   const int K_bytes = A->size(1);  // K in bytes
@@ -302,7 +303,6 @@ void block_scaled_matmul_nvfp4_impl(
               "Output shape mismatch: expected (", M, ", ", N, "), got (", output->size(0), ", ", output->size(1), ")");
   TORCH_CHECK(A->dtype() == at::ScalarType::Byte, "A must be uint8, got ", A->dtype());
   TORCH_CHECK(B->dtype() == at::ScalarType::Byte, "B must be uint8, got ", B->dtype());
-  TORCH_CHECK(output->dtype() == at::ScalarType::Half, "Output must be float16, got ", output->dtype());
 
   using cublasHandleManager = HandleManager<cublasLtHandle_t, CreateCublasHandle>;
   cublasLtHandle_t handle = cublasHandleManager::Instance().GetHandle();
@@ -353,7 +353,6 @@ void block_scaled_matmul_nvfp4_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, dataType, K, N, K));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, M, N, M));
 
-  float alpha = 1.0f;
   float beta = 0.0f; // No bias
 
   // Create preference
@@ -401,6 +400,8 @@ void block_scaled_matmul_nvfp4(
     at::Tensor output,
     const at::Tensor scale_A,
     const at::Tensor scale_B,
+    float amax_A,
+    float amax_B,
     const at::Tensor workspace_tensor,
     size_t workspace_size) {
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -410,8 +411,6 @@ void block_scaled_matmul_nvfp4(
               "block_scaled_matmul_nvfp4 only supports uint8 packed FP4 inputs (NVFP4), got A dtype: ", A.dtype());
   TORCH_CHECK(B.dtype() == at::ScalarType::Byte,
               "block_scaled_matmul_nvfp4 only supports uint8 packed FP4 inputs (NVFP4), got B dtype: ", B.dtype());
-  TORCH_CHECK(output.dtype() == at::ScalarType::Half,
-              "block_scaled_matmul_nvfp4 output must be float16, got ", output.dtype());
   
   // For packed FP4, shape[1] is in bytes, but K dimension should be in elements
   // So K = A_shape[1] * 2 (2 elements per byte)
@@ -419,8 +418,12 @@ void block_scaled_matmul_nvfp4(
   TORCH_CHECK(B.size(1) * 2 == K, 
               "K dimensions must match. A has ", K, " elements, B has ", B.size(1) * 2, " elements");
 
+  // Compute alpha
+  float new_alpha = 1.0f;
+  new_alpha = compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B);
+
   block_scaled_matmul_nvfp4_impl(
       &A, &B, &output, &scale_A, &scale_B,
-      workspace_tensor.data_ptr(), workspace_size, stream);
+      workspace_tensor.data_ptr(), workspace_size, new_alpha, stream);
 }
 

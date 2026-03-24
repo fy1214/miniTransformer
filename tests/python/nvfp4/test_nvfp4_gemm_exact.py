@@ -86,6 +86,7 @@ def check_nvfp4_gemm_versus_reference(
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
+    '''
     fp4_gemm.cublas_gemm(
         x_res.data,
         swizzle_scale(x_res.scale, M, K),
@@ -100,6 +101,18 @@ def check_nvfp4_gemm_versus_reference(
         accumulate,
         workspace,
         workspace.shape[0],
+    )
+    '''
+    fp4_gemm.block_scaled_matmul_nvfp4(
+        x_res.data,
+        w_res.data,
+        out,
+        swizzle_scale(x_res.scale, M, K),
+        swizzle_scale(x_res.scale, N, K),
+        x_res.tensor_scale.item(),
+        w_res.tensor_scale.item(),
+        workspace,
+        workspace.shape[0]
     )
 
     ref_op = Nvfp4TiledQuantizeRefOp()

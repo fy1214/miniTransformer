@@ -1,3 +1,4 @@
+from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 import torch
@@ -87,12 +88,12 @@ def check_nvfp4_gemm_versus_reference(
 
     fp4_gemm.cublas_gemm(
         x_res.data,
-        x_res.scale,
-        x_res.global_amax_row.item(),
+        swizzle_scale(x_res.scale, M, K),
+        x_res.tensor_scale.item(),
         True,
         w_res.data,
-        w_res.scale,
-        w_res.global_amax_row.item(),
+        swizzle_scale(x_res.scale, N, K),
+        w_res.tensor_scale.item(),
         False,
         1, 0,
         out,
@@ -128,8 +129,8 @@ def check_nvfp4_gemm_versus_reference(
         None,
         out,
         accumulate=accumulate,
-        global_amax_qx=x_res_ref.global_amax_row,
-        global_amax_qw=w_res_ref.global_amax_row,
+        global_amax_qx=x_res_ref.tensor_scale,
+        global_amax_qw=w_res_ref.tensor_scale,
         qparams_x=qparam_x,
         qparams_w=qparam_w
     )

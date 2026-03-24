@@ -72,9 +72,9 @@ void cublas_gemm_impl(
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
-  if (inputB->dtype() == at::ScalarType::Half) {
+  if (outputD->dtype() == at::ScalarType::Half) {
     D_type = CUDA_R_16F;
-  } else if (inputB->dtype() == at::ScalarType::Float) {
+  } else if (outputD->dtype() == at::ScalarType::Float) {
     D_type = CUDA_R_32F;
   }
 

@@ -441,6 +441,8 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     return cute_f8_torch_tensor_cpu.cuda()
 
 
+compile_kernel = {}
+
 def cutedsl_nvfp4_gemm_optimized(
     qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False, has_swizzle=True
 ):
@@ -486,17 +488,23 @@ def cutedsl_nvfp4_gemm_optimized(
 
     gemm = OptimizedBlockScaledDenseGemmKernel()
     stream = cutlass_torch.default_stream()
-    compiled = cute.compile(
-        gemm,
-        a_ptr,
-        b_ptr,
-        sfa_ptr,
-        sfb_ptr,
-        c_ptr,
-        (M, N, K, l),
-        stream,
-        epilogue_op=lambda x: x * alpha_value,
-        accumulate=accumulate,
-    )
+    key = (M, N, K, out_dtype, accumulate, has_swizzle)
+    if key in compile_kernel:
+        compiled = compile_kernel[key]
+    else:
+        compiled = cute.compile(
+            gemm,
+            a_ptr,
+            b_ptr,
+            sfa_ptr,
+            sfb_ptr,
+            c_ptr,
+            (M, N, K, l),
+            stream,
+            epilogue_op=lambda x: x * alpha_value,
+            accumulate=accumulate,
+        )
+        compile_kernel[key] = compiled
+
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
     return c_tensor.squeeze(-1).float().to(out_dtype)

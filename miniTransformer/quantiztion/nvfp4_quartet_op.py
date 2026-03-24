@@ -235,7 +235,7 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
-        m, n, k = qx.shape[0], qw.shape[0], qx.shape[0] * 2
+        m, n, k = qx.shape[0], qw.shape[0], qx.shape[1] * 2
 
         # GEMM for FP4
         #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)

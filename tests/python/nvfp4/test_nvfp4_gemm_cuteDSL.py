@@ -1,14 +1,14 @@
 import time
 import pytest
-from sympy import true
 import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import make_ptr
+import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
 
+from sympy import true
+from cutlass.cute.runtime import make_ptr
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.nvfp4_qgemm import initialize_nvfp4_for_qgemm
 from miniTransformer.ops.cuteDSL.nvfp4.scale_factor_swizzle import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 
 def ceil_div(a, b):
@@ -26,58 +26,6 @@ def to_blocked(input_matrix):
 
     return rearranged.flatten()
 
-def create_ref_scale_factor_tensor(l, mn, sf_k):
-    """
-    Create the reference scale factor tensor (mn, sf_k, l) in ref layout.
-    Returns float8_e4m3fn tensor on CPU; callers may copy_ their data into it.
-    """
-    ref_shape = (l, mn, sf_k)
-    ref_permute_order = (1, 2, 0)
-    ref_f8_random_int = torch.randint(1, 3, ref_shape, dtype=torch.int8)
-    ref_f8_torch_tensor_cpu = ref_f8_random_int.to(dtype=torch.float8_e4m3fn)
-    ref_f8_torch_tensor_cpu_permuted = ref_f8_torch_tensor_cpu.permute(
-        *ref_permute_order
-    )
-    return ref_f8_torch_tensor_cpu_permuted
-
-
-def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permuted):
-    """
-    Create the CUTE-format scale factor tensor on CUDA from ref (mn, sf_k, l).
-    """
-    atom_m = (32, 4)
-    atom_k = 4
-    mma_shape = (
-        l,
-        ceil_div(mn, atom_m[0] * atom_m[1]),
-        ceil_div(sf_k, atom_k),
-        atom_m[0],
-        atom_m[1],
-        atom_k,
-    )
-    mma_permute_order = (3, 4, 1, 5, 2, 0)
-    rand_int_tensor = torch.randint(0, 2, mma_shape, dtype=torch.int8)
-    cute_f8_torch_tensor_cpu = rand_int_tensor.to(dtype=torch.float8_e4m3fn)
-    cute_f8_torch_tensor_cpu = cute_f8_torch_tensor_cpu.permute(*mma_permute_order)
-    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-        make_ptr(
-            cutlass.Float8E4M3FN,
-            ref_f8_torch_tensor_cpu_permuted.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        ),
-        make_ptr(
-            cutlass.Float8E4M3FN,
-            cute_f8_torch_tensor_cpu.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        ),
-        mn,
-        sf_k,
-        l,
-        mma_shape,
-    )
-    return cute_f8_torch_tensor_cpu.cuda()
 
 def _run_cutedsl_nvfp4_gemm_ref(
     qx,
@@ -143,9 +91,9 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
     c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
 
     def _ref_2d_to_cute_sf(data_2d, mn):
-        ref = create_ref_scale_factor_tensor(l, mn, sf_k)
+        ref = nvfp4_qgemm.create_ref_scale_factor_tensor(l, mn, sf_k)
         ref.copy_(data_2d.unsqueeze(-1).to(ref.dtype).cpu())
-        return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+        return nvfp4_qgemm.create_cute_scale_factor_tensor(l, mn, sf_k, ref)
 
     sfa_tensor = _ref_2d_to_cute_sf(sx, M)
     sfb_tensor = _ref_2d_to_cute_sf(sw, N)
@@ -176,70 +124,6 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
     return c_tensor.squeeze(-1).float().to(out_dtype)
 
 
-def _run_cutedsl_nvfp4_gemm_optimized(
-    qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False, has_swizzle=True
-):
-    """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
-    import cutlass.cute as cute
-    import cutlass.torch as cutlass_torch
-    import cutlass
-    from cutlass.cute.runtime import make_ptr
-
-    from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
-        OptimizedBlockScaledDenseGemmKernel,
-        ab_dtype,
-        sf_dtype,
-        sf_vec_size,
-    )
-
-    alpha_value = float(alpha.item())
-    l = 1
-    sf_k = ceil_div(K, sf_vec_size)
-
-    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
-    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
-    if accumulate:
-        assert out is not None, "out must be provided when accumulate=True"
-        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype)
-    else:
-        c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
-
-    def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
-        ref = create_ref_scale_factor_tensor(l, mn, sf_k)
-        ref.copy_(data_2d.unsqueeze(-1).to(ref.dtype).cpu())
-        if has_swizzle:
-            return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
-        else:
-            return ref.flatten().to(device)
-
-    sfa_tensor = _ref_2d_to_cute_sf(sx, M, has_swizzle)
-    sfb_tensor = _ref_2d_to_cute_sf(sw, N, has_swizzle)
-
-    a_ptr = make_ptr(ab_dtype, a_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(ab_dtype, b_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    c_cutlass_dtype = cutlass.BFloat16 if c_tensor.dtype == torch.bfloat16 else cutlass.Float32
-    c_ptr = make_ptr(c_cutlass_dtype, c_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-
-    sfa_ptr = make_ptr(sf_dtype, sfa_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-    sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-
-    gemm = OptimizedBlockScaledDenseGemmKernel()
-    stream = cutlass_torch.default_stream()
-    compiled = cute.compile(
-        gemm,
-        a_ptr,
-        b_ptr,
-        sfa_ptr,
-        sfb_ptr,
-        c_ptr,
-        (M, N, K, l),
-        stream,
-        epilogue_op=lambda x: x * alpha_value,
-        accumulate=accumulate,
-    )
-    compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
-    return c_tensor.squeeze(-1).float().to(out_dtype)
-
 class TestCuTeDSLNvfp4Gemm:
 
     @pytest.mark.parametrize(
@@ -256,7 +140,7 @@ class TestCuTeDSLNvfp4Gemm:
         out_dtype = torch.bfloat16
 
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = (
-            initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
+            nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
         )
 
         factor = 6.0 * 6.0 * 448.0 * 448.0
@@ -324,7 +208,7 @@ class TestCuTeDSLNvfp4Gemm:
         out_init_dsl = out_init.clone() if accumulate else None
         
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = (
-            initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
+            nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
         )
 
         factor = 6.0 * 6.0 * 448.0 * 448.0
@@ -341,7 +225,7 @@ class TestCuTeDSLNvfp4Gemm:
         assert y_ref.dtype == out_dtype
 
         start = time.time()
-        D_cute = _run_cutedsl_nvfp4_gemm_optimized(
+        D_cute = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
             qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, out=out_init_dsl, accumulate=accumulate, has_swizzle=has_swizzle
         )
 
@@ -355,7 +239,10 @@ class TestCuTeDSLNvfp4Gemm:
         assert not torch.isinf(D_cute).any()
 
         y_ref_f32 = y_ref.to(torch.float32)
-        y_cute_f32 = D_cute.to(torch.float32)
+        if accumulate:
+            y_cute_f32 = out_init_dsl.to(torch.float32)
+        else:
+            y_cute_f32 = D_cute.to(torch.float32)
 
         abs_diff = (y_ref_f32 - y_cute_f32).abs()
         rel_diff = abs_diff / (y_ref_f32.abs() + 1e-8)

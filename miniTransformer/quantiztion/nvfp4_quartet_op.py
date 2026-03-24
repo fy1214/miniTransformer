@@ -4,6 +4,7 @@ import fp4_gemm
 from typing import Optional
 from scipy.linalg import hadamard
 
+from miniTransformer.ops.nvfp4_qgemm import cutedsl_nvfp4_gemm_optimized
 from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
@@ -234,17 +235,21 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
-        m, n = qx.shape[0], qw.shape[0]
+        m, n, k = qx.shape[0], qw.shape[0], qx.shape[1] * 2
 
         # GEMM for FP4
         #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
         #sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
-        y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
+        y = cutedsl_nvfp4_gemm_optimized(
+            qx, qw, sx, sw, m, n, k,
+            global_amax_qx * global_amax_qw, out_dtype,
+            qx.device, out, accumulate, True
+        )
+        # y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
 
         #TODO: fuse accumulate into GEMM
         if accumulate:
             assert out is not None, "Output tensor must be provided for accumulation."
-            out.add_(y)
             return out
         else:
             y = y.to(out_dtype)

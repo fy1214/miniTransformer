@@ -41,6 +41,8 @@ void block_scaled_matmul_nvfp4(
     const at::Tensor scale_B,
     float amax_A,
     float amax_B,
+    float alpha,
+    bool accumulate,
     const at::Tensor workspace_tensor,
     size_t workspace_size);
 

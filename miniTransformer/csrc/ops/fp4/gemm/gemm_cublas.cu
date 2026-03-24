@@ -292,6 +292,7 @@ void block_scaled_matmul_nvfp4_impl(
     void *workspace,
     size_t workspaceSize,
     float alpha,
+    bool accumulate,
     cudaStream_t stream) {
   const int M = A->size(0);
   const int K_bytes = A->size(1);  // K in bytes
@@ -349,11 +350,18 @@ void block_scaled_matmul_nvfp4_impl(
   // With transa=T: A layout is (k, m), lda=k
   // With transb=N: B layout is (k, n), ldb=k
   cudaDataType_t dataType = CUDA_R_4F_E2M1;
+  cudaDataType_t D_type = CUDA_R_16BF;
+  if (output->dtype() == at::ScalarType::Half) {
+    D_type = CUDA_R_16F;
+  } else if (output->dtype() == at::ScalarType::Float) {
+    D_type = CUDA_R_32F;
+  }
+
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, dataType, K, M, K));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, dataType, K, N, K));
-  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, M, N, M));
+  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, D_type, M, N, M));
 
-  float beta = 0.0f; // No bias
+  float beta = (accumulate) ? 1.0f : 0.0f;
 
   // Create preference
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
@@ -402,6 +410,8 @@ void block_scaled_matmul_nvfp4(
     const at::Tensor scale_B,
     float amax_A,
     float amax_B,
+    float alpha,
+    bool accumulate,
     const at::Tensor workspace_tensor,
     size_t workspace_size) {
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -424,6 +434,6 @@ void block_scaled_matmul_nvfp4(
 
   block_scaled_matmul_nvfp4_impl(
       &A, &B, &output, &scale_A, &scale_B,
-      workspace_tensor.data_ptr(), workspace_size, new_alpha, stream);
+      workspace_tensor.data_ptr(), workspace_size, new_alpha, accumulate, stream);
 }
 

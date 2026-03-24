@@ -108,7 +108,7 @@ def check_nvfp4_gemm_versus_reference(
         w_res.data,
         out,
         swizzle_scale(x_res.scale, M, K),
-        swizzle_scale(x_res.scale, N, K),
+        swizzle_scale(w_res.scale, N, K),
         x_res.tensor_scale.item(),
         w_res.tensor_scale.item(),
         workspace,

@@ -82,27 +82,12 @@ def check_nvfp4_gemm_versus_reference(
     else:
         out = torch.empty((M, N), dtype=out_dtype, device=device)
 
+    out_native = out.clone()
+
     # Native TE GEMM using tex.generic_gemm (cuBLAS GEMM)
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
-    '''
-    fp4_gemm.cublas_gemm(
-        x_res.data,
-        swizzle_scale(x_res.scale, M, K),
-        x_res.tensor_scale.item(),
-        True,
-        w_res.data,
-        swizzle_scale(x_res.scale, N, K),
-        w_res.tensor_scale.item(),
-        False,
-        1, 0,
-        out,
-        accumulate,
-        workspace,
-        workspace.shape[0],
-    )
-    '''
     fp4_gemm.block_scaled_matmul_nvfp4(
         x_res.data,
         w_res.data,
@@ -111,6 +96,8 @@ def check_nvfp4_gemm_versus_reference(
         swizzle_scale(w_res.scale, N, K),
         x_res.tensor_scale.item(),
         w_res.tensor_scale.item(),
+        1.0,
+        accumulate,
         workspace,
         workspace.shape[0]
     )
@@ -163,7 +150,7 @@ def check_nvfp4_gemm_versus_reference(
         transa,
         x_nvfp4_native,
         transb,
-        out.clone() if accumulate else None,
+        out_native if accumulate else None,
         out_quantizer,
         TE_DType[out_dtype],
         bias,
@@ -196,6 +183,17 @@ if __name__ == "__main__":
         K=1024,
         N=1024,
         accumulate=False,
+        x_columnwise=False,
+        w_columnwise=False,
+    )
+    check_nvfp4_gemm_versus_reference(
+        x_dtype=torch.bfloat16,
+        w_dtype=torch.bfloat16,
+        out_dtype=torch.float,
+        M=1024,
+        K=1024,
+        N=1024,
+        accumulate=True,
         x_columnwise=False,
         w_columnwise=False,
     )

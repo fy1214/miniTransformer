@@ -4,7 +4,7 @@ import fp4_gemm
 from typing import Optional
 from scipy.linalg import hadamard
 
-from miniTransformer.ops.nvfp4_qgemm import cutedsl_nvfp4_gemm_optimized
+from miniTransformer.ops.nvfp4_qgemm import cutedsl_nvfp4_gemm_optimized, get_cublas_workspace
 from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
@@ -230,6 +230,7 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
 
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
@@ -240,17 +241,37 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         # GEMM for FP4
         #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
         #sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
-        y = cutedsl_nvfp4_gemm_optimized(
-            qx, qw, sx, sw, m, n, k,
-            global_amax_qx * global_amax_qw, out_dtype,
-            qx.device, out, accumulate, True
-        )
-        # y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
+        if custom_gemm_backend == "cublas":
+            workspace = get_cublas_workspace(torch.cuda.current_device(), False, False)
 
-        #TODO: fuse accumulate into GEMM
-        if accumulate:
-            assert out is not None, "Output tensor must be provided for accumulation."
+            fp4_gemm.block_scaled_matmul_nvfp4(
+                qx,
+                qw,
+                out,
+                sx,
+                sw,
+                global_amax_qx.item(),
+                global_amax_qw.item(),
+                1.0,
+                accumulate,
+                workspace,
+                workspace.shape[0]
+            )
             return out
-        else:
-            y = y.to(out_dtype)
+        elif custom_gemm_backend == "cuteDSL":
+            y = cutedsl_nvfp4_gemm_optimized(
+                qx, qw, sx, sw, m, n, k,
+                global_amax_qx * global_amax_qw, out_dtype,
+                qx.device, out, accumulate, True
+            )
             return y
+        else:
+            y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
+            # TODO: fuse accumulate into GEMM
+            if accumulate:
+                assert out is not None, "Output tensor must be provided for accumulation."
+                out.add_(y)
+                return out
+            else:
+                y = y.to(out_dtype)
+                return y

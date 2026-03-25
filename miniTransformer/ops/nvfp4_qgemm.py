@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import pytest
 import cutlass
@@ -384,6 +386,7 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
 
     qparams = x_params
     return qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams
+
 
 
 def create_ref_scale_factor_tensor(l, mn, sf_k):

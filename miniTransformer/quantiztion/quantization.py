@@ -156,6 +156,7 @@ class QuantizeOpBase:
         global_amax_qw: torch.Tensor,
         qparams_x: Optional[QParams],
         qparams_w: Optional[QParams],
+        custom_gemm_backend: str = "cublas"
     ) -> torch.Tensor:
         """Quantized GEMM interface.
 
@@ -333,6 +334,7 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[QParams] = None,
         qparams_w: Optional[QParams] = None,
+        custom_gemm_backend: str = "cublas"
     ) -> torch.Tensor:
 
         assert (

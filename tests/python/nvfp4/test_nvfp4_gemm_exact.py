@@ -1,6 +1,3 @@
-from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
-from miniTransformer.quantiztion import quantization
-from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 import torch
 import fp4_gemm
 
@@ -9,6 +6,10 @@ import transformer_engine_torch as tex
 from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
 from transformer_engine.pytorch.custom_recipes import utils
 from transformer_engine.pytorch.constants import TE_DType
+from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
+from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
+
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -88,15 +89,17 @@ def check_nvfp4_gemm_versus_reference(
     # Allocate cuBLAS workspace
     workspace = torch.empty(4, dtype=torch.uint8, device=device)
 
+    alpha = (x_res.tensor_scale * w_res.tensor_scale) / (6.0 * 6.0 * 448.0 * 448.0)
+
     fp4_gemm.block_scaled_matmul_nvfp4(
-        x_res.data,
         w_res.data,
+        x_res.data,
         out,
-        swizzle_scale(x_res.scale, M, K),
         swizzle_scale(w_res.scale, N, K),
+        swizzle_scale(x_res.scale, M, K),
         x_res.tensor_scale.item(),
         w_res.tensor_scale.item(),
-        1.0,
+        alpha,
         accumulate,
         workspace,
         workspace.shape[0]

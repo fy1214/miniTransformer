@@ -389,39 +389,6 @@ def initialize_nvfp4_for_qgemm(M, N, K, device="cuda", seed=10):
 
 
 
-_NUM_MAX_UB_STREAMS = 3
-_NUM_COMPUTE_STREAM = 4
-
-
-def get_cublas_workspace_size_bytes() -> None:
-    """Return 32 MiB if using hopper, 4 MiB for all other architectures."""
-    if torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 9:
-        # 32 MiB for NVFP4 GEMM, plus additional 1024 B for alignment and misc scales
-        return 32 * 1024 * 1024 + 1024
-    return 4_194_304
-
-
-@functools.lru_cache(maxsize=None)
-def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Tensor:
-    """Returns workspace for cublas GEMM."""
-    assert not (ub and grouped_gemm), "UB is unsupported for grouped GEMM."
-
-    if ub:
-        return torch.empty(
-            get_cublas_workspace_size_bytes() * _NUM_MAX_UB_STREAMS,
-            dtype=torch.uint8,
-            device=device,
-        )
-    if grouped_gemm:
-        _multi_stream_cublas_workspace = []
-        for _ in range(_NUM_COMPUTE_STREAM):
-            _multi_stream_cublas_workspace.append(
-                torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device)
-            )
-        return _multi_stream_cublas_workspace
-
-    return torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device)
-
 def create_ref_scale_factor_tensor(l, mn, sf_k):
     """
     Create the reference scale factor tensor (mn, sf_k, l) in ref layout.

@@ -1,16 +1,12 @@
-from flashinfer import mm_fp4
 import torch
 import fp4_gemm
 from typing import Optional
 from scipy.linalg import hadamard
 
-from miniTransformer.ops.nvfp4_qgemm import cutedsl_nvfp4_gemm_optimized, get_cublas_workspace
+from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend
 from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
-
-from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
 
 
 def get_hadamard_matrix(group_size: int, dtype: torch.dtype, device: torch.device):
@@ -29,36 +25,6 @@ def rerotate_hadamard(hadamard_matrix):
             dtype=hadamard_matrix.dtype
         ) * 2 - 1
     return hadamard_matrix * signs[None, :] # NOTE: rerotate along last dim, inner dim for TN GEMM
-
-
-@torch.library.custom_op("clover::fp4_mm", mutates_args=())
-def _fp4_mm(x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    m, packed_k = x_fp4.shape
-    k = packed_k * 2
-    n = w_fp4.shape[0]
-    BLOCK = 16
-    out = torch.empty([m, n], device=x_fp4.device, dtype=torch.bfloat16)
-
-    mm_fp4(
-        x_fp4,
-        w_fp4.T,
-        x_mx.view(-1, k // BLOCK),
-        w_mx.view(-1, k // BLOCK).T,
-        alpha,
-        torch.bfloat16,
-        out,
-        block_size=BLOCK,
-        use_8x4_sf_layout=False,
-        backend="cutlass",
-        use_nvfp4=True,
-    )
-
-    return out
-
-
-@_fp4_mm.register_fake
-def _fp4_mm_fake(y: torch.Tensor, x_fp4: torch.Tensor, w_fp4: torch.Tensor, x_mx: torch.Tensor, w_mx: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    return torch.empty((x_fp4.shape[0], w_fp4.shape[0]), device=x_fp4.device, dtype=torch.bfloat16)
 
 
 @torch.compile(dynamic=False)
@@ -236,42 +202,13 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         # forward qx qw  [m, k] [n, k] TN   => out [m, n]
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
-        m, n, k = qx.shape[0], qw.shape[0], qx.shape[1] * 2
 
-        # GEMM for FP4
-        #sx_sl = swizzle_scale(sx, qx.shape[0], qx.shape[1] * 2)
-        #sw_sl = swizzle_scale(sw, qw.shape[0], qw.shape[1] * 2)
-        if custom_gemm_backend == "cublas":
-            workspace = get_cublas_workspace(torch.cuda.current_device(), False, False)
+        alpha = global_amax_qx * global_amax_qw
+        backend = dispatch_gemm_backend(custom_gemm_backend, "nvfp4")
+        out = backend.gemm(
+            qx, qw, out_dtype, sx, sw,
+            bias, out, grad, accumulate,
+            layout, alpha, None, None, True
+        )
 
-            fp4_gemm.block_scaled_matmul_nvfp4(
-                qx,
-                qw,
-                out,
-                sx,
-                sw,
-                global_amax_qx.item(),
-                global_amax_qw.item(),
-                1.0,
-                accumulate,
-                workspace,
-                workspace.shape[0]
-            )
-            return out
-        elif custom_gemm_backend == "cuteDSL":
-            y = cutedsl_nvfp4_gemm_optimized(
-                qx, qw, sx, sw, m, n, k,
-                global_amax_qx * global_amax_qw, out_dtype,
-                qx.device, out, accumulate, True
-            )
-            return y
-        else:
-            y = _fp4_mm(qx, qw, sx, sw, global_amax_qx * global_amax_qw)
-            # TODO: fuse accumulate into GEMM
-            if accumulate:
-                assert out is not None, "Output tensor must be provided for accumulation."
-                out.add_(y)
-                return out
-            else:
-                y = y.to(out_dtype)
-                return y
+        return out

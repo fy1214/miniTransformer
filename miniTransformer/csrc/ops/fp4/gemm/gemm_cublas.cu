@@ -300,8 +300,6 @@ void block_scaled_matmul_nvfp4_impl(
   const int N = B->size(0);
   
   TORCH_CHECK(B->size(1) == K_bytes, "B K dimension mismatch: expected ", K_bytes, " bytes, got ", B->size(1));
-  TORCH_CHECK(output->size(0) == M && output->size(1) == N, 
-              "Output shape mismatch: expected (", M, ", ", N, "), got (", output->size(0), ", ", output->size(1), ")");
   TORCH_CHECK(A->dtype() == at::ScalarType::Byte, "A must be uint8, got ", A->dtype());
   TORCH_CHECK(B->dtype() == at::ScalarType::Byte, "B must be uint8, got ", B->dtype());
 
@@ -335,16 +333,14 @@ void block_scaled_matmul_nvfp4_impl(
       sizeof(ab_scale_type)));
 
   // Set scale pointers
-  // NOTE: A and B matrices are swapped in cublasLtMatmul call to handle
-  // row-major vs column-major conversion, so scales are also swapped
   void *scale_A_ptr = const_cast<void*>(scale_A->data_ptr());
   void *scale_B_ptr = const_cast<void*>(scale_B->data_ptr());
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
-      matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_B_ptr,
-      sizeof(scale_B_ptr))); // Swapped
+      matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_A_ptr,
+      sizeof(scale_A_ptr)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
-      matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_A_ptr,
-      sizeof(scale_A_ptr))); // Swapped
+      matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_B_ptr,
+      sizeof(scale_B_ptr)));
   // Create matrix layouts
   // NVFP4: CUDA_R_4F_E2M1
   // With transa=T: A layout is (k, m), lda=k
@@ -381,9 +377,9 @@ void block_scaled_matmul_nvfp4_impl(
 
   // Execute matmul with the selected algorithm
   // B and A are swapped for row-major to col-major conversion
-  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, &alpha, 
+  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, &alpha,
+                                   const_cast<void*>(A->data_ptr()), Adesc,
                                    const_cast<void*>(B->data_ptr()), Bdesc,
-                                   const_cast<void*>(A->data_ptr()), Adesc, 
                                    &beta, 
                                    output->data_ptr(), Cdesc,
                                    output->data_ptr(), Cdesc, 
@@ -429,11 +425,11 @@ void block_scaled_matmul_nvfp4(
               "K dimensions must match. A has ", K, " elements, B has ", B.size(1) * 2, " elements");
 
   // Compute alpha
-  float new_alpha = 1.0f;
-  new_alpha = compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B);
+  // float new_alpha = 1.0f;
+  // new_alpha = compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B);
 
   block_scaled_matmul_nvfp4_impl(
       &A, &B, &output, &scale_A, &scale_B,
-      workspace_tensor.data_ptr(), workspace_size, new_alpha, accumulate, stream);
+      workspace_tensor.data_ptr(), workspace_size, alpha, accumulate, stream);
 }
 

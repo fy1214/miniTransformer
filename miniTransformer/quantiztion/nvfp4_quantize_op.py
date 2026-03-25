@@ -98,108 +98,27 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
-        custom_gemm: bool = False,
         custom_gemm_backend: str = "cutlass",  # cutlass, triton, cuteDSL
     ) -> torch.Tensor:
 
-        if custom_gemm:
-            assert custom_gemm_backend in [
-                "cutlass",
-                "triton",
-                "cuteDSL",
-            ], "Unsupported custom gemm backend."
-
-            device = qx.device
-            M, K_bytes_a = qx.shape
-            N, K_bytes_b = qw.shape
-            assert (
-                K_bytes_a == K_bytes_b
-            ), f"K dimension mismatch between qx ({K_bytes_a}) and qw ({K_bytes_b})"
-            K = 2 * K_bytes_a  # 2 FP4 values per byte
-
-            if custom_gemm_backend == "cutlass":
-
-                sx_4d = swizzle_scale(sx, M, K).to(torch.float8_e4m3fn)
-                sw_4d = swizzle_scale(sw, N, K).to(torch.float8_e4m3fn)
-
-                if (
-                    not (qparams_x and qparams_x.pow_2_scales)
-                    and K > 0
-                    and global_amax_qx is not None
-                    and global_amax_qw is not None
-                ):
-                    factor = 6.0 * 6.0 * 448.0 * 448.0
-                    partial_alpha = (global_amax_qx * global_amax_qw).to(torch.float32)
-                    alpha = partial_alpha.squeeze(-1) / factor
-                    alpha = alpha.item()
-                else:
-                    alpha = 1.0
-
-                out_tensor = torch.empty((M, N), device=device, dtype=out_dtype)
-                fp4_gemm.cutlass_gemm(
-                    out_tensor,  # output
-                    qx,  # A: packed NVFP4
-                    qw,  # B: packed NVFP4
-                    sx_4d,  # A scales
-                    sw_4d,  # B scales
-                    torch.tensor(alpha, device=device, dtype=torch.float32),
-                )
-                gemm_out = out_tensor
-
-            elif custom_gemm_backend == "triton":
-                gemm_out = qgemm_tl(
-                    qx=qx,
-                    qw=qw,
-                    m_params=m_params,
-                    out_dtype=out_dtype,
-                    sx=sx,
-                    sw=sw,
-                    bias=bias,
-                    out=out,
-                    accumulate=accumulate,
-                    pow_2_scales=qparams_x.pow_2_scales and qparams_w.pow_2_scales
-                    if (qparams_x is not None and qparams_w is not None)
-                    else False,
-                    global_amax_qx=global_amax_qx,
-                    global_amax_qw=global_amax_qw,
-                    qparams_x=qparams_x,
-                    qparams_w=qparams_w,
-                )
-            elif custom_gemm_backend == "cuteDSL":
-                sx_4d = swizzle_scale(sx, M, K).to(torch.float8_e4m3fn)
-                sw_4d = swizzle_scale(sw, N, K).to(torch.float8_e4m3fn)
-                alpha = 1.0
-                out_tensor = torch.empty((M, N), device=device, dtype=out_dtype)
-                fp4_gemm.cuteDSL_gemm(
-                    out_tensor,
-                    qx,
-                    qw,
-                    sx_4d,
-                    sw_4d,
-                    torch.tensor(alpha, device=device, dtype=torch.float32),
-                )
-                gemm_out = out_tensor
-            else:
-                raise ValueError(f"Unsupported custom gemm backend: {custom_gemm_backend}")
-        else:
-            gemm_out = general_gemm(
-                A=qw,
-                B=qx,
-                out_dtype=out_dtype,
-                quantization_params=None,
-                gelu=False,
-                gelu_in=None,
-                alpha=1.0,
-                beta=None,
-                accumulate=accumulate,
-                layout=layout,
-                out=out,
-                bias=bias,
-                use_split_accumulator=False,
-                grad=grad,
-                ub=None,
-                ub_type=None,
-                extra_output=None,
-                bulk_overlap=False
-            )[0]
+        gemm_out = general_gemm(
+            A=qw,
+            B=qx,
+            out_dtype=out_dtype,
+            quantization_params=None,
+            gelu=False,
+            gelu_in=None,
+            alpha=1.0,
+            beta=None,
+            accumulate=accumulate,
+            layout=layout,
+            out=out,
+            bias=bias,
+            use_split_accumulator=False,
+            grad=grad,
+            ub=None,
+            ub_type=None,
+            extra_output=None,
+            bulk_overlap=False
+        )[0]
         return gemm_out

@@ -571,6 +571,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             y = y.to(out_dtype)
             return y
 
+
     def qgemm(
         self,
         qx: torch.Tensor,
@@ -588,6 +589,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
         if out is not None:
             assert out_dtype == out.dtype, "Output dtype mismatch."

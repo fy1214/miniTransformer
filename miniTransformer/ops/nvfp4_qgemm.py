@@ -510,8 +510,8 @@ def cutedsl_nvfp4_gemm_optimized(
         c_ptr=c_ptr,
         problem_size=(M, N, K, l),
         stream=stream,
-        epilogue_op=lambda x: x * alpha_value,
-        epilogue_cache_tag=("scale_alpha", alpha_value),
+        epilogue_op=lambda x: x,
+        epilogue_cache_tag=("scale_alpha",),
         out_dtype=out_dtype,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
@@ -567,4 +567,6 @@ def cutedsl_nvfp4_gemm_optimized(
         print(f"CuTeDSL BW: {bandwidth:.3f} GB/s")
 
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
+    if alpha_value != 1.0:
+        c_tensor.mul_(alpha_value)
     return c_tensor.squeeze(-1).float().to(out_dtype)

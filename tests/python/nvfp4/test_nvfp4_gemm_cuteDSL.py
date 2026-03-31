@@ -12,7 +12,7 @@ from sympy import true
 from cutlass.cute.runtime import make_ptr
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.ops.cuteDSL.nvfp4.scale_factor_swizzle import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
-
+from miniTransformer.ops.cuteDSL.nvfp4 import gemm_cute_opts
 
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (
     NormalBlockScaledDenseGemmKernel,
@@ -343,6 +343,32 @@ class TestCuTeDSLNvfp4Gemm:
             atol=1e-6,
             msg=f"CuTeDSL NVFP4 GEMM mismatch for M={M}, K={K}, N={N}, seed={seed}, accumulate={accumulate}",
         )
+        
+    def test_cutedsl_cache_key_ignores_alpha(self):
+            M, K, N = 256, 256, 256
+            seed = 1234
+            device = "cuda"
+            out_dtype = torch.bfloat16
+            qx, qw, sx, sw, global_amax_qx, global_amax_qw, _ = (
+                nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
+            )
+            factor = 6.0 * 6.0 * 448.0 * 448.0
+            alpha_base = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
+            alpha_a = torch.tensor(alpha_base, device=device, dtype=torch.float32)
+            alpha_b = torch.tensor(alpha_base * 1.1, device=device, dtype=torch.float32)
+            gemm_cute_opts._CONFIG_KERNEL_CACHE.clear()
+            _ = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
+                qx, qw, sx, sw, M, N, K, alpha_a, out_dtype, device,
+                accumulate=False, has_swizzle=False, do_benchmark=False
+            )
+            cache_size_after_first = len(gemm_cute_opts._CONFIG_KERNEL_CACHE)
+            _ = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
+                qx, qw, sx, sw, M, N, K, alpha_b, out_dtype, device,
+                accumulate=False, has_swizzle=False, do_benchmark=False
+            )
+            cache_size_after_second = len(gemm_cute_opts._CONFIG_KERNEL_CACHE)
+            assert cache_size_after_first == 1
+            assert cache_size_after_second == 1
 
 
 if __name__ == "__main__":

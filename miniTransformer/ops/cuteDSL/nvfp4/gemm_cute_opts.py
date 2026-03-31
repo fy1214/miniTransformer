@@ -1,8 +1,14 @@
 import argparse
+import fcntl
+import hashlib
 import os
+import pickle
 import sys
+import tempfile
 from dataclasses import dataclass
+from getpass import getuser
 from itertools import product
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import cuda.bindings.driver as cuda
 
@@ -68,6 +74,76 @@ for _mma_tiler_mn, _cluster_shape_mnk, _use_2cta_instrs, _num_ab_stage in produc
 
 _CONFIG_KERNEL_CACHE: Dict[Tuple[Any, ...], Any] = {}
 _INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
+_PERSISTENT_CACHE_VERSION = "v1"
+_PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
+_PERSISTENT_CACHE_FUNC_NAME = "func"
+
+
+def _get_persistent_cache_dir() -> Path:
+    cache_dir = os.getenv("NVFP4_CUTE_CACHE_DIR")
+    if cache_dir:
+        path = Path(cache_dir)
+    else:
+        path = Path(tempfile.gettempdir()) / getuser() / "minitransformer_cute_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _persistent_cache_hash(config_key: Tuple[Any, ...]) -> str:
+    payload = (_PERSISTENT_CACHE_VERSION, config_key)
+    return hashlib.sha256(pickle.dumps(payload)).hexdigest()
+
+
+class _FileLock:
+    def __init__(self, lock_path: Path, exclusive: bool):
+        self.lock_path = lock_path
+        self.exclusive = exclusive
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = os.open(
+            str(self.lock_path),
+            os.O_CREAT | (os.O_WRONLY if self.exclusive else os.O_RDONLY),
+        )
+        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        fcntl.flock(self._fd, mode)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
+def _try_load_compiled_from_disk(config_key: Tuple[Any, ...]):
+    if not _PERSISTENT_CACHE_ENABLED:
+        return None
+    cache_dir = _get_persistent_cache_dir()
+    key_hash = _persistent_cache_hash(config_key)
+    obj_path = cache_dir / f"{key_hash}.o"
+    lock_path = cache_dir / f"{key_hash}.lock"
+    with _FileLock(lock_path, exclusive=False):
+        if not obj_path.exists():
+            return None
+        module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+        return getattr(module, _PERSISTENT_CACHE_FUNC_NAME)
+
+
+def _try_export_compiled_to_disk(config_key: Tuple[Any, ...], compiled) -> None:
+    if not _PERSISTENT_CACHE_ENABLED:
+        return
+    cache_dir = _get_persistent_cache_dir()
+    key_hash = _persistent_cache_hash(config_key)
+    obj_path = cache_dir / f"{key_hash}.o"
+    lock_path = cache_dir / f"{key_hash}.lock"
+    with _FileLock(lock_path, exclusive=True):
+        if obj_path.exists():
+            return
+        compiled.export_to_c(
+            object_file_path=str(obj_path),
+            function_name=_PERSISTENT_CACHE_FUNC_NAME,
+        )
 
 class OptimizedBlockScaledDenseGemmKernel:
     def __init__(
@@ -798,7 +874,8 @@ class OptimizedBlockScaledDenseGemmKernel:
                             tCtAcc,
                         )
                         # Enable accumulate on tCtAcc after first kblock
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if kblock_idx == 0:
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                     # Async arrive AB buffer empty
                     ab_full.release()
@@ -901,6 +978,11 @@ def _compile_kernel_with_config(
     if config_key in _CONFIG_KERNEL_CACHE:
         return _CONFIG_KERNEL_CACHE[config_key]
 
+    compiled = _try_load_compiled_from_disk(config_key)
+    if compiled is not None:
+        _CONFIG_KERNEL_CACHE[config_key] = compiled
+        return compiled
+
     gemm = OptimizedBlockScaledDenseGemmKernel(
         mma_tiler_mn=config.mma_tiler_mn,
         cluster_shape_mnk=config.cluster_shape_mnk,
@@ -920,6 +1002,7 @@ def _compile_kernel_with_config(
         epilogue_op=epilogue_op,
         accumulate=accumulate,
     )
+    _try_export_compiled_to_disk(config_key, compiled)
     _CONFIG_KERNEL_CACHE[config_key] = compiled
     return compiled
 

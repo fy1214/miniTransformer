@@ -18,10 +18,10 @@ from miniTransformer.ops.triton.gemm_tl import block_scaled_matmul
 from cutlass.cute.runtime import make_ptr
 
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
-    OptimizedBlockScaledDenseGemmKernel,
     ab_dtype,
     sf_dtype,
     sf_vec_size,
+    get_compiled_nvfp4_gemm,
 )
 
 def ceil_div(a, b):
@@ -501,19 +501,24 @@ def cutedsl_nvfp4_gemm_optimized(
     sfa_ptr = make_ptr(sf_dtype, sfa_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
-    gemm = OptimizedBlockScaledDenseGemmKernel()
     stream = cutlass_torch.default_stream()
-    compiled = cute.compile(
-        gemm,
-        a_ptr,
-        b_ptr,
-        sfa_ptr,
-        sfb_ptr,
-        c_ptr,
-        (M, N, K, l),
-        stream,
+    compiled, _, _ = get_compiled_nvfp4_gemm(
+        a_ptr=a_ptr,
+        b_ptr=b_ptr,
+        sfa_ptr=sfa_ptr,
+        sfb_ptr=sfb_ptr,
+        c_ptr=c_ptr,
+        problem_size=(M, N, K, l),
+        stream=stream,
         epilogue_op=lambda x: x * alpha_value,
+        epilogue_cache_tag=("scale_alpha", alpha_value),
+        out_dtype=out_dtype,
         accumulate=accumulate,
+        has_swizzle=has_swizzle,
+        do_autotune=False,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+        use_cold_l2=use_cold_l2,
     )
 
     if do_benchmark:

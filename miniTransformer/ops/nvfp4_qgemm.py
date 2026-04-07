@@ -23,6 +23,7 @@ from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
     sf_dtype,
     sf_vec_size,
     get_compiled_nvfp4_gemm,
+    Nvfp4KernelVariant,
 )
 
 def ceil_div(a, b):
@@ -469,10 +470,12 @@ def cutedsl_nvfp4_gemm_optimized(
     alpha,
     out_dtype,
     device,
+    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.CURRENT_OPTIMIZED,
     out=None,
     accumulate=False,
     has_swizzle=True,
     do_benchmark=False,
+    do_autotune=False,
     warmup_iterations=10,
     iterations=100,
     use_cold_l2=False,
@@ -521,9 +524,10 @@ def cutedsl_nvfp4_gemm_optimized(
         epilogue_op=lambda x: x,
         epilogue_cache_tag=("scale_alpha",),
         out_dtype=out_dtype,
+        kernel_variant=kernel_variant,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
-        do_autotune=False,
+        do_autotune=do_autotune,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
         use_cold_l2=use_cold_l2,

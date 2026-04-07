@@ -6,6 +6,7 @@ import pickle
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from getpass import getuser
 from itertools import product
 from pathlib import Path
@@ -77,6 +78,16 @@ _INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
 _PERSISTENT_CACHE_VERSION = "v1"
 _PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
 _PERSISTENT_CACHE_FUNC_NAME = "func"
+
+
+class Nvfp4KernelVariant(str, Enum):
+    CURRENT_OPTIMIZED = "current_optimized"
+    OPTS0 = "opts0"
+    OPTS2 = "opts2"
+    OPTS3 = "opts3"
+    OPTS3_1 = "opts3_1"
+    OPTS4 = "opts4"
+    OPTS5 = "opts5"
 
 
 def _get_persistent_cache_dir() -> Path:
@@ -954,6 +965,69 @@ def _get_device_arch_from_torch_device(device: torch.device) -> str:
     return f"sm_{major}{minor}"
 
 
+def _make_kernel_instance(config: GemmTuneConfig, kernel_variant: Nvfp4KernelVariant):
+    if kernel_variant == Nvfp4KernelVariant.CURRENT_OPTIMIZED:
+        return OptimizedBlockScaledDenseGemmKernel(
+            mma_tiler_mn=config.mma_tiler_mn,
+            cluster_shape_mnk=config.cluster_shape_mnk,
+            use_2cta_instrs=config.use_2cta_instrs,
+            num_ab_stage=config.num_ab_stage,
+            num_acc_stage=config.num_acc_stage,
+        )
+    if kernel_variant == Nvfp4KernelVariant.OPTS0:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (
+            NormalBlockScaledDenseGemmKernel,
+        )
+
+        return NormalBlockScaledDenseGemmKernel()
+
+    if kernel_variant == Nvfp4KernelVariant.OPTS2:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts2 import (
+            Sm100BlockScaledDenseGemmKernel,
+        )
+
+        return Sm100BlockScaledDenseGemmKernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS3:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3 import (
+            Sm100BlockScaledDenseGemm3Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm3Kernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS3_1:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3_1 import (
+            Sm100BlockScaledDenseGemm3_1Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm3_1Kernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS4:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts4 import (
+            Sm100BlockScaledDenseGemm4Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm4Kernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS5:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts5 import (
+            Sm100BlockScaledDenseGemm5Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm5Kernel()
+    raise ValueError(f"Unsupported kernel_variant: {kernel_variant}")
+
+
+def _extra_compile_args_for_variant(
+    kernel_variant: Nvfp4KernelVariant, config: GemmTuneConfig
+) -> List[Any]:
+    if kernel_variant != Nvfp4KernelVariant.OPTS3:
+        return []
+    try:
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            config.cluster_shape_mnk[0] * config.cluster_shape_mnk[1]
+        )
+    except RuntimeError:
+        max_active_clusters = 32
+    return [max_active_clusters]
+
+
 def _compile_kernel_with_config(
     config: GemmTuneConfig,
     *,
@@ -970,6 +1044,7 @@ def _compile_kernel_with_config(
     accumulate: bool,
     has_swizzle: bool,
     arch: str,
+    kernel_variant: Nvfp4KernelVariant,
 ):
     config_key = (
         arch,
@@ -978,6 +1053,7 @@ def _compile_kernel_with_config(
         out_dtype,
         bool(accumulate),
         bool(has_swizzle),
+        kernel_variant.value,
         epilogue_cache_tag,
         config.mma_tiler_mn,
         config.cluster_shape_mnk,
@@ -993,13 +1069,14 @@ def _compile_kernel_with_config(
         _CONFIG_KERNEL_CACHE[config_key] = compiled
         return compiled
 
-    gemm = OptimizedBlockScaledDenseGemmKernel(
-        mma_tiler_mn=config.mma_tiler_mn,
-        cluster_shape_mnk=config.cluster_shape_mnk,
-        use_2cta_instrs=config.use_2cta_instrs,
-        num_ab_stage=config.num_ab_stage,
-        num_acc_stage=config.num_acc_stage,
-    )
+    gemm = _make_kernel_instance(config, kernel_variant)
+    extra_compile_args = _extra_compile_args_for_variant(kernel_variant, config)
+    compile_kwargs = {"epilogue_op": epilogue_op}
+    if kernel_variant in (
+        Nvfp4KernelVariant.CURRENT_OPTIMIZED,
+        Nvfp4KernelVariant.OPTS0,
+    ):
+        compile_kwargs["accumulate"] = accumulate
     compiled = cute.compile(
         gemm,
         a_ptr,
@@ -1009,8 +1086,8 @@ def _compile_kernel_with_config(
         c_ptr,
         problem_size,
         stream,
-        epilogue_op=epilogue_op,
-        accumulate=accumulate,
+        *extra_compile_args,
+        **compile_kwargs,
     )
     _try_export_compiled_to_disk(config_key, compiled)
     _CONFIG_KERNEL_CACHE[config_key] = compiled
@@ -1029,6 +1106,7 @@ def get_compiled_nvfp4_gemm(
     epilogue_op,
     epilogue_cache_tag: Any = None,
     out_dtype=torch.float16,
+    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.CURRENT_OPTIMIZED,
     accumulate: bool = False,
     has_swizzle: bool = True,
     do_autotune: bool = False,
@@ -1055,6 +1133,7 @@ def get_compiled_nvfp4_gemm(
         m,
         n,
         k,
+        kernel_variant.value,
         out_dtype,
         bool(accumulate),
         bool(has_swizzle),
@@ -1103,6 +1182,7 @@ def get_compiled_nvfp4_gemm(
                 epilogue_op=epilogue_op,
                 epilogue_cache_tag=epilogue_cache_tag,
                 out_dtype=out_dtype,
+                kernel_variant=kernel_variant,
                 accumulate=accumulate,
                 has_swizzle=has_swizzle,
                 arch=arch,
@@ -1129,6 +1209,7 @@ def get_compiled_nvfp4_gemm(
                     epilogue_op=epilogue_op,
                     epilogue_cache_tag=epilogue_cache_tag,
                     out_dtype=out_dtype,
+                    kernel_variant=kernel_variant,
                     accumulate=accumulate,
                     has_swizzle=has_swizzle,
                     arch=arch,
@@ -1166,6 +1247,7 @@ def get_compiled_nvfp4_gemm(
         epilogue_op=epilogue_op,
         epilogue_cache_tag=epilogue_cache_tag,
         out_dtype=out_dtype,
+        kernel_variant=kernel_variant,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
         arch=arch,

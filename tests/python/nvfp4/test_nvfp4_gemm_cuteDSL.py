@@ -79,6 +79,9 @@ GEMM2_WORKLOAD_PARAMS = [
     pytest.param(256, 256, 256, id="gemm2_function_test0"),
     pytest.param(8192, 8192, 8192, id="gemm2_function_test1"),
 ]
+GEMM345_WORKLOAD_PARAMS = [
+    pytest.param(256, 256, 256, id="gemm345_function_test0"),
+]
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -222,11 +225,6 @@ def _run_cutedsl_nvfp4_gemm2(
     out_dtype,
     device,
 ):
-    cutlass_cutedsl_root = (
-        Path(__file__).resolve().parents[4] / "cutlass" / "examples" / "python" / "CuTeDSL"
-    )
-    if str(cutlass_cutedsl_root) not in sys.path:
-        sys.path.insert(0, str(cutlass_cutedsl_root))
 
     try:
         from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts2 import Sm100BlockScaledDenseGemmKernel
@@ -286,6 +284,130 @@ def _run_cutedsl_nvfp4_gemm2(
     )
     return c_tensor.squeeze(-1).float().to(out_dtype)
 
+
+def _run_cutedsl_nvfp4_gemm_optsx(
+    qx,
+    qw,
+    sx,
+    sw,
+    M,
+    N,
+    K,
+    alpha,
+    out_dtype,
+    device,
+    module_path,
+    kernel_cls_name,
+    needs_max_active_clusters=False,
+):
+
+    try:
+        mod = __import__(module_path, fromlist=[kernel_cls_name])
+        kernel_cls = getattr(mod, kernel_cls_name)
+    except ModuleNotFoundError as e:
+        pytest.skip(f"{module_path} import unavailable: {e}")
+
+    l = 1
+    sf_k = ceil_div(K, sf_vec_size)
+    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
+    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
+    c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
+
+    def _ref_2d_to_cute_sf(data_2d, mn):
+        ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn, device="cpu")
+        return nvfp4_qgemm.create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+
+    sfa_tensor = _ref_2d_to_cute_sf(sx, M)
+    sfb_tensor = _ref_2d_to_cute_sf(sw, N)
+
+    a_ptr = make_ptr(ab_dtype, a_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(ab_dtype, b_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(cutlass.Float16, c_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+    sfa_ptr = make_ptr(sf_dtype, sfa_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+    sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
+
+    gemm = kernel_cls()
+    stream = cutlass_torch.default_stream()
+    compile_args = [
+        gemm,
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        (M, N, K, l),
+        stream,
+    ]
+    run_args = [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream]
+    if needs_max_active_clusters:
+        max_active_clusters = 32
+        compile_args.append(max_active_clusters)
+    compile_args.append(lambda x: x)
+    compiled = cute.compile(*compile_args)
+    compiled(*run_args)
+    return c_tensor.squeeze(-1).float().to(out_dtype)
+
+
+def _run_cutedsl_nvfp4_gemm3_1(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+    return _run_cutedsl_nvfp4_gemm_optsx(
+        qx, qw, sx, sw, M, N, K, alpha, out_dtype, device,
+        "miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3_1",
+        "Sm100BlockScaledDenseGemm3_1Kernel",
+    )
+
+
+def _run_cutedsl_nvfp4_gemm3(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+    return _run_cutedsl_nvfp4_gemm_optsx(
+        qx, qw, sx, sw, M, N, K, alpha, out_dtype, device,
+        "miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3",
+        "Sm100BlockScaledDenseGemm3Kernel",
+        needs_max_active_clusters=True,
+    )
+
+
+def _run_cutedsl_nvfp4_gemm4(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+    return _run_cutedsl_nvfp4_gemm_optsx(
+        qx, qw, sx, sw, M, N, K, alpha, out_dtype, device,
+        "miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts4",
+        "Sm100BlockScaledDenseGemm4Kernel",
+    )
+
+
+def _run_cutedsl_nvfp4_gemm5(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+    return _run_cutedsl_nvfp4_gemm_optsx(
+        qx, qw, sx, sw, M, N, K, alpha, out_dtype, device,
+        "miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts5",
+        "Sm100BlockScaledDenseGemm5Kernel",
+    )
+
+
+def _run_and_validate_opts_variant(runner, M, K, N, out_dtype, device):
+    seed = torch.randint(2**31 - 1, ()).item()
+    qx, qw, sx, sw, _, _, _ = nvfp4_qgemm.initialize_nvfp4_for_qgemm(
+        M, N, K, device=device, seed=seed
+    )
+    sx = (sx.to(torch.float32) / 256.0).to(torch.float8_e4m3fn)
+    sw = (sw.to(torch.float32) / 256.0).to(torch.float8_e4m3fn)
+    alpha_t = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+    y_ref = _run_cutedsl_nvfp4_gemm_ref(
+        qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, has_swizzle=True
+    )
+    d_cute = runner(qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device)
+
+    assert d_cute.shape == (M, N)
+    assert d_cute.dtype == out_dtype
+    assert not torch.isnan(d_cute).any()
+    assert not torch.isinf(d_cute).any()
+
+    torch.testing.assert_close(
+        y_ref.to(torch.float32),
+        d_cute.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-6,
+        msg=f"CuTeDSL NVFP4 opts variant mismatch for M={M}, K={K}, N={N}, seed={seed}",
+    )
+
 class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize("M, K, N", GEMM2_WORKLOAD_PARAMS)
     @pytest.mark.parametrize("acc_dtype", [torch.float16])
@@ -328,6 +450,34 @@ class TestCuTeDSLNvfp4Gemm:
             rtol=1e-2,
             atol=1e-6,
             msg=f"CuTeDSL NVFP4 GEMM2 mismatch for M={M}, K={K}, N={N}, seed={seed}",
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm3_1_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm3_1, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm3_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm3, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm4_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm4, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm5_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm5, M, K, N, acc_dtype, "cuda"
         )
 
 

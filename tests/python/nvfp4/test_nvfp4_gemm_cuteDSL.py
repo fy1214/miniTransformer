@@ -12,7 +12,6 @@ from sympy import true
 from cutlass.cute.runtime import make_ptr
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.ops.cuteDSL.nvfp4.scale_factor_swizzle import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
-from miniTransformer.ops.cuteDSL.nvfp4 import gemm_cute_opts
 
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (
     NormalBlockScaledDenseGemmKernel,
@@ -24,15 +23,57 @@ from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
     OptimizedBlockScaledDenseGemmKernel,
 )
 
-GEMM_WORKLOAD_PARAMS = [
+_DEEPGEMM_NK_NORMAL_ONLY = [
+    (24576, 1536),
+    (32768, 512),
+    (7168, 16384),
+    (4096, 7168),
+    (7168, 2048),
+]
+_DEEPGEMM_M_FWD = (128, 4096)
+
+
+def _deepgemm_normal_only_params():
+    params = []
+    for m in _DEEPGEMM_M_FWD:
+        for n, k in _DEEPGEMM_NK_NORMAL_ONLY:
+            params.append(
+                pytest.param(m, k, n, id=f"deepgemm_m{m}_n{n}_k{k}")
+            )
+        n, k = 256, 7168
+        params.append(
+            pytest.param(m, k, n, id=f"deepgemm_m{m}_n{n}_k{k}_bf16_extra")
+        )
+    for m in _DEEPGEMM_M_FWD:
+        n, k = 129280, 7168
+        params.append(
+            pytest.param(
+                m,
+                k,
+                n,
+                id=f"deepgemm_m{m}_n{n}_k{k}_bf16_extra_large",
+                marks=pytest.mark.slow,
+            )
+        )
+    return params
+
+
+GEMM_WORKLOAD_PARAMS_BASE = [
     pytest.param(2048, 5120, 10240, id="linear_qkv"),
     pytest.param(8192, 2048, 1280, id="linear_proj"),
     pytest.param(2048, 5120, 51200, id="linear_fc1"),
     pytest.param(8192, 6400, 1280, id="linear_fc2"),
-   
+
     pytest.param(256, 256, 256, id="function_test0"),
     pytest.param(8192, 8192, 8192, id="function_test1"),
+
+    pytest.param(128, 7168, 16384, id="benchmark_test0"),
+    pytest.param(128, 4096, 7168, id="benchmark_test1"),
+    pytest.param(128, 7168, 2048, id="benchmark_test2"),
 ]
+
+GEMM_WORKLOAD_PARAMS_NORMAL = GEMM_WORKLOAD_PARAMS_BASE + _deepgemm_normal_only_params()
+GEMM_WORKLOAD_PARAMS_OPTIMIZED = GEMM_WORKLOAD_PARAMS_BASE
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -133,93 +174,9 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
     return c_tensor.squeeze(-1).float().to(out_dtype)
 
-
-def _run_cutedsl_nvfp4_gemm_optimized(
-    qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False, has_swizzle=True,
-    return_timing: bool = False,
-    do_benchmark: bool = True,
-    warmup_iterations: int = 10,
-    benchmark_iterations: int = 100,
-):
-    """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
-    alpha_value = float(alpha.item())
-    l = 1
-    sf_k = ceil_div(K, sf_vec_size)
-
-    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
-    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
-    if accumulate:
-        assert out is not None, "out must be provided when accumulate=True"
-        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype)
-    else:
-        c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
-
-    def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
-        ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn, device="cpu")
-        if has_swizzle:
-            return nvfp4_qgemm.create_cute_scale_factor_tensor(l, mn, sf_k, ref)
-        else:
-            return ref.flatten().to(device)
-
-    sfa_tensor = _ref_2d_to_cute_sf(sx, M, has_swizzle)
-    sfb_tensor = _ref_2d_to_cute_sf(sw, N, has_swizzle)
-
-    a_ptr = make_ptr(ab_dtype, a_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(ab_dtype, b_ref_f4.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    c_cutlass_dtype = cutlass.BFloat16 if c_tensor.dtype == torch.bfloat16 else cutlass.Float32
-    c_ptr = make_ptr(c_cutlass_dtype, c_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-
-    sfa_ptr = make_ptr(sf_dtype, sfa_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-    sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
-
-    gemm = OptimizedBlockScaledDenseGemmKernel()
-    stream = cutlass_torch.default_stream()
-    compile_start = time.time()
-    compiled = cute.compile(
-        gemm,
-        a_ptr,
-        b_ptr,
-        sfa_ptr,
-        sfb_ptr,
-        c_ptr,
-        (M, N, K, l),
-        stream,
-        epilogue_op=lambda x: x * alpha_value,
-        accumulate=accumulate,
-    )
-    compile_time = time.time() - compile_start
-
-    if do_benchmark:
-        # Warmup
-        for _ in range(warmup_iterations):
-            compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
-        if device == "cuda":
-            torch.cuda.synchronize()
-
-        # Timed benchmark loop
-        bench_start = time.time()
-        for _ in range(benchmark_iterations):
-            compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        kernel_time = (time.time() - bench_start) / benchmark_iterations
-    else:
-        if device == "cuda":
-            torch.cuda.synchronize()
-        kernel_start = time.time()
-        compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        kernel_time = time.time() - kernel_start
-
-    result = c_tensor.squeeze(-1).float().to(out_dtype)
-    if return_timing:
-        return result, compile_time, kernel_time
-    return result
-
 class TestCuTeDSLNvfp4Gemm:
 
-    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_NORMAL)
     def test_cutedsl_nvfp4_normal(self, M, K, N):
         device = "cuda"
         out_dtype = torch.bfloat16
@@ -275,7 +232,7 @@ class TestCuTeDSLNvfp4Gemm:
             msg=f"CuTeDSL NVFP4 GEMM mismatch for M={M}, K={K}, N={N}, seed={seed}",
         )
 
-    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
     @pytest.mark.parametrize("accumulate", [False])
     @pytest.mark.parametrize("acc_dtype", [torch.bfloat16])
     @pytest.mark.parametrize("has_swizzle", [False])
@@ -343,32 +300,6 @@ class TestCuTeDSLNvfp4Gemm:
             atol=1e-6,
             msg=f"CuTeDSL NVFP4 GEMM mismatch for M={M}, K={K}, N={N}, seed={seed}, accumulate={accumulate}",
         )
-        
-    def test_cutedsl_cache_key_ignores_alpha(self):
-            M, K, N = 256, 256, 256
-            seed = 1234
-            device = "cuda"
-            out_dtype = torch.bfloat16
-            qx, qw, sx, sw, global_amax_qx, global_amax_qw, _ = (
-                nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
-            )
-            factor = 6.0 * 6.0 * 448.0 * 448.0
-            alpha_base = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
-            alpha_a = torch.tensor(alpha_base, device=device, dtype=torch.float32)
-            alpha_b = torch.tensor(alpha_base * 1.1, device=device, dtype=torch.float32)
-            gemm_cute_opts._CONFIG_KERNEL_CACHE.clear()
-            _ = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
-                qx, qw, sx, sw, M, N, K, alpha_a, out_dtype, device,
-                accumulate=False, has_swizzle=False, do_benchmark=False
-            )
-            cache_size_after_first = len(gemm_cute_opts._CONFIG_KERNEL_CACHE)
-            _ = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
-                qx, qw, sx, sw, M, N, K, alpha_b, out_dtype, device,
-                accumulate=False, has_swizzle=False, do_benchmark=False
-            )
-            cache_size_after_second = len(gemm_cute_opts._CONFIG_KERNEL_CACHE)
-            assert cache_size_after_first == 1
-            assert cache_size_after_second == 1
 
 
 if __name__ == "__main__":

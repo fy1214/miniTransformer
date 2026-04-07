@@ -55,10 +55,10 @@ class GemmTuneConfig:
 
 DEFAULT_TUNE_SEARCH_SPACE: List[GemmTuneConfig] = []
 for _mma_tiler_mn, _cluster_shape_mnk, _use_2cta_instrs, _num_ab_stage in product(
-    [(128, 128), (128, 256), (256, 128), (256, 256)],
+    [(128, 128), (128, 256), (256, 128), (256, 256), (64, 64), (64, 128), (128, 64), (32, 32)],
     [(1, 1, 1), (2, 1, 1)],
     [False, True],
-    [4, 5],
+    [1, 2, 3, 4, 5],
 ):
     if _mma_tiler_mn[0] == 128 and _use_2cta_instrs:
         continue

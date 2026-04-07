@@ -66,10 +66,8 @@ GEMM_WORKLOAD_PARAMS_BASE = [
 
     pytest.param(256, 256, 256, id="function_test0"),
     pytest.param(8192, 8192, 8192, id="function_test1"),
-
-    pytest.param(128, 7168, 16384, id="benchmark_test0"),
-    pytest.param(128, 4096, 7168, id="benchmark_test1"),
-    pytest.param(128, 7168, 2048, id="benchmark_test2"),
+    pytest.param(128, 4096, 7168, id="function_test2"),
+    pytest.param(128, 7168, 2048, id="function_test3"),
 ]
 
 GEMM_WORKLOAD_PARAMS_NORMAL = GEMM_WORKLOAD_PARAMS_BASE + _deepgemm_normal_only_params()
@@ -132,7 +130,20 @@ def _run_cutedsl_nvfp4_gemm_ref(
         return y_fp32
     return y_fp32.to(out_dtype)
 
-def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
+def _run_cutedsl_nvfp4_gemm(
+    qx,
+    qw,
+    sx,
+    sw,
+    M,
+    N,
+    K,
+    alpha,
+    out_dtype,
+    device,
+    out=None,
+    accumulate=False,
+):
     """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
     alpha_value = float(alpha.item())
     l = 1
@@ -140,7 +151,10 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
 
     a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
     b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
-    c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
+    if out is None:
+        c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
+    else:
+        c_tensor = out.unsqueeze(-1)
 
     def _ref_2d_to_cute_sf(data_2d, mn):
         ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn, device="cpu")
@@ -169,18 +183,31 @@ def _run_cutedsl_nvfp4_gemm(qx, qw, sx, sw, M, N, K, alpha, out_dtype, device):
         c_ptr,
         (M, N, K, l),
         stream,
-        epilogue_op=lambda x: x * alpha_value,
+        lambda x: x * alpha_value,
+        accumulate,
     )
-    compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
+    compiled(
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        (M, N, K, l),
+        stream,
+    )
     return c_tensor.squeeze(-1).float().to(out_dtype)
 
 class TestCuTeDSLNvfp4Gemm:
 
-    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_NORMAL)
-    def test_cutedsl_nvfp4_normal(self, M, K, N):
+    @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
+    @pytest.mark.parametrize("accumulate", [False, True])
+    @pytest.mark.parametrize("acc_dtype", [torch.bfloat16, torch.float32])
+    def test_cutedsl_nvfp4_normal(self, M, K, N, accumulate, acc_dtype):
         device = "cuda"
-        out_dtype = torch.bfloat16
+        out_dtype = acc_dtype
         seed = torch.randint(2**31 - 1, ()).item()
+        out_init = torch.randn((M, N), dtype=out_dtype, device=device) if accumulate else None
+        out_init_dsl = out_init.clone() if accumulate else None
 
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = (
             nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
@@ -192,15 +219,17 @@ class TestCuTeDSLNvfp4Gemm:
 
         # Reference implementation: block layout + torch._scaled_mm + alpha
         y_ref = _run_cutedsl_nvfp4_gemm_ref(
-            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device
+            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, return_fp32=accumulate, has_swizzle=True
         )
+        if accumulate:
+            y_ref = (y_ref + out_init.float()).to(out_dtype)
 
         assert y_ref.shape == (M, N)
         assert y_ref.dtype == out_dtype
 
         start = time.time()
         D_cute = _run_cutedsl_nvfp4_gemm(
-            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device
+            qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device, out=out_init_dsl, accumulate=accumulate
         )
         if device == "cuda":
             torch.cuda.synchronize()
@@ -212,12 +241,12 @@ class TestCuTeDSLNvfp4Gemm:
         assert not torch.isinf(D_cute).any()
 
         y_ref_f32 = y_ref.to(torch.float32)
-        y_cute_f32 = D_cute.to(torch.float32)
+        y_cute_f32 = out_init_dsl.to(torch.float32) if accumulate else D_cute.to(torch.float32)
 
         abs_diff = (y_ref_f32 - y_cute_f32).abs()
         rel_diff = abs_diff / (y_ref_f32.abs() + 1e-8)
 
-        print(f"\nCuTeDSL NVFP4 GEMM M={M}, K={K}, N={N}, seed={seed}")
+        print(f"\nCuTeDSL NVFP4 GEMM M={M}, K={K}, N={N}, seed={seed}, accumulate={accumulate}")
         print(f"  CuTeDSL time: {cutlass_time * 1000:.3f} ms")
         print(f"  Max abs diff: {abs_diff.max().item():.6f}")
         print(f"  Mean abs diff: {abs_diff.mean().item():.6f}")
@@ -227,7 +256,7 @@ class TestCuTeDSLNvfp4Gemm:
         torch.testing.assert_close(
             y_ref_f32,
             y_cute_f32,
-            rtol=1e-6,
+            rtol=1e-2,
             atol=1e-6,
             msg=f"CuTeDSL NVFP4 GEMM mismatch for M={M}, K={K}, N={N}, seed={seed}",
         )

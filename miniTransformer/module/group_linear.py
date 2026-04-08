@@ -87,7 +87,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
         if update_fp8_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
-            qresult_w_list = quantize_op.grouped_quantize(
+            qresult_w_list = quantize_op.group_quantize(
                 w,
                 qlinear_params.w_params,
                 m_splits=m_splits,

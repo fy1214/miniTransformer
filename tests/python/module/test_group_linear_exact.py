@@ -24,6 +24,7 @@ Usage:
     python test_group_linear_exact.py --tests 1 4 --qparam 1
 """
 import argparse
+import traceback
 import torch
 from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
 from miniTransformer.module.group_linear import GroupedLinear
@@ -461,8 +462,15 @@ def run_all_tests(qparam_id: int = 5, test_ids: list = None):
             passed_tests.append((test_id, test_desc))
             
         except Exception as e:
-            print(f"\n✗ Test {test_id} failed with error:")
-            print(f"  {type(e).__name__}: {e}")
+            print(f"\n{'='*60}")
+            print(f"✗ Test {test_id} FAILED: {test_desc}")
+            print(f"{'='*60}")
+            print(f"Error Type: {type(e).__name__}")
+            print(f"Error Message: {e}")
+            print(f"\nFull Traceback:")
+            print("-" * 60)
+            traceback.print_exc()
+            print("-" * 60)
             failed_tests.append((test_id, test_desc, e))
     
     # Print summary
@@ -488,6 +496,7 @@ def run_all_tests(qparam_id: int = 5, test_ids: list = None):
     print("="*60 + "\n")
     
     if failed_tests:
+        print(f"✗ {len(failed_tests)} test(s) failed. See traceback above for details.\n")
         raise RuntimeError(f"{len(failed_tests)} test(s) failed")
     else:
         print("✓ All tests passed successfully!\n")
@@ -509,5 +518,12 @@ if __name__ == "__main__":
     try:
         run_all_tests(qparam_id=args.qparam, test_ids=args.tests)
     except Exception as e:
-        print(f"\n✗ Test suite failed: {e}\n")
+        print(f"\n{'='*60}")
+        print(f"✗ Test Suite Failed")
+        print(f"{'='*60}")
+        print(f"Error: {e}")
+        print(f"\nFull Traceback:")
+        print("-" * 60)
+        traceback.print_exc()
+        print("-" * 60 + "\n")
         exit(1)

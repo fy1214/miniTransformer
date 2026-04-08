@@ -1,15 +1,8 @@
 import argparse
-import fcntl
-import hashlib
 import os
-import pickle
 import sys
-import tempfile
 from dataclasses import dataclass
-from enum import Enum
-from getpass import getuser
 from itertools import product
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import cuda.bindings.driver as cuda
 
@@ -24,6 +17,12 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack, make_ptr
+from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import (
+    Nvfp4KernelVariant,
+    FileLock,
+    get_persistent_cache_dir,
+    persistent_cache_hash,
+)
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -77,66 +76,18 @@ _CONFIG_KERNEL_CACHE: Dict[Tuple[Any, ...], Any] = {}
 _INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
 
 
-_PERSISTENT_CACHE_VERSION = "v1"
 _PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
 _PERSISTENT_CACHE_FUNC_NAME = "func"
-
-
-class Nvfp4KernelVariant(str, Enum):
-    CURRENT_OPTIMIZED = "current_optimized"
-    OPTS0 = "opts0"
-    OPTS2 = "opts2"
-    OPTS3 = "opts3"
-    OPTS3_1 = "opts3_1"
-    OPTS4 = "opts4"
-    OPTS5 = "opts5"
-
-
-def _get_persistent_cache_dir() -> Path:
-    cache_dir = os.getenv("NVFP4_CUTE_CACHE_DIR")
-    if cache_dir:
-        path = Path(cache_dir)
-    else:
-        path = Path(tempfile.gettempdir()) / getuser() / "minitransformer_cute_cache"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _persistent_cache_hash(config_key: Tuple[Any, ...]) -> str:
-    payload = (_PERSISTENT_CACHE_VERSION, config_key)
-    return hashlib.sha256(pickle.dumps(payload)).hexdigest()
-
-
-class _FileLock:
-    def __init__(self, lock_path: Path, exclusive: bool):
-        self.lock_path = lock_path
-        self.exclusive = exclusive
-        self._fd = None
-
-    def __enter__(self):
-        self._fd = os.open(
-            str(self.lock_path),
-            os.O_CREAT | (os.O_WRONLY if self.exclusive else os.O_RDONLY),
-        )
-        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-        fcntl.flock(self._fd, mode)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            os.close(self._fd)
-            self._fd = None
 
 
 def _try_load_compiled_from_disk(config_key: Tuple[Any, ...]):
     if not _PERSISTENT_CACHE_ENABLED:
         return None
-    cache_dir = _get_persistent_cache_dir()
-    key_hash = _persistent_cache_hash(config_key)
+    cache_dir = get_persistent_cache_dir()
+    key_hash = persistent_cache_hash(config_key)
     obj_path = cache_dir / f"{key_hash}.o"
     lock_path = cache_dir / f"{key_hash}.lock"
-    with _FileLock(lock_path, exclusive=False):
+    with FileLock(lock_path, exclusive=False):
         if not obj_path.exists():
             return None
         module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
@@ -146,11 +97,11 @@ def _try_load_compiled_from_disk(config_key: Tuple[Any, ...]):
 def _try_export_compiled_to_disk(config_key: Tuple[Any, ...], compiled) -> None:
     if not _PERSISTENT_CACHE_ENABLED:
         return
-    cache_dir = _get_persistent_cache_dir()
-    key_hash = _persistent_cache_hash(config_key)
+    cache_dir = get_persistent_cache_dir()
+    key_hash = persistent_cache_hash(config_key)
     obj_path = cache_dir / f"{key_hash}.o"
     lock_path = cache_dir / f"{key_hash}.lock"
-    with _FileLock(lock_path, exclusive=True):
+    with FileLock(lock_path, exclusive=True):
         if obj_path.exists():
             return
         try:
@@ -968,7 +919,7 @@ def _get_device_arch_from_torch_device(device: torch.device) -> str:
 
 
 def _make_kernel_instance(config: GemmTuneConfig, kernel_variant: Nvfp4KernelVariant):
-    if kernel_variant == Nvfp4KernelVariant.CURRENT_OPTIMIZED:
+    if kernel_variant == Nvfp4KernelVariant.OPTS1:
         return OptimizedBlockScaledDenseGemmKernel(
             mma_tiler_mn=config.mma_tiler_mn,
             cluster_shape_mnk=config.cluster_shape_mnk,
@@ -977,7 +928,7 @@ def _make_kernel_instance(config: GemmTuneConfig, kernel_variant: Nvfp4KernelVar
             num_acc_stage=config.num_acc_stage,
         )
     if kernel_variant == Nvfp4KernelVariant.OPTS0:
-        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts0 import (
             NormalBlockScaledDenseGemmKernel,
         )
 
@@ -995,20 +946,20 @@ def _make_kernel_instance(config: GemmTuneConfig, kernel_variant: Nvfp4KernelVar
         )
 
         return Sm100BlockScaledDenseGemm3Kernel()
-    if kernel_variant == Nvfp4KernelVariant.OPTS3_1:
-        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3_1 import (
+    if kernel_variant == Nvfp4KernelVariant.OPTS4:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts4 import (
             Sm100BlockScaledDenseGemm3_1Kernel,
         )
 
         return Sm100BlockScaledDenseGemm3_1Kernel()
-    if kernel_variant == Nvfp4KernelVariant.OPTS4:
-        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts4 import (
+    if kernel_variant == Nvfp4KernelVariant.OPTS5:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts5 import (
             Sm100BlockScaledDenseGemm4Kernel,
         )
 
         return Sm100BlockScaledDenseGemm4Kernel()
-    if kernel_variant == Nvfp4KernelVariant.OPTS5:
-        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts5 import (
+    if kernel_variant == Nvfp4KernelVariant.OPTS6:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts6 import (
             Sm100BlockScaledDenseGemm5Kernel,
         )
 
@@ -1075,8 +1026,13 @@ def _compile_kernel_with_config(
     extra_compile_args = _extra_compile_args_for_variant(kernel_variant, config)
     compile_kwargs = {"epilogue_op": epilogue_op}
     if kernel_variant in (
-        Nvfp4KernelVariant.CURRENT_OPTIMIZED,
         Nvfp4KernelVariant.OPTS0,
+        Nvfp4KernelVariant.OPTS1,
+        Nvfp4KernelVariant.OPTS2,
+        Nvfp4KernelVariant.OPTS3,
+        Nvfp4KernelVariant.OPTS4,
+        Nvfp4KernelVariant.OPTS5,
+        Nvfp4KernelVariant.OPTS6,
     ):
         compile_kwargs["accumulate"] = accumulate
     compiled = cute.compile(
@@ -1108,7 +1064,7 @@ def get_compiled_nvfp4_gemm(
     epilogue_op,
     epilogue_cache_tag: Any = None,
     out_dtype=torch.float16,
-    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.CURRENT_OPTIMIZED,
+    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.OPTS1,
     accumulate: bool = False,
     has_swizzle: bool = True,
     do_autotune: bool = False,

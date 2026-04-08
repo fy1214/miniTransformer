@@ -26,11 +26,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# NVFP4 CuTeDSL 4 (cluster variants): documents the same preferred/fallback cluster
-# shapes as fp16_gemm_4.py for API parity. The device implementation currently matches
-# nvfp4_gemm_3_1 (single cluster (2,1,1), CLC scheduling, SIMT C): CuTeDSL does not yet
-# support the fp16-style mega-kernel path for NVFP4 without breaking tma_partition static
-# shape requirements under runtime cluster dispatch.
+# NVFP4 variant of fp16_gemm_3_1.py: CLC dynamic persistent tile scheduling plus
+# warp-specialized TMA / MMA / epilogue. C is written with SIMT stores like
+# nvfp4_gemm_2.py (no TMA S2G for batched NVFP4 C layouts).
 
 import argparse
 import os
@@ -56,7 +54,6 @@ if __name__ == "__main__":
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
 
-from blackwell.tutorial_gemm.utils import create_parser, run
 
 mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
@@ -65,9 +62,6 @@ sf_dtype = cutlass.Float8E4M3FN
 c_dtype = cutlass.Float16
 sf_vec_size = 16
 cluster_shape_mnk = (2, 1, 1)
-# Shapes aligned with fp16_gemm_4 (reference for future NVFP4 mega-kernel work).
-preferred_cluster_shape_mnk = (2, 4, 1)
-fallback_cluster_shape_mnk = (2, 1, 1)
 
 ab_stages = 5
 acc_stages = 1
@@ -78,12 +72,15 @@ use_clc_dynamic_scheduler = True
 scheduler_type = utils.ClcDynamicPersistentTileScheduler
 
 """
-NVFP4 block-scaled GEMM: same device kernel as nvfp4_gemm_3_1 today, with
-preferred/fallback cluster constants noted for comparison to fp16_gemm_4.py.
+NVFP4 block-scaled GEMM with CLC dynamic persistent scheduling (fp16_gemm_3_1
+structure) and NVFP4 warp-specialized mainloop (nvfp4_gemm_2). Epilogue is SIMT.
+
+Constraints match nvfp4_gemm_2. The CLC scheduler grid includes the batch
+dimension (one tile per batch index, same as the static nvfp4_gemm_2 launch).
 """
 
 
-class Sm100BlockScaledDenseGemm4Kernel:
+class Sm100BlockScaledDenseGemm3_1Kernel:
     def __init__(self):
         self.num_tmem_alloc_cols = 512
 
@@ -98,6 +95,7 @@ class Sm100BlockScaledDenseGemm4Kernel:
         problem_size: tuple,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         m, n, k, l = problem_size
 
@@ -317,6 +315,7 @@ class Sm100BlockScaledDenseGemm4Kernel:
             cluster_layout_sfb_vmnk,
             tile_sched_params,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid_shape,
             block=[224, 1, 1],
@@ -347,6 +346,7 @@ class Sm100BlockScaledDenseGemm4Kernel:
         cta_layout_sfb_vmnk: cute.Layout,
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -794,10 +794,11 @@ class Sm100BlockScaledDenseGemm4Kernel:
             tTR_rAcc = cute.make_rmem_tensor(
                 tTR_gC_base[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
             )
+            c_elem_dtype = mC_mnl.element_type
             tTR_rC = cute.make_rmem_tensor(
-                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_dtype
+                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_elem_dtype
             )
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_elem_dtype)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -811,7 +812,11 @@ class Sm100BlockScaledDenseGemm4Kernel:
                 tTR_gC = tTR_gC_base[
                     (None, None, None, None, *mma_tile_coord_mnl)
                 ]
-                acc_vec = epilogue_op(tTR_rAcc.load().to(c_dtype))
+                acc_vec = epilogue_op(tTR_rAcc.load().to(c_elem_dtype))
+                if cutlass.const_expr(accumulate):
+                    cute.copy(simt_atom, tTR_gC, tTR_rC)
+                    c_global = tTR_rC.load()
+                    acc_vec = acc_vec + c_global
                 tTR_rC.store(acc_vec)
                 cute.copy(simt_atom, tTR_rC, tTR_gC)
                 acc_full.release()
@@ -825,49 +830,3 @@ class Sm100BlockScaledDenseGemm4Kernel:
 
         return
 
-
-def run_nvfp4_gemm(
-    mnkl: Tuple[int, int, int, int],
-    tolerance: float,
-    warmup_iterations: int = 10,
-    iterations: int = 100,
-    use_cold_l2: bool = True,
-    do_benchmark: bool = False,
-):
-    run(
-        gemm_class=Sm100BlockScaledDenseGemm4Kernel,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mnk=cluster_shape_mnk,
-        mnkl=mnkl,
-        tolerance=tolerance,
-        do_benchmark=do_benchmark,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        use_cold_l2=use_cold_l2,
-    )
-
-
-if __name__ == "__main__":
-    parser = create_parser()
-    args = parser.parse_args()
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-
-    m, n, k, _ = args.mnkl
-    if m % mma_tiler_mn[0] != 0:
-        parser.error("M must be multiples of mma_tiler_mn[0] (got m={})".format(m))
-    if n % mma_tiler_mn[1] != 0:
-        parser.error("N must be multiples of mma_tiler_mn[1] (got n={})".format(n))
-    if k % 256 != 0:
-        parser.error("k must be a multiple of 256 (got k={})".format(k))
-
-    run_nvfp4_gemm(
-        args.mnkl,
-        args.tolerance,
-        do_benchmark=args.do_benchmark,
-    )
-    print("PASS")

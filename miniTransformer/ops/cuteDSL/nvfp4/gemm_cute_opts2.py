@@ -56,7 +56,7 @@ mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
-c_dtype = cutlass.Float16
+io_dtype = cutlass.Float32
 sf_vec_size = 16
 cluster_shape_mnk = (2, 1, 1)
 
@@ -93,6 +93,7 @@ class Sm100BlockScaledDenseGemmKernel:
 
         self.num_acc_stage = 1
         self.num_ab_stage = 5
+        self.epi_stages = 2
 
     @cute.jit
     def __call__(
@@ -105,6 +106,7 @@ class Sm100BlockScaledDenseGemmKernel:
         problem_size: tuple,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
         m, n, k, l = problem_size
@@ -288,6 +290,28 @@ class Sm100BlockScaledDenseGemmKernel:
             internal_type=cutlass.Int16,
         )
 
+        c_smem_layout_kind = utils.LayoutEnum.from_tensor(c_tensor)
+        epi_tile = utils.compute_epilogue_tile_shape(
+            self.cta_tile_shape_mnk,
+            self.use_2cta_instrs,
+            c_smem_layout_kind,
+            io_dtype,
+        )
+        epi_smem_layout_staged = cutlass.utils.blackwell_helpers.make_smem_layout_epi(
+            io_dtype,
+            c_smem_layout_kind,
+            epi_tile,
+            self.epi_stages,
+        )
+        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
+
+        c_tma_atom, c_tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            c_tensor,
+            epi_smem_layout,
+            epi_tile,
+        )
+
         a_copy_size = cute.size_in_bytes(ab_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(ab_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(sf_dtype, sfa_smem_layout)
@@ -315,14 +339,19 @@ class Sm100BlockScaledDenseGemmKernel:
             tma_tensor_sfa,
             tma_atom_sfb,
             tma_tensor_sfb,
-            c_tensor,
+            c_tma_atom,
+            c_tma_tensor,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
+            c_smem_layout_kind,
+            epi_smem_layout_staged,
+            epi_tile,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid,
             block=[192, 1, 1],
@@ -344,6 +373,7 @@ class Sm100BlockScaledDenseGemmKernel:
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
+        tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -351,7 +381,11 @@ class Sm100BlockScaledDenseGemmKernel:
         sfb_smem_layout_staged: cute.Layout,
         cta_layout_vmnk: cute.Layout,
         cta_layout_sfb_vmnk: cute.Layout,
+        c_smem_layout_kind: cutlass.Constexpr,
+        epi_smem_layout_staged: cute.ComposedLayout,
+        epi_tile: cute.Tile,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -407,6 +441,12 @@ class Sm100BlockScaledDenseGemmKernel:
             element_type=sf_dtype,
             layout=sfb_smem_layout_staged,
             byte_alignment=128,
+        )
+        sC = smem.allocate_tensor(
+            element_type=io_dtype,
+            layout=epi_smem_layout_staged.outer,
+            byte_alignment=128,
+            swizzle=epi_smem_layout_staged.inner,
         )
 
         a_full_mcast_mask = None
@@ -502,6 +542,23 @@ class Sm100BlockScaledDenseGemmKernel:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
 
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+
+        tCsC, tCgC_tma = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_c,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sC, 0, 2),
+            cute.group_modes(tCgC_epi, 0, 2),
+        )
+
+        # Barrier 1 for epilogue synchronization
+        epilogue_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=32 * len(epilogue_warp_ids),
+        )
+
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)),
@@ -595,9 +652,10 @@ class Sm100BlockScaledDenseGemmKernel:
 
         elif warp_idx == mma_warp_id:
             tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
+            
             if is_leader_cta:
-                acc_tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
-                tCtAcc = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
                 sfa_tmem_ptr = cute.recast_ptr(
                     acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc),
@@ -655,8 +713,8 @@ class Sm100BlockScaledDenseGemmKernel:
                     tiled_copy_s2t_sfb, tCsSFB_compact_s2t_
                 )
                 tCtSFB_compact_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
-
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
                 acc_empty = acc_producer.acquire_and_advance()
                 for k_tile_idx in range(num_k_tiles):
                     handle = ab_consumer.wait_and_advance()
@@ -695,37 +753,106 @@ class Sm100BlockScaledDenseGemmKernel:
                 acc_empty.commit()
 
         elif warp_idx < mma_warp_id:
+            # Alloc TMEM
             num_tmem_cols = self.num_tmem_alloc_cols
             tmem.allocate(num_tmem_cols)
+
+            # Retrieve TMEM pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            acc_full = acc_consumer.wait_and_advance()
+            # Initialize TMA store pipeline for epilogue
+            epilogue_pipeline_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                size=128,
+            )
+            epilogue_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=self.epi_stages,
+                producer_group=epilogue_pipeline_producer_group,
+            )
 
-            # Same epilogue pattern as nvfp4_gemm_1.py (SIMT store to global C).
-            op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x128, tcgen05.Pack.NONE)
-            copy_atom_t2r = cute.make_copy_atom(op, cutlass.Float32)
-            tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc)
+            # Wait for the accumulator buffer to be full
+            acc_consumer.wait_and_advance()
+
+            copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.Ld16x256bOp(tcgen05.Repetition.x8)
+                if self.mma_tiler[0] == 64
+                else tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
+                cutlass.Float32,
+            )  
+
+            # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+            tCtAcc_epi = cute.flat_divide(
+                tCtAcc[((None, None), 0, 0)],
+                epi_tile,
+            )
+
+            # Tiled copy for TMEM -> RMEM load
+            tiled_copy_t2r = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tCtAcc_epi[(None, None, 0, 0)]
+            )
+
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-            tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc)
-            tTR_gC = thr_copy_t2r.partition_D(tCgC)
+            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+            tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc_epi)
+            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+            tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
+            # (T2R, T2R_M, T2R_N)
             tTR_rAcc = cute.make_rmem_tensor(
-                tTR_gC[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
+                tTR_gC[(None, None, None, 0, 0)].shape, cutlass.Float32
             )
-            tTR_rC = cute.make_rmem_tensor(
-                tTR_gC[None, None, None, None, 0, 0, 0].shape, c_dtype
+            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+            # Copy atom and tiled copy for RMEM -> SMEM load
+            copy_atom_r2s = cutlass.utils.blackwell_helpers.get_smem_store_op(
+                c_smem_layout_kind, cutlass.Float32, cutlass.Float32, tiled_copy_t2r
             )
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
-            tTR_gC = tTR_gC[(None, None, None, None, *mma_tile_coord_mnl)]
+            tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
+            # (R2S, R2S_M, R2S_N, PIPE_D)
+            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+            tRS_sC = thr_copy_r2s.partition_D(sC)
 
-            cute.copy(tiled_copy_t2r, tTR_tAcc, tTR_rAcc)
-            acc_vec = epilogue_op(tTR_rAcc.load().to(c_dtype))
-            tTR_rC.store(acc_vec)
-            cute.copy(simt_atom, tTR_rC, tTR_gC)
+            tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
+            tRS_rC = cute.make_rmem_tensor(tRS_rAcc.shape, io_dtype)
 
-            acc_full.release()
+            tCgC_grouped = cute.group_modes(tCgC_tma, 1, cute.rank(tCgC_tma))
+
+            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+
+            # Epilogue tiling loop
+            for subtile_idx in cutlass.range(subtile_cnt):
+                # TMEM -> RMEM
+                tTR_tAcc_slice = tTR_tAcc[(None, None, None, subtile_idx)]
+                cute.copy(tiled_copy_t2r, tTR_tAcc_slice, tTR_rAcc)
+
+                # RMEM -> SMEM
+                c_buffer = subtile_idx % self.epi_stages
+                tRS_sC_slice = tRS_sC[(None, None, None, c_buffer)]
+
+                # type conversion
+                tRS_rC.store(tRS_rAcc.load().to(io_dtype))
+
+                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC_slice)
+
+                # Memory fence and barrier to ensure shared memory stores are visible to TMA stores
+                cute.arch.fence_view_async_shared()
+                epilogue_sync_barrier.arrive_and_wait()
+                # SMEM -> GMEM
+                if warp_idx == epilogue_warp_ids[0]:
+                    cute.copy(
+                        tma_atom_c,
+                        tCsC[(None, c_buffer)],
+                        tCgC_grouped[(None, subtile_idx)],
+                    )
+
+                    epilogue_pipeline.producer_commit()
+                    epilogue_pipeline.producer_acquire()
+                epilogue_sync_barrier.arrive_and_wait()
+
+            epilogue_pipeline.producer_tail()
+
+            # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
-        return

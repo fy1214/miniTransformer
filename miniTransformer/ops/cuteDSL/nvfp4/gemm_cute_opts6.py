@@ -26,9 +26,12 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# NVFP4 variant of fp16_gemm_3_1.py: CLC dynamic persistent tile scheduling plus
-# warp-specialized TMA / MMA / epilogue. C is written with SIMT stores like
-# nvfp4_gemm_2.py (no TMA S2G for batched NVFP4 C layouts).
+# NVFP4 variant of fp16_gemm_5.py: adds TMA L2 prefetch (cute.prefetch) on top of
+# nvfp4_gemm_3_1 (CLC scheduling + warp-specialized TMA/MMA/epilogue, SIMT C).
+#
+# Unlike fp16_gemm_5.py, this example keeps mma_tiler_mn=(256,256) and
+# cluster_shape_mnk=(2,1,1) to match nvfp4_gemm_3_1 validation surface instead of
+# fp16_gemm_5's (256,64) tiler and (2,2,1) cluster.
 
 import argparse
 import os
@@ -54,8 +57,6 @@ if __name__ == "__main__":
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
 
-from blackwell.tutorial_gemm.utils import create_parser, run
-
 mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
@@ -73,15 +74,15 @@ use_clc_dynamic_scheduler = True
 scheduler_type = utils.ClcDynamicPersistentTileScheduler
 
 """
-NVFP4 block-scaled GEMM with CLC dynamic persistent scheduling (fp16_gemm_3_1
-structure) and NVFP4 warp-specialized mainloop (nvfp4_gemm_2). Epilogue is SIMT.
+NVFP4 block-scaled GEMM like nvfp4_gemm_3_1 with TMA prefetch on A, B, SFA, and SFB
+(initial prefetch of the first ab_stages k-tiles plus rolling prefetch).
 
-Constraints match nvfp4_gemm_2. The CLC scheduler grid includes the batch
-dimension (one tile per batch index, same as the static nvfp4_gemm_2 launch).
+Constraints match nvfp4_gemm_2 / nvfp4_gemm_3_1. Tiler and cluster intentionally
+differ from fp16_gemm_5 (see file header).
 """
 
 
-class Sm100BlockScaledDenseGemm3_1Kernel:
+class Sm100BlockScaledDenseGemm5Kernel:
     def __init__(self):
         self.num_tmem_alloc_cols = 512
 
@@ -96,6 +97,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
         problem_size: tuple,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         m, n, k, l = problem_size
 
@@ -315,6 +317,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             cluster_layout_sfb_vmnk,
             tile_sched_params,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid_shape,
             block=[224, 1, 1],
@@ -345,6 +348,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
         cta_layout_sfb_vmnk: cute.Layout,
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -615,6 +619,14 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                 tBgSFB_slice = tBgSFB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
+                prefetch_dist = ab_stages
+                for pf_k_tile in cutlass.range(
+                    cutlass.min(prefetch_dist, num_k_tiles), unroll=1
+                ):
+                    cute.prefetch(tma_atom_a, tAgA_slice[(None, pf_k_tile)])
+                    cute.prefetch(tma_atom_b, tBgB_slice[(None, pf_k_tile)])
+                    cute.prefetch(tma_atom_sfa, tAgSFA_slice[(None, pf_k_tile)])
+                    cute.prefetch(tma_atom_sfb, tBgSFB_slice[(None, pf_k_tile)])
                 for k_tile_idx in range(num_k_tiles):
                     handle = ab_producer.acquire_and_advance()
                     cute.copy(
@@ -645,6 +657,20 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=sfb_full_mcast_mask,
                     )
+                    if k_tile_idx + prefetch_dist < num_k_tiles:
+                        future_k_tile = k_tile_idx + prefetch_dist
+                        cute.prefetch(
+                            tma_atom_a, tAgA_slice[(None, future_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_b, tBgB_slice[(None, future_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_sfa, tAgSFA_slice[(None, future_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_sfb, tBgSFB_slice[(None, future_k_tile)]
+                        )
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
@@ -792,10 +818,11 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             tTR_rAcc = cute.make_rmem_tensor(
                 tTR_gC_base[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
             )
+            c_elem_dtype = mC_mnl.element_type
             tTR_rC = cute.make_rmem_tensor(
-                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_dtype
+                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_elem_dtype
             )
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_elem_dtype)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -809,7 +836,11 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                 tTR_gC = tTR_gC_base[
                     (None, None, None, None, *mma_tile_coord_mnl)
                 ]
-                acc_vec = epilogue_op(tTR_rAcc.load().to(c_dtype))
+                acc_vec = epilogue_op(tTR_rAcc.load().to(c_elem_dtype))
+                if cutlass.const_expr(accumulate):
+                    cute.copy(simt_atom, tTR_gC, tTR_rC)
+                    c_global = tTR_rC.load()
+                    acc_vec = acc_vec + c_global
                 tTR_rC.store(acc_vec)
                 cute.copy(simt_atom, tTR_rC, tTR_gC)
                 acc_full.release()
@@ -822,50 +853,3 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             tmem.free(tmem_ptr)
 
         return
-
-
-def run_nvfp4_gemm(
-    mnkl: Tuple[int, int, int, int],
-    tolerance: float,
-    warmup_iterations: int = 10,
-    iterations: int = 100,
-    use_cold_l2: bool = True,
-    do_benchmark: bool = False,
-):
-    run(
-        gemm_class=Sm100BlockScaledDenseGemm3_1Kernel,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mnk=cluster_shape_mnk,
-        mnkl=mnkl,
-        tolerance=tolerance,
-        do_benchmark=do_benchmark,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        use_cold_l2=use_cold_l2,
-    )
-
-
-if __name__ == "__main__":
-    parser = create_parser()
-    args = parser.parse_args()
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-
-    m, n, k, _ = args.mnkl
-    if m % mma_tiler_mn[0] != 0:
-        parser.error("M must be multiples of mma_tiler_mn[0] (got m={})".format(m))
-    if n % mma_tiler_mn[1] != 0:
-        parser.error("N must be multiples of mma_tiler_mn[1] (got n={})".format(n))
-    if k % 256 != 0:
-        parser.error("k must be a multiple of 256 (got k={})".format(k))
-
-    run_nvfp4_gemm(
-        args.mnkl,
-        args.tolerance,
-        do_benchmark=args.do_benchmark,
-    )
-    print("PASS")

@@ -54,8 +54,6 @@ if __name__ == "__main__":
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
 
-from blackwell.tutorial_gemm.utils import create_parser, run
-
 mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
@@ -94,6 +92,7 @@ class Sm100BlockScaledDenseGemm3Kernel:
         stream: cuda.CUstream,
         max_active_clusters: cutlass.Constexpr,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         m, n, k, l = problem_size
 
@@ -313,6 +312,7 @@ class Sm100BlockScaledDenseGemm3Kernel:
             cluster_layout_sfb_vmnk,
             tile_sched_params,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid_shape,
             block=[192, 1, 1],
@@ -343,6 +343,7 @@ class Sm100BlockScaledDenseGemm3Kernel:
         cta_layout_sfb_vmnk: cute.Layout,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -724,10 +725,11 @@ class Sm100BlockScaledDenseGemm3Kernel:
             tTR_rAcc = cute.make_rmem_tensor(
                 tTR_gC_base[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
             )
+            c_elem_dtype = mC_mnl.element_type
             tTR_rC = cute.make_rmem_tensor(
-                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_dtype
+                tTR_gC_base[None, None, None, None, 0, 0, 0].shape, c_elem_dtype
             )
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_elem_dtype)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -741,7 +743,11 @@ class Sm100BlockScaledDenseGemm3Kernel:
                 tTR_gC = tTR_gC_base[
                     (None, None, None, None, *mma_tile_coord_mnl)
                 ]
-                acc_vec = epilogue_op(tTR_rAcc.load().to(c_dtype))
+                acc_vec = epilogue_op(tTR_rAcc.load().to(c_elem_dtype))
+                if cutlass.const_expr(accumulate):
+                    cute.copy(simt_atom, tTR_gC, tTR_rC)
+                    c_global = tTR_rC.load()
+                    acc_vec = acc_vec + c_global
                 tTR_rC.store(acc_vec)
                 cute.copy(simt_atom, tTR_rC, tTR_gC)
                 acc_full.release()
@@ -753,57 +759,3 @@ class Sm100BlockScaledDenseGemm3Kernel:
 
         return
 
-
-def run_nvfp4_gemm(
-    mnkl: Tuple[int, int, int, int],
-    tolerance: float,
-    warmup_iterations: int = 10,
-    iterations: int = 100,
-    use_cold_l2: bool = True,
-    do_benchmark: bool = False,
-):
-    try:
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-            cluster_shape_mnk[0] * cluster_shape_mnk[1]
-        )
-    except RuntimeError:
-        # Primary context may not exist yet (e.g. standalone script before torch alloc).
-        max_active_clusters = 32
-    run(
-        gemm_class=Sm100BlockScaledDenseGemm3Kernel,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mnk=cluster_shape_mnk,
-        mnkl=mnkl,
-        tolerance=tolerance,
-        do_benchmark=do_benchmark,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        use_cold_l2=use_cold_l2,
-        max_active_clusters=max_active_clusters,
-    )
-
-
-if __name__ == "__main__":
-    parser = create_parser()
-    args = parser.parse_args()
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-
-    m, n, k, _ = args.mnkl
-    if m % mma_tiler_mn[0] != 0:
-        parser.error("M must be multiples of mma_tiler_mn[0] (got m={})".format(m))
-    if n % mma_tiler_mn[1] != 0:
-        parser.error("N must be multiples of mma_tiler_mn[1] (got n={})".format(n))
-    if k % 256 != 0:
-        parser.error("k must be a multiple of 256 (got k={})".format(k))
-
-    run_nvfp4_gemm(
-        args.mnkl,
-        args.tolerance,
-        do_benchmark=args.do_benchmark,
-    )
-    print("PASS")

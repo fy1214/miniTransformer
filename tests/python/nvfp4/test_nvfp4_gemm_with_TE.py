@@ -354,5 +354,5 @@ def test_nvfp4_gemm_exact(
 # ==================== Main Entry Point ====================
 
 if __name__ == "__main__":
-    # Allow running with: python test_nvfp4_gemm_exact.py
+    # Allow running with: python test_nvfp4_gemm_with_TE.py
     pytest.main([__file__, "-v", "-s"])

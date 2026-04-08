@@ -232,7 +232,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             dy,
             ctx.qlinear_params.g_params,
             m_splits=ctx.m_splits,
-            return_transpose=False,
+            return_transpose=True,  # Need transpose for wgrad computation
         )
         qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = unpack_quantize_results(qresult_dy_list)
 

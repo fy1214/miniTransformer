@@ -112,21 +112,24 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                param_type=ParamType.X
             ),
             w_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(16, 16),
                 with_2d_quantization=True,
-                with_rht=False
+                with_rht=False,
+                param_type=ParamType.WEIGHT
             ),
             g_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True
+                with_rht=True,
+                param_type=ParamType.Y
             ),
             quantize_op=Nvfp4TiledQuantizeRefOp(),
             allgather_quantize=False,
@@ -144,6 +147,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 with_2d_quantization=False,
                 with_rht=True,
                 stochastic_rounding=False,
+                param_type=ParamType.X
             ),
             w_params=QParams(
                 output_dtype=torch.uint8,
@@ -151,7 +155,8 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 quant_tile_shape=(16, 16),
                 with_2d_quantization=True,
                 with_rht=False,
-                stochastic_rounding = False
+                stochastic_rounding = False,
+                param_type=ParamType.WEIGHT
             ),
             g_params=QParams(
                 output_dtype=torch.uint8,
@@ -160,6 +165,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 with_2d_quantization=False,
                 with_rht=True,
                 stochastic_rounding=True,
+                param_type=ParamType.Y
             ),
             quantize_op=Nvfp4TiledQuantizeOp(),
             allgather_quantize=False,

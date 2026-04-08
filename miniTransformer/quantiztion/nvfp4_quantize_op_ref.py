@@ -665,9 +665,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         empty_tensor = _empty_tensor()
         empty_tensors = [empty_tensor] * num_gemms
 
-        bias = bias if use_bias else empty_tensors
-
-        out = []
+        bias = bias if use_bias else None
+        res = []
 
         for i in range(num_gemms):
             out = self.qgemm(
@@ -677,7 +676,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 out_dtype,
                 sA[i],
                 sB[i],
-                bias[i],
+                None if bias is None else bias[i],
                 None if out is None else out[i],
                 grad,
                 accumulate,
@@ -688,6 +687,6 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 qparams_w,
                 "cublas"
             )
-            out.append(out)
+            res.append(out)
 
-        return torch.cat(out, dim=0)
+        return torch.cat(res, dim=0)

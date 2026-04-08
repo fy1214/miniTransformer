@@ -113,9 +113,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         assert qw is not None, "FP8 weight cache should not be None"
 
         # Forward pass GEMM 1D2D = x @ w [groups*m, in], [groups, out, in] -> [groups*m, out]
-        logger.debug(f"[Hybrid] Before FWD Grouped QGEMM"
-                   f", qx shape [m, k]: {list(qx.shape)}, sx shape: {list(sx.shape)}"
-                   f", qw shape [g, n, k]: {list(qw.shape)}, sw shape: {list(sw.shape)}")
+        logger.debug(
+            f"[Hybrid] Before FWD Grouped QGEMM\n"
+            f"  qx shapes [m, k]  : {[list(t.shape) for t in qx]}\n"
+            f"  sx shapes          : {[list(t.shape) for t in sx]}\n"
+            f"  qw shapes [g, n, k]: {[list(t.shape) for t in qw]}\n"
+            f"  sw shapes          : {[list(t.shape) for t in sw]}"
+        )
         y = quantize_op.grouped_gemm(
             A=qx,
             B=qw,
@@ -147,6 +151,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             ctx.quantize_op = quantize_op
             ctx.is_first_microbatch = is_first_microbatch
             ctx.activation_dtype = activation_dtype
+            ctx.device = x.device  # Save device for backward
             ctx.weights_requires_grad = weights[0].requires_grad
             if fuse_wgrad_accumulation and ctx.weights_requires_grad:
                 # This check is needed to ensure that main_grad is not created
@@ -164,20 +169,14 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
 
-            qw_t, sw_t = (
-                weight_qresult_cache.data_t,
-                weight_qresult_cache.scale_t,
-            )
+            qw_t = weight_qresult_cache.data_t
+            sw_t = weight_qresult_cache.scale_t
+            tw_t = weight_qresult_cache.global_amax_col
 
-            ctx.save_for_backward(
-                qx_t,
-                sx_t,
-                tx_t,
-                qw_t,
-                sw_t,
-                tw_t,
-                weights,
-            )
+            # Flatten lists for save_for_backward (it only accepts individual tensors)
+            # Save order: qx_t (N), sx_t (N), tx_t (N), qw_t (N), sw_t (N), tw_t (N), weights (N)
+            tensor_lists = [qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights]
+            ctx.save_for_backward(*[t for lst in tensor_lists for t in lst])
 
         # JQ: sequence parallel not ready yet
         # if parallel_mode == "row" and sequence_parallel:
@@ -200,7 +199,17 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        (qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights) = ctx.saved_tensors
+        
+        # Reconstruct lists from saved_tensors
+        # Order: qx_t (N), sx_t (N), tx_t (N), qw_t (N), sw_t (N), tw_t (N), weights (N)
+        saved = ctx.saved_tensors
+        total_saved = len(saved)
+        assert total_saved == N * 7, f"Expected {N * 7} saved tensors, got {total_saved}"
+        
+        # Split saved tensors into 7 groups of N tensors each
+        qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights = [
+            list(saved[i*N:(i+1)*N]) for i in range(7)
+        ]
 
         assert qw_t is not None and sw_t is not None
 
@@ -222,22 +231,23 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         qresult_dy_list = ctx.quantize_op.group_quantize(
             dy,
             ctx.qlinear_params.g_params,
+            m_splits=ctx.m_splits,
             return_transpose=False,
         )
         qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = unpack_quantize_results(qresult_dy_list)
 
         # GEMM dgrad 1Dx2D = dy @ w_t ([groups*m, h_out], [m, h_in, h_out])
         logger.debug(f"[Hybrid] Before DGRAD Grouped QGEMM"
-                   f", qdy shape [m, k]: {list(qdy.shape)}, sdy shape: {list(sdy.shape)}"
-                   f", qw_t shape [g, n, k]: {list(qw_t.shape)}, sw_t shape: {list(sw_t.shape)}")
+                   f", qdy shapes: {[list(t.shape) for t in qdy]}"
+                   f", qw_t shapes: {[list(t.shape) for t in qw_t]}")
 
-        dgrad = ctx.quantize_op.grouped_qgemm(
-            qdy,
-            qw_t,
-            sdy,
-            sw_t,
-            tdy,
-            tw_t,
+        dgrad = ctx.quantize_op.grouped_gemm(
+            A=qdy,
+            B=qw_t,
+            sA=sdy,
+            sB=sw_t,
+            global_amax_A=tdy,
+            global_amax_B=tw_t,
             out=None,
             out_dtype=out_dtype_dgrad,
             layout="NN",
@@ -270,13 +280,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         # GEMM wgrad
         # TODO: single wgrad or list?
-        wgrad = ctx.quantize_op.grouped_qgemm(
-            qdy_t,
-            qx_t,
-            sdy_t,
-            sx_t,
-            tdy_t,
-            tx_t,
+        wgrad = ctx.quantize_op.grouped_gemm(
+            A=qdy_t,
+            B=qx_t,
+            sA=sdy_t,
+            sB=sx_t,
+            global_amax_A=tdy_t,
+            global_amax_B=tx_t,
             out=wgrad_list,
             out_dtype=ctx.activation_dtype,
             layout="NT",

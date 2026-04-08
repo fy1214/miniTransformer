@@ -513,7 +513,13 @@ def cutedsl_nvfp4_gemm_optimized(
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
     stream = cutlass_torch.default_stream()
-    compiled, _, _ = get_compiled_nvfp4_gemm(
+    benchmark_scope_tensors = None
+    if do_autotune:
+        benchmark_scope_tensors = [a_ref_f4, b_ref_f4, sfa_tensor, sfb_tensor, c_tensor]
+    c_tensor_initial_for_autotune = None
+    if do_autotune and accumulate:
+        c_tensor_initial_for_autotune = c_tensor.clone()
+    compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
         a_ptr=a_ptr,
         b_ptr=b_ptr,
         sfa_ptr=sfa_ptr,
@@ -528,12 +534,19 @@ def cutedsl_nvfp4_gemm_optimized(
         accumulate=accumulate,
         has_swizzle=has_swizzle,
         do_autotune=do_autotune,
+        benchmark_scope_tensors=benchmark_scope_tensors,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
         use_cold_l2=use_cold_l2,
     )
+    if do_autotune and accumulate and c_tensor_initial_for_autotune is not None:
+        c_tensor.copy_(c_tensor_initial_for_autotune)
 
     if do_benchmark:
+        c_tensor_initial_for_bench = None
+        if accumulate:
+            c_tensor_initial_for_bench = c_tensor.clone()
+
         def generate_tensors():
             args = cute.testing.JitArguments(
                 a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream
@@ -563,6 +576,8 @@ def cutedsl_nvfp4_gemm_optimized(
             warmup_iterations=warmup_iterations,
             iterations=iterations,
         )
+        if accumulate and c_tensor_initial_for_bench is not None:
+            c_tensor.copy_(c_tensor_initial_for_bench)
 
         print(f"CuTeDSL benchmark time: {elapsed_us:.3f} us")
         peta_flops = (4 * M * N * K * l) / (elapsed_us * 1e-6) / 1e9 / 1000000

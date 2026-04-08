@@ -75,6 +75,8 @@ for _mma_tiler_mn, _cluster_shape_mnk, _use_2cta_instrs, _num_ab_stage in produc
 
 _CONFIG_KERNEL_CACHE: Dict[Tuple[Any, ...], Any] = {}
 _INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
+
+
 _PERSISTENT_CACHE_VERSION = "v1"
 _PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
 _PERSISTENT_CACHE_FUNC_NAME = "func"
@@ -1192,6 +1194,7 @@ def get_compiled_nvfp4_gemm(
         best_time = float("inf")
         best_config = None
         best_compiled = None
+        fail_count = 0
 
         for config in tune_search_space:
             if config.use_2cta_instrs and config.mma_tiler_mn[0] == 128:
@@ -1216,6 +1219,7 @@ def get_compiled_nvfp4_gemm(
                 )
                 elapsed_us = _benchmark(compiled, benchmark_scope_tensors)
             except Exception:
+                fail_count += 1
                 continue
             if elapsed_us < best_time:
                 best_time = elapsed_us

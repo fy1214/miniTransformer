@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# This is the third tutorial NVFP4 GEMM. It builds on nvfp4_gemm_1.py by adding
+# This is the third NVFP4 CuTeDSL GEMM. It builds on nvfp4_gemm_1.py by adding
 # warp specialization (TMA / MMA / epilogue warps) like fp16_gemm_2.py. The C
 # epilogue uses SIMT stores (CopyUniversalOp) as in nvfp4_gemm_1: batched NVFP4
 # C layouts do not match the TMA S2G tiling expected by make_tiled_tma_atom.
@@ -63,7 +63,7 @@ sf_vec_size = 16
 cluster_shape_mnk = (2, 1, 1)
 
 """
-The third tutorial NVFP4 block-scaled batched GEMM extends nvfp4_gemm_1.py with:
+The third NVFP4 CuTeDSL block-scaled batched GEMM extends nvfp4_gemm_1.py with:
 
 1. Warp specialization: one warp issues TMA loads (A/B/SFA/SFB), one warp runs
    MMA (S2T + tcgen05 NVFP4 MMA on the leader CTA), and four warps run the

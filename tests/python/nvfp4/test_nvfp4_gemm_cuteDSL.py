@@ -15,6 +15,22 @@ from cutlass.cute.runtime import make_ptr
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import ab_dtype, sf_dtype, sf_vec_size
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import Nvfp4KernelVariant
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def to_blocked(input_matrix):
+    rows, cols = input_matrix.shape
+
+    n_row_blocks = ceil_div(rows, 128)
+    n_col_blocks = ceil_div(cols, 4)
+
+    padded = input_matrix
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+
+    return rearranged.flatten()
+
 _DEEPGEMM_NK_NORMAL_ONLY = [
     (24576, 1536),
     (32768, 512),
@@ -23,7 +39,6 @@ _DEEPGEMM_NK_NORMAL_ONLY = [
     (7168, 2048),
 ]
 _DEEPGEMM_M_FWD = (128, 4096)
-
 
 def _deepgemm_normal_only_params():
     params = []
@@ -58,8 +73,6 @@ GEMM_WORKLOAD_PARAMS_BASE = [
 
     pytest.param(256, 256, 256, id="function_test0"),
     pytest.param(8192, 8192, 8192, id="function_test1"),
-    pytest.param(128, 4096, 7168, id="function_test2"),
-    pytest.param(128, 7168, 2048, id="function_test3"),
 ]
 
 GEMM_WORKLOAD_PARAMS_NORMAL = GEMM_WORKLOAD_PARAMS_BASE + _deepgemm_normal_only_params()
@@ -71,23 +84,6 @@ GEMM2_WORKLOAD_PARAMS = [
 GEMM345_WORKLOAD_PARAMS = [
     pytest.param(256, 256, 256, id="gemm345_function_test0"),
 ]
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def to_blocked(input_matrix):
-    rows, cols = input_matrix.shape
-
-    n_row_blocks = ceil_div(rows, 128)
-    n_col_blocks = ceil_div(cols, 4)
-
-    padded = input_matrix
-    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-
-    return rearranged.flatten()
-
 
 def _run_cutedsl_nvfp4_gemm_ref(
     qx,
@@ -347,10 +343,15 @@ def _run_and_validate_optimized_path(
     qx, qw, sx, sw, global_amax_qx, global_amax_qw, _ = (
         nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
     )
-    factor = 6.0 * 6.0 * 448.0 * 448.0
-    alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
-    alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
 
+    if accumulate:
+        # accu mode only use in wgrad, aplha = 1.0
+        alpha_t = torch.tensor(1.0, device=device, dtype=torch.float32)
+    else:
+        factor = 6.0 * 6.0 * 448.0 * 448.0
+        alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
+        alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
+  
     y_ref = _run_cutedsl_nvfp4_gemm_ref(
         qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device,
         return_fp32=accumulate, has_swizzle=has_swizzle
@@ -482,11 +483,11 @@ class TestCuTeDSLNvfp4Gemm:
         )
 
     @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
-    @pytest.mark.parametrize("accumulate", [False])
-    @pytest.mark.parametrize("acc_dtype", [torch.bfloat16])
+    @pytest.mark.parametrize("accumulate", [False, True])
+    @pytest.mark.parametrize("acc_dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("has_swizzle", [False])
-    @pytest.mark.parametrize("do_benchmark", [True])
-    @pytest.mark.parametrize("do_autotune", [False])
+    @pytest.mark.parametrize("do_benchmark", [False, True])
+    @pytest.mark.parametrize("do_autotune", [False, True])
     @pytest.mark.parametrize("kernel_variant", [Nvfp4KernelVariant.CURRENT_OPTIMIZED])
     def test_cutedsl_nvfp4_optimized(
         self, M, K, N, accumulate, acc_dtype, has_swizzle, do_benchmark, do_autotune, kernel_variant

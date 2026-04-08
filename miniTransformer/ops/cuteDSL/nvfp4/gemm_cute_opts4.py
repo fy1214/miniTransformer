@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# NVFP4 tutorial 4 (cluster variants): documents the same preferred/fallback cluster
+# NVFP4 CuTeDSL 4 (cluster variants): documents the same preferred/fallback cluster
 # shapes as fp16_gemm_4.py for API parity. The device implementation currently matches
 # nvfp4_gemm_3_1 (single cluster (2,1,1), CLC scheduling, SIMT C): CuTeDSL does not yet
 # support the fp16-style mega-kernel path for NVFP4 without breaking tma_partition static

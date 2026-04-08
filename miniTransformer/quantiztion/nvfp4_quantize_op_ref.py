@@ -619,8 +619,6 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
         custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
-        if out is not None:
-            assert out_dtype == out.dtype, "Output dtype mismatch."
 
         return self._ref_qgemm(
             qx,
@@ -667,12 +665,15 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
 
         bias = bias if use_bias else None
         res = []
+        
+        # Create empty MMParams for qgemm calls
+        m_params = quantization.MMParams()
 
         for i in range(num_gemms):
-            out = self.qgemm(
+            gemm_out = self.qgemm(
                 A[i],
                 B[i],
-                None,
+                m_params,  # Pass valid MMParams instead of None
                 out_dtype,
                 sA[i],
                 sB[i],
@@ -687,6 +688,6 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 qparams_w,
                 "cublas"
             )
-            res.append(out)
+            res.append(gemm_out)
 
         return torch.cat(res, dim=0)

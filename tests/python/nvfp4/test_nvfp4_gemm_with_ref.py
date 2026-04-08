@@ -4,6 +4,8 @@ import time
 import pytest
 import torch
 
+from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend
+
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
@@ -61,21 +63,30 @@ class TestCutlassNvfp4Gemm:
         sx_4d = swizzle_scale(sx, M, K)  # (M//128, K//64, 32, 16)
         sw_4d = swizzle_scale(sw, N, K)  # (N//128, K//64, 32, 16)
 
-        D_cutlass = torch.empty((M, N), device=device, dtype=out_dtype)
-
         factor = 6.0 * 6.0 * 448.0 * 448.0
         alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
 
         start = time.time()
-        fp4_gemm.cutlass_gemm(
-            D_cutlass,  # output
-            qx,         # A：uint8 packed NVFP4
-            qw,         # B：uint8 packed NVFP4
-            sx_4d,      # A_sf：block‑scaled scale for A
-            sw_4d,      # B_sf：block‑scaled scale for B
-            alpha,      # alpha
+
+        backend = dispatch_gemm_backend("cutlass", "nvfp4")
+        D_cutlass = backend.gemm(
+            qx, qw, out_dtype, sx, sw,
+            None, None, False, False,
+            "TN", alpha, None, None, False
         )
+
+        backend = dispatch_gemm_backend("cublas", "nvfp4")
+        ref = backend.gemm(
+            qx, qw, out_dtype, sx, sw,
+            None, None, False, False,
+            "TN", alpha, None, None, False
+        )
+
+        print(f'\ny_ref:{y_ref}')
+        print(f'D_cutlass:{D_cutlass}')
+        print(f'ref:{ref}')
+
         if device == "cuda":
             torch.cuda.synchronize()
         cutlass_time = time.time() - start

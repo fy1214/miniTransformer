@@ -3,7 +3,7 @@ import dataclasses
 import enum
 import math
 import torch
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, NamedTuple, List
 
 from ..utils import utils
 
@@ -97,6 +97,19 @@ class QuantizeResultCache:
             tensor_scale=self.global_amax_row,
             tensor_scale_t=self.global_amax_col
         )
+
+
+@dataclasses.dataclass
+class GroupQuantizeResultCache:
+    """
+    Cache of group quantized tensors
+    """
+    data: Optional[List[torch.Tensor]] = None
+    scale: Optional[List[torch.Tensor]] = None
+    data_t: Optional[List[torch.Tensor]] = None
+    scale_t: Optional[List[torch.Tensor]] = None
+    global_amax_row: Optional[List[torch.Tensor]] = None
+    global_amax_col: Optional[List[torch.Tensor]] = None
 
 
 @dataclasses.dataclass

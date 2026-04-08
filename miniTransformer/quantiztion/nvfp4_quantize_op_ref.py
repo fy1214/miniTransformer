@@ -1,9 +1,10 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from miniTransformer.utils import utils
 from miniTransformer.quantiztion import quantization
+from miniTransformer.utils.utils import _empty_tensor
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -458,6 +459,33 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         )
         return quantization.QuantizeResult(qx, sx, qx_t, sx_t, global_amax_row, global_amax_col)
 
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+    ) -> List[quantization.QuantizeResult]:
+        """
+        If param type is weight, the shape is [num_gemms, n, k].
+        If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
+        If param type is Y, the shape is [m_sum, n].
+        """
+        if qparams.param_type != qparams.param_type.WEIGHT:
+            x = torch.split(x, m_splits)
+
+        results = [
+            self.quantize(xi, qparams, return_transpose, reduce_amax, tp_group, input_meta)
+            for xi in x
+        ]
+
+        return results
+
+
     def _ref_qgemm(
         self,
         qx: torch.Tensor,
@@ -610,3 +638,56 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             qparams_x=qparams_x,
             qparams_w=qparams_w,
         )
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad=False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+
+        num_gemms = len(m_splits)
+
+        empty_tensor = _empty_tensor()
+        empty_tensors = [empty_tensor] * num_gemms
+
+        bias = bias if use_bias else empty_tensors
+
+        out = []
+
+        for i in range(num_gemms):
+            out = self.qgemm(
+                A[i],
+                B[i],
+                None,
+                out_dtype,
+                sA[i],
+                sB[i],
+                bias[i],
+                None if out is None else out[i],
+                grad,
+                accumulate,
+                layout,
+                global_amax_A[i],
+                global_amax_B[i],
+                qparams_x,
+                qparams_w,
+                "cublas"
+            )
+            out.append(out)
+
+        return torch.cat(out, dim=0)

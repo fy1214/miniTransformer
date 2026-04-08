@@ -5,10 +5,6 @@ from typing import Optional
 
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
-from miniTransformer.ops.nvfp4_qgemm import (
-    qgemm_tl,
-    swizzle_scale,
-)
 
 from transformer_engine.pytorch import NVFP4Quantizer
 from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
@@ -24,7 +20,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
 
     @property
     def supports_allgather(self) -> bool:
-        return False   
+        return False
 
     def _quantize(
         self,

@@ -19,7 +19,7 @@ from miniTransformer.ops.nvfp4_qgemm import (
 import fp4_gemm
 
 
-class TestCutlassNvfp4Gemm:
+class TestNvfp4GemmBackend:
 
     @pytest.mark.parametrize(
         "M, K, N, seed",
@@ -30,7 +30,7 @@ class TestCutlassNvfp4Gemm:
             (8192, 8192, 8192, 1234),
         ],
     )
-    def test_cutlass_nvfp4_matches_ref(self, M, K, N, seed):
+    def test_nvfp4_backend_matches_ref(self, M, K, N, seed):
         device = "cuda"
         out_dtype = torch.bfloat16
 
@@ -59,9 +59,6 @@ class TestCutlassNvfp4Gemm:
 
         assert y_ref.shape == (M, N)
         assert y_ref.dtype == out_dtype
-
-        sx_4d = swizzle_scale(sx, M, K)  # (M//128, K//64, 32, 16)
-        sw_4d = swizzle_scale(sw, N, K)  # (N//128, K//64, 32, 16)
 
         factor = 6.0 * 6.0 * 448.0 * 448.0
         alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor

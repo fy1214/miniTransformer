@@ -389,6 +389,35 @@ def _run_and_validate_optimized_path(
     )
 
 class TestCuTeDSLNvfp4Gemm:
+ 
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm3_1_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm3_1, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm3_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm3, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm4_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm4, M, K, N, acc_dtype, "cuda"
+        )
+
+    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
+    @pytest.mark.parametrize("acc_dtype", [torch.float16])
+    def test_cutedsl_nvfp4_gemm5_kernel(self, M, K, N, acc_dtype):
+        _run_and_validate_opts_variant(
+            _run_cutedsl_nvfp4_gemm5, M, K, N, acc_dtype, "cuda"
+        )
+
     @pytest.mark.parametrize("M, K, N", GEMM2_WORKLOAD_PARAMS)
     @pytest.mark.parametrize("acc_dtype", [torch.float16])
     def test_cutedsl_nvfp4_gemm2_kernel(self, M, K, N, acc_dtype):
@@ -400,7 +429,6 @@ class TestCuTeDSLNvfp4Gemm:
             nvfp4_qgemm.initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
         )
 
-        # GEMM2 tutorial kernel writes FP16 C; keep scale factors in a stable range.
         sx = (sx.to(torch.float32) / 256.0).to(torch.float8_e4m3fn)
         sw = (sw.to(torch.float32) / 256.0).to(torch.float8_e4m3fn)
         alpha_t = torch.tensor(1.0, device=device, dtype=torch.float32)
@@ -431,35 +459,6 @@ class TestCuTeDSLNvfp4Gemm:
             atol=1e-6,
             msg=f"CuTeDSL NVFP4 GEMM2 mismatch for M={M}, K={K}, N={N}, seed={seed}",
         )
-
-    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
-    @pytest.mark.parametrize("acc_dtype", [torch.float16])
-    def test_cutedsl_nvfp4_gemm3_1_kernel(self, M, K, N, acc_dtype):
-        _run_and_validate_opts_variant(
-            _run_cutedsl_nvfp4_gemm3_1, M, K, N, acc_dtype, "cuda"
-        )
-
-    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
-    @pytest.mark.parametrize("acc_dtype", [torch.float16])
-    def test_cutedsl_nvfp4_gemm3_kernel(self, M, K, N, acc_dtype):
-        _run_and_validate_opts_variant(
-            _run_cutedsl_nvfp4_gemm3, M, K, N, acc_dtype, "cuda"
-        )
-
-    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
-    @pytest.mark.parametrize("acc_dtype", [torch.float16])
-    def test_cutedsl_nvfp4_gemm4_kernel(self, M, K, N, acc_dtype):
-        _run_and_validate_opts_variant(
-            _run_cutedsl_nvfp4_gemm4, M, K, N, acc_dtype, "cuda"
-        )
-
-    @pytest.mark.parametrize("M, K, N", GEMM345_WORKLOAD_PARAMS)
-    @pytest.mark.parametrize("acc_dtype", [torch.float16])
-    def test_cutedsl_nvfp4_gemm5_kernel(self, M, K, N, acc_dtype):
-        _run_and_validate_opts_variant(
-            _run_cutedsl_nvfp4_gemm5, M, K, N, acc_dtype, "cuda"
-        )
-
 
     @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
     @pytest.mark.parametrize("accumulate", [False, True])

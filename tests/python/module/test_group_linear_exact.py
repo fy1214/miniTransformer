@@ -496,8 +496,8 @@ def run_all_tests(qparam_id: int = 5, test_ids: list = None):
     print("="*60 + "\n")
     
     if failed_tests:
-        print(f"✗ {len(failed_tests)} test(s) failed. See traceback above for details.\n")
-        raise RuntimeError(f"{len(failed_tests)} test(s) failed")
+        print(f"✗ {len(failed_tests)} test(s) failed. See detailed traceback above.\n")
+        exit(1)
     else:
         print("✓ All tests passed successfully!\n")
 
@@ -515,15 +515,4 @@ if __name__ == "__main__":
         exit(0)
     
     # Run tests
-    try:
-        run_all_tests(qparam_id=args.qparam, test_ids=args.tests)
-    except Exception as e:
-        print(f"\n{'='*60}")
-        print(f"✗ Test Suite Failed")
-        print(f"{'='*60}")
-        print(f"Error: {e}")
-        print(f"\nFull Traceback:")
-        print("-" * 60)
-        traceback.print_exc()
-        print("-" * 60 + "\n")
-        exit(1)
+    run_all_tests(qparam_id=args.qparam, test_ids=args.tests)

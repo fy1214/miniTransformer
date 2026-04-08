@@ -140,10 +140,20 @@ def _try_export_compiled_to_disk(config_key: Tuple[Any, ...], compiled) -> None:
     with _FileLock(lock_path, exclusive=True):
         if obj_path.exists():
             return
-        compiled.export_to_c(
-            object_file_path=str(obj_path),
-            function_name=_PERSISTENT_CACHE_FUNC_NAME,
-        )
+        try:
+            compiled.export_to_c(
+                object_file_path=str(obj_path),
+                function_name=_PERSISTENT_CACHE_FUNC_NAME,
+            )
+        except TypeError:
+            try:
+                compiled.export_to_c(
+                    str(cache_dir),
+                    key_hash,
+                    function_prefix=_PERSISTENT_CACHE_FUNC_NAME,
+                )
+            except TypeError:
+                return
 
 class OptimizedBlockScaledDenseGemmKernel:
     def __init__(

@@ -34,16 +34,16 @@ void cublas_gemm(
 );
 
 void block_scaled_matmul_nvfp4(
-    const at::Tensor A,
-    const at::Tensor B,
-    at::Tensor output,
-    const at::Tensor scale_A,
-    const at::Tensor scale_B,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& output,
+    const at::Tensor& scale_A,
+    const at::Tensor& scale_B,
     float amax_A,
     float amax_B,
-    float alpha,
+    at::Tensor& alpha,
     bool accumulate,
-    const at::Tensor workspace_tensor,
+    const at::Tensor& workspace_tensor,
     size_t workspace_size);
 
 void cutlass_gemm(

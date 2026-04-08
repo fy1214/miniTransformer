@@ -10,6 +10,7 @@ from ..distributed.distributed import get_distributed_world_size
 from ..utils.env import get_keep_in_bf16_layer_numbers
 from ..utils.utils import get_default_init_method #, FP8GlobalStateManager
 
+_dummy_wgrads = {}
 
 @dataclass
 class _ParameterInitMeta:
@@ -24,6 +25,22 @@ class _ParameterInitMeta:
         """Safeguard reference to the parameter's parent module and initialization function."""
         if self.init_fn is None:
             self.init_fn = get_default_init_method()
+
+
+def get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
+    """Returns a dummy tensor of given shape."""
+    assert len(shape) == 2
+    global _dummy_wgrads
+    if (shape[0], shape[1], dtype) not in _dummy_wgrads:
+        _dummy_wgrads[(shape[0], shape[1], dtype)] = torch.empty(
+            shape,
+            dtype=dtype,
+            device="cuda",
+            requires_grad=False,
+        )
+    if zero:
+        _dummy_wgrads[(shape[0], shape[1], dtype)].fill_(0)
+    return _dummy_wgrads[(shape[0], shape[1], dtype)].detach()
 
 
 class LayerLinearBaseModule(torch.nn.Module, ABC):

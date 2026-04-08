@@ -20,6 +20,38 @@ inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
 }
 
+
+/* Use CUDA const memory to store scalar 1 and 0 for cublas usage
+*/
+__device__ __constant__ float one_device;
+__device__ __constant__ float zero_device;
+
+
+inline float *GetScalarOne() {
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    float one = 1.0f;
+    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(one_device, &one, sizeof(float)));
+  });
+  // return address by cudaGetSymbolAddress
+  float *dev_ptr;
+  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), one_device));
+  return dev_ptr;
+}
+
+
+inline float *GetScalarZero() {
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    float zero = 0.0f;
+    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(zero_device, &zero, sizeof(float)));
+  });
+  // return address by cudaGetSymbolAddress
+  float *dev_ptr;
+  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), zero_device));
+  return dev_ptr;
+}
+
 void cublas_gemm_impl(
     const at::Tensor *inputA,
     const at::Tensor *A_scale,
@@ -291,7 +323,7 @@ void block_scaled_matmul_nvfp4_impl(
     const at::Tensor *scale_B,
     void *workspace,
     size_t workspaceSize,
-    float alpha,
+    float *alpha,
     bool accumulate,
     cudaStream_t stream) {
   const int M = A->size(0);
@@ -357,13 +389,19 @@ void block_scaled_matmul_nvfp4_impl(
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, dataType, K, N, K));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, D_type, M, N, M));
 
-  float beta = (accumulate) ? 1.0f : 0.0f;
+  float* beta = (accumulate) ? GetScalarOne() : GetScalarZero();
 
   // Create preference
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
       sizeof(workspaceSize)));
+
+  // Set pointer mode: alpha and beta are both device pointers
+  // https://docs.nvidia.com/cuda/cublas/#cublasltpointermode-t
+  cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+      matmulDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
   // Query cuBLAS heuristics for the best algorithm
   cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
@@ -377,10 +415,10 @@ void block_scaled_matmul_nvfp4_impl(
 
   // Execute matmul with the selected algorithm
   // B and A are swapped for row-major to col-major conversion
-  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, &alpha,
+  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, alpha,
                                    const_cast<void*>(A->data_ptr()), Adesc,
                                    const_cast<void*>(B->data_ptr()), Bdesc,
-                                   &beta, 
+                                   beta,
                                    output->data_ptr(), Cdesc,
                                    output->data_ptr(), Cdesc, 
                                    &heuristicResult.algo,
@@ -399,16 +437,16 @@ void block_scaled_matmul_nvfp4_impl(
 }
 
 void block_scaled_matmul_nvfp4(
-    const at::Tensor A,
-    const at::Tensor B,
-    at::Tensor output,
-    const at::Tensor scale_A,
-    const at::Tensor scale_B,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& output,
+    const at::Tensor& scale_A,
+    const at::Tensor& scale_B,
     float amax_A,
     float amax_B,
-    float alpha,
+    at::Tensor& alpha,
     bool accumulate,
-    const at::Tensor workspace_tensor,
+    const at::Tensor& workspace_tensor,
     size_t workspace_size) {
   auto stream = at::cuda::getCurrentCUDAStream();
   
@@ -430,6 +468,6 @@ void block_scaled_matmul_nvfp4(
 
   block_scaled_matmul_nvfp4_impl(
       &A, &B, &output, &scale_A, &scale_B,
-      workspace_tensor.data_ptr(), workspace_size, alpha, accumulate, stream);
+      workspace_tensor.data_ptr(), workspace_size, static_cast<float*>(alpha.data_ptr()), accumulate, stream);
 }
 

@@ -6,6 +6,7 @@ import cutlass
 import fp4_gemm
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import torch.nn.functional as F
 
 from typing import Optional
 
@@ -316,8 +317,15 @@ def swizzle_scale(scale_2d, target_M, target_K):
     2D scale (M, K//16) -> 4D (M//128, K//64, 32, 16) for triton/cuBLAS.
     Inverse of pack_scale_from_4d.
     """
+    pad_length = (128 - (scale_2d.size(0) % 128)) % 128
+    # 如果长度已经是 128 的倍数，则不需要填充
+    if pad_length > 0:
+        x_scale_padded = F.pad(scale_2d, pad=(0, 0, 0, pad_length), mode='constant', value=0)
+        target_M = x_scale_padded.shape[0]
+    else:
+        x_scale_padded = scale_2d
     num_chunk_m, num_chunk_k = target_M // 128, (target_K // 16) // 4
-    u = scale_2d.reshape(num_chunk_m, 4, 32, num_chunk_k, 4)
+    u = x_scale_padded.reshape(num_chunk_m, 4, 32, num_chunk_k, 4)
     return u.permute(0, 3, 2, 1, 4).reshape(
         num_chunk_m, num_chunk_k, 32, 16
     )

@@ -233,7 +233,7 @@ class NVFP4CuteDSLGemmBackend(GemmBackendBase):
         y = cutedsl_nvfp4_gemm_optimized(
             qx, qw, sx, sw, M, N, K,
             alpha, out_dtype,
-            qx.device, out, accumulate, has_swzzile
+            qx.device, out, accumulate, has_swzzile=False
         )
 
         return y

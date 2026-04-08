@@ -18,6 +18,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from miniTransformer.ops.triton.gemm_tl import block_scaled_matmul
 from cutlass.cute.runtime import make_ptr
 
+from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
+    ab_dtype,
+    sf_dtype,
+    sf_vec_size,
+    get_compiled_nvfp4_gemm,
+)
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -452,39 +458,45 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     return cute_f8_torch_tensor_cpu.cuda()
 
 
-compile_kernel = {}
-
 def cutedsl_nvfp4_gemm_optimized(
-    qx, qw, sx, sw, M, N, K, alpha, out_dtype, device, out=None, accumulate=False, has_swizzle=True
+    qx,
+    qw,
+    sx,
+    sw,
+    M,
+    N,
+    K,
+    alpha,
+    out_dtype,
+    device,
+    out=None,
+    accumulate=False,
+    has_swizzle=True,
+    do_benchmark=False,
+    warmup_iterations=10,
+    iterations=100,
+    use_cold_l2=False,
 ):
     """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
-
-    from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
-        OptimizedBlockScaledDenseGemmKernel,
-        ab_dtype,
-        sf_dtype,
-        sf_vec_size,
-    )
 
     alpha_value = float(alpha.item())
     l = 1
     sf_k = ceil_div(K, sf_vec_size)
 
-    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
-    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
+    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2).to(device)
+    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2).to(device)
     if accumulate:
         assert out is not None, "out must be provided when accumulate=True"
-        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype)
+        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype).to(device)
     else:
         c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
 
     def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
-        ref = create_ref_scale_factor_tensor(l, mn, sf_k)
-        ref.copy_(data_2d.unsqueeze(-1).to(ref.dtype).cpu())
+        ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn)
         if has_swizzle:
             return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
         else:
-            return ref.flatten().to(device)
+            return ref
 
     sfa_tensor = _ref_2d_to_cute_sf(sx, M, has_swizzle)
     sfb_tensor = _ref_2d_to_cute_sf(sw, N, has_swizzle)
@@ -497,25 +509,72 @@ def cutedsl_nvfp4_gemm_optimized(
     sfa_ptr = make_ptr(sf_dtype, sfa_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
-    gemm = OptimizedBlockScaledDenseGemmKernel()
     stream = cutlass_torch.default_stream()
-    key = (M, N, K, out_dtype, accumulate, has_swizzle)
-    if key in compile_kernel:
-        compiled = compile_kernel[key]
-    else:
-        compiled = cute.compile(
-            gemm,
-            a_ptr,
-            b_ptr,
-            sfa_ptr,
-            sfb_ptr,
-            c_ptr,
-            (M, N, K, l),
-            stream,
-            epilogue_op=lambda x: x * alpha_value,
-            accumulate=accumulate,
+    compiled, _, _ = get_compiled_nvfp4_gemm(
+        a_ptr=a_ptr,
+        b_ptr=b_ptr,
+        sfa_ptr=sfa_ptr,
+        sfb_ptr=sfb_ptr,
+        c_ptr=c_ptr,
+        problem_size=(M, N, K, l),
+        stream=stream,
+        epilogue_op=lambda x: x,
+        epilogue_cache_tag=("scale_alpha",),
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+        has_swizzle=has_swizzle,
+        do_autotune=False,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+        use_cold_l2=use_cold_l2,
+    )
+
+    if do_benchmark:
+        def generate_tensors():
+            args = cute.testing.JitArguments(
+                a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream
+            )
+            args.add_to_scope([a_ref_f4, b_ref_f4, sfa_tensor, sfb_tensor, c_tensor])
+            return args
+
+        workspace_count = 1
+        if use_cold_l2:
+            one_workspace_bytes = (
+                a_ref_f4.numel() * a_ref_f4.element_size()
+                + b_ref_f4.numel() * b_ref_f4.element_size()
+                + sfa_tensor.numel() * sfa_tensor.element_size()
+                + sfb_tensor.numel() * sfb_tensor.element_size()
+                + c_tensor.numel() * c_tensor.element_size()
+            )
+            workspace_count = cute.testing.get_workspace_count(
+                one_workspace_bytes, warmup_iterations, iterations
+            )
+
+        # benchmark() returns kernel time in microseconds.
+        elapsed_us = cute.testing.benchmark(
+            compiled,
+            workspace_generator=generate_tensors,
+            workspace_count=workspace_count,
+            stream=stream,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
         )
-        compile_kernel[key] = compiled
+
+        print(f"CuTeDSL benchmark time: {elapsed_us:.3f} us")
+        peta_flops = (4 * M * N * K * l) / (elapsed_us * 1e-6) / 1e9 / 1000000
+        print(f"CuTeDSL FLOPS: {peta_flops:.6f} PFLOPS")
+        bytes_transfer = (
+            2 * M * K / 2 * l * a_ref_f4.element_size()
+            + 2 * N * K / 2 * l * b_ref_f4.element_size()
+            + 2 * M * N * l * c_tensor.element_size()
+            + 2 * M * sf_k * l * sfa_tensor.element_size()
+            + 2 * N * sf_k * l * sfb_tensor.element_size()
+        )
+        print(f"CuTeDSL bytes: {bytes_transfer} Bytes")
+        bandwidth = bytes_transfer / elapsed_us * 1e-3
+        print(f"CuTeDSL BW: {bandwidth:.3f} GB/s")
 
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
+    if alpha_value != 1.0:
+        c_tensor.mul_(alpha_value)
     return c_tensor.squeeze(-1).float().to(out_dtype)

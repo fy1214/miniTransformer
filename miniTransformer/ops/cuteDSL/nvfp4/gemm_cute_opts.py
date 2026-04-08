@@ -1,7 +1,15 @@
 import argparse
+import fcntl
+import hashlib
 import os
+import pickle
 import sys
-from typing import Type, Tuple
+import tempfile
+from dataclasses import dataclass
+from getpass import getuser
+from itertools import product
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 import cuda.bindings.driver as cuda
 
 import torch
@@ -30,15 +38,135 @@ sf_dtype = cutlass.Float8E4M3FN
 sf_vec_size = 16
 cluster_shape_mnk = (2, 1, 1)
 
+DEFAULT_MMA_TILER_MN = mma_tiler_mn
+DEFAULT_CLUSTER_SHAPE_MNK = cluster_shape_mnk
+DEFAULT_NUM_AB_STAGE = 5
+DEFAULT_NUM_ACC_STAGE = 1
+
+
+@dataclass(frozen=True)
+class GemmTuneConfig:
+    mma_tiler_mn: Tuple[int, int]
+    cluster_shape_mnk: Tuple[int, int, int]
+    use_2cta_instrs: bool
+    num_ab_stage: int
+    num_acc_stage: int
+
+
+DEFAULT_TUNE_SEARCH_SPACE: List[GemmTuneConfig] = []
+for _mma_tiler_mn, _cluster_shape_mnk, _use_2cta_instrs, _num_ab_stage in product(
+    [(128, 128), (128, 256), (256, 128), (256, 256)],
+    [(1, 1, 1), (2, 1, 1)],
+    [False, True],
+    [4, 5],
+):
+    if _mma_tiler_mn[0] == 128 and _use_2cta_instrs:
+        continue
+    DEFAULT_TUNE_SEARCH_SPACE.append(
+        GemmTuneConfig(
+            mma_tiler_mn=_mma_tiler_mn,
+            cluster_shape_mnk=_cluster_shape_mnk,
+            use_2cta_instrs=_use_2cta_instrs,
+            num_ab_stage=_num_ab_stage,
+            num_acc_stage=1,
+        )
+    )
+
+_CONFIG_KERNEL_CACHE: Dict[Tuple[Any, ...], Any] = {}
+_INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
+_PERSISTENT_CACHE_VERSION = "v1"
+_PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
+_PERSISTENT_CACHE_FUNC_NAME = "func"
+
+
+def _get_persistent_cache_dir() -> Path:
+    cache_dir = os.getenv("NVFP4_CUTE_CACHE_DIR")
+    if cache_dir:
+        path = Path(cache_dir)
+    else:
+        path = Path(tempfile.gettempdir()) / getuser() / "minitransformer_cute_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _persistent_cache_hash(config_key: Tuple[Any, ...]) -> str:
+    payload = (_PERSISTENT_CACHE_VERSION, config_key)
+    return hashlib.sha256(pickle.dumps(payload)).hexdigest()
+
+
+class _FileLock:
+    def __init__(self, lock_path: Path, exclusive: bool):
+        self.lock_path = lock_path
+        self.exclusive = exclusive
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = os.open(
+            str(self.lock_path),
+            os.O_CREAT | (os.O_WRONLY if self.exclusive else os.O_RDONLY),
+        )
+        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        fcntl.flock(self._fd, mode)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
+def _try_load_compiled_from_disk(config_key: Tuple[Any, ...]):
+    if not _PERSISTENT_CACHE_ENABLED:
+        return None
+    cache_dir = _get_persistent_cache_dir()
+    key_hash = _persistent_cache_hash(config_key)
+    obj_path = cache_dir / f"{key_hash}.o"
+    lock_path = cache_dir / f"{key_hash}.lock"
+    with _FileLock(lock_path, exclusive=False):
+        if not obj_path.exists():
+            return None
+        module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+        return getattr(module, _PERSISTENT_CACHE_FUNC_NAME)
+
+
+def _try_export_compiled_to_disk(config_key: Tuple[Any, ...], compiled) -> None:
+    if not _PERSISTENT_CACHE_ENABLED:
+        return
+    cache_dir = _get_persistent_cache_dir()
+    key_hash = _persistent_cache_hash(config_key)
+    obj_path = cache_dir / f"{key_hash}.o"
+    lock_path = cache_dir / f"{key_hash}.lock"
+    with _FileLock(lock_path, exclusive=True):
+        if obj_path.exists():
+            return
+        compiled.export_to_c(
+            object_file_path=str(obj_path),
+            function_name=_PERSISTENT_CACHE_FUNC_NAME,
+        )
+
 class OptimizedBlockScaledDenseGemmKernel:
-    def __init__(self):
+    def __init__(
+        self,
+        mma_tiler_mn: Tuple[int, int] = DEFAULT_MMA_TILER_MN,
+        cluster_shape_mnk: Tuple[int, int, int] = DEFAULT_CLUSTER_SHAPE_MNK,
+        use_2cta_instrs: Optional[bool] = None,
+        num_ab_stage: int = DEFAULT_NUM_AB_STAGE,
+        num_acc_stage: int = DEFAULT_NUM_ACC_STAGE,
+    ):
         self.threads_per_cta = 128
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tmem_alloc_cols = 512
 
         # set stages for ab_pipeline and acc_pipeline
-        self.num_acc_stage = 1
-        self.num_ab_stage = 5
+        self.num_acc_stage = num_acc_stage
+        self.num_ab_stage = num_ab_stage
+        self.mma_tiler_mn = mma_tiler_mn
+        self.cluster_shape_mnk = cluster_shape_mnk
+        self.mma_inst_shape_k = mma_inst_shape_k
+        self.use_2cta_instrs = (
+            (mma_tiler_mn[0] != 128) if use_2cta_instrs is None else use_2cta_instrs
+        )
 
     @cute.jit
     def __call__(
@@ -57,25 +185,23 @@ class OptimizedBlockScaledDenseGemmKernel:
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
         m, n, k, l = problem_size
 
-        self.use_2cta_instrs = False if mma_tiler_mn[0] == 128 else True
-
         # Setup attributes that depend on gemm inputs
         mma_inst_tile_k = 4
         self.mma_tiler = (
-            mma_tiler_mn[0],
-            mma_tiler_mn[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            self.mma_inst_shape_k * mma_inst_tile_k,
         )
 
         self.mma_inst_shape_sfb = (
-            mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
-            mma_tiler_mn[1],
-            mma_inst_shape_k,
+            self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
+            self.mma_tiler_mn[1],
+            self.mma_inst_shape_k,
         )
         self.mma_tiler_sfb = (
             self.mma_inst_shape_sfb[0],
             self.mma_inst_shape_sfb[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            self.mma_inst_shape_k * mma_inst_tile_k,
         )
 
         a_tensor = cute.make_tensor(
@@ -116,7 +242,7 @@ class OptimizedBlockScaledDenseGemmKernel:
 
         mma_op = tcgen05.MmaMXF4NVF4Op(
             sf_dtype,
-            (*mma_tiler_mn, mma_inst_shape_k),
+            (*self.mma_tiler_mn, self.mma_inst_shape_k),
             tcgen05.CtaGroup.ONE if not self.use_2cta_instrs else tcgen05.CtaGroup.TWO,
             tcgen05.OperandSource.SMEM,
         )
@@ -144,11 +270,11 @@ class OptimizedBlockScaledDenseGemmKernel:
         )
 
         self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(cluster_shape_mnk),
+            cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma.thr_id.shape,),
         )
         self.cluster_layout_sfb_vmnk = cute.tiled_divide(
-            cute.make_layout(cluster_shape_mnk),
+            cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma_sfb.thr_id.shape,),
         )
 
@@ -189,7 +315,7 @@ class OptimizedBlockScaledDenseGemmKernel:
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            cluster_shape_mnk[:2], tiled_mma.thr_id
+            self.cluster_shape_mnk[:2], tiled_mma.thr_id
         )
         # TMA load for A
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
@@ -203,7 +329,7 @@ class OptimizedBlockScaledDenseGemmKernel:
         )
         # TMA load for B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            cluster_shape_mnk[:2], tiled_mma.thr_id
+            self.cluster_shape_mnk[:2], tiled_mma.thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -217,7 +343,7 @@ class OptimizedBlockScaledDenseGemmKernel:
 
         # TMA load for SFA
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            cluster_shape_mnk[:2], tiled_mma.thr_id
+            self.cluster_shape_mnk[:2], tiled_mma.thr_id
         )
         sfa_smem_layout = cute.slice_(
             self.sfa_smem_layout_staged, (None, None, None, 0)
@@ -234,7 +360,7 @@ class OptimizedBlockScaledDenseGemmKernel:
 
         # TMA load for SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
-            cluster_shape_mnk[:2], tiled_mma.thr_id
+            self.cluster_shape_mnk[:2], tiled_mma.thr_id
         )
         sfb_smem_layout = cute.slice_(
             self.sfb_smem_layout_staged, (None, None, None, 0)
@@ -264,7 +390,7 @@ class OptimizedBlockScaledDenseGemmKernel:
                 (c_tensor.layout.shape),
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], 1),
             ),
-            cluster_shape_mnk,
+            self.cluster_shape_mnk,
         )
 
         # Launch the kernel
@@ -291,7 +417,7 @@ class OptimizedBlockScaledDenseGemmKernel:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=cluster_shape_mnk,
+            cluster=self.cluster_shape_mnk,
             stream=stream,
         )
         return
@@ -748,7 +874,8 @@ class OptimizedBlockScaledDenseGemmKernel:
                             tCtAcc,
                         )
                         # Enable accumulate on tCtAcc after first kblock
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if kblock_idx == 0:
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                     # Async arrive AB buffer empty
                     ab_full.release()
@@ -810,3 +937,227 @@ class OptimizedBlockScaledDenseGemmKernel:
         tmem.free(acc_tmem_ptr)
 
         return
+
+
+def _get_device_arch_from_torch_device(device: torch.device) -> str:
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"sm_{major}{minor}"
+
+
+def _compile_kernel_with_config(
+    config: GemmTuneConfig,
+    *,
+    a_ptr,
+    b_ptr,
+    sfa_ptr,
+    sfb_ptr,
+    c_ptr,
+    problem_size,
+    stream,
+    epilogue_op,
+    epilogue_cache_tag: Any,
+    out_dtype,
+    accumulate: bool,
+    has_swizzle: bool,
+    arch: str,
+):
+    config_key = (
+        arch,
+        ab_dtype,
+        sf_dtype,
+        out_dtype,
+        bool(accumulate),
+        bool(has_swizzle),
+        epilogue_cache_tag,
+        config.mma_tiler_mn,
+        config.cluster_shape_mnk,
+        config.use_2cta_instrs,
+        config.num_ab_stage,
+        config.num_acc_stage,
+    )
+    if config_key in _CONFIG_KERNEL_CACHE:
+        return _CONFIG_KERNEL_CACHE[config_key]
+
+    compiled = _try_load_compiled_from_disk(config_key)
+    if compiled is not None:
+        _CONFIG_KERNEL_CACHE[config_key] = compiled
+        return compiled
+
+    gemm = OptimizedBlockScaledDenseGemmKernel(
+        mma_tiler_mn=config.mma_tiler_mn,
+        cluster_shape_mnk=config.cluster_shape_mnk,
+        use_2cta_instrs=config.use_2cta_instrs,
+        num_ab_stage=config.num_ab_stage,
+        num_acc_stage=config.num_acc_stage,
+    )
+    compiled = cute.compile(
+        gemm,
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        problem_size,
+        stream,
+        epilogue_op=epilogue_op,
+        accumulate=accumulate,
+    )
+    _try_export_compiled_to_disk(config_key, compiled)
+    _CONFIG_KERNEL_CACHE[config_key] = compiled
+    return compiled
+
+
+def get_compiled_nvfp4_gemm(
+    *,
+    a_ptr,
+    b_ptr,
+    sfa_ptr,
+    sfb_ptr,
+    c_ptr,
+    problem_size: Tuple[int, int, int, int],
+    stream,
+    epilogue_op,
+    epilogue_cache_tag: Any = None,
+    out_dtype=torch.float16,
+    accumulate: bool = False,
+    has_swizzle: bool = True,
+    do_autotune: bool = False,
+    warmup_iterations: int = 10,
+    iterations: int = 100,
+    use_cold_l2: bool = True,
+    benchmark_scope_tensors: Optional[List[torch.Tensor]] = None,
+    tune_search_space: Optional[List[GemmTuneConfig]] = None,
+):
+    if tune_search_space is None:
+        tune_search_space = DEFAULT_TUNE_SEARCH_SPACE
+    if len(tune_search_space) == 0:
+        raise ValueError("tune_search_space must not be empty")
+
+    if not isinstance(c_ptr, cute.Pointer):
+        raise TypeError("c_ptr must be a cute.Pointer")
+    torch_device = torch.device("cuda", torch.cuda.current_device())
+    arch = _get_device_arch_from_torch_device(torch_device)
+    m, n, k, l = problem_size
+
+    input_key = (
+        torch_device.index,
+        arch,
+        m,
+        n,
+        k,
+        out_dtype,
+        bool(accumulate),
+        bool(has_swizzle),
+        epilogue_cache_tag,
+    )
+
+    def _benchmark(compiled, scope_tensors):
+        def workspace_generator():
+            args = cute.testing.JitArguments(
+                a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, problem_size, stream
+            )
+            args.add_to_scope(scope_tensors)
+            return args
+
+        workspace_count = 1
+        if use_cold_l2:
+            one_workspace_bytes = sum(
+                int(t.numel() * t.element_size()) for t in scope_tensors
+            )
+            workspace_count = cute.testing.get_workspace_count(
+                one_workspace_bytes, warmup_iterations, iterations
+            )
+        return cute.testing.benchmark(
+            compiled,
+            workspace_generator=workspace_generator,
+            workspace_count=workspace_count,
+            stream=stream,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+        )
+
+    if do_autotune:
+        if benchmark_scope_tensors is None or len(benchmark_scope_tensors) == 0:
+            raise ValueError("benchmark_scope_tensors is required when do_autotune=True")
+        if input_key in _INPUT_BEST_CONFIG_CACHE:
+            best_config = _INPUT_BEST_CONFIG_CACHE[input_key]
+            compiled = _compile_kernel_with_config(
+                best_config,
+                a_ptr=a_ptr,
+                b_ptr=b_ptr,
+                sfa_ptr=sfa_ptr,
+                sfb_ptr=sfb_ptr,
+                c_ptr=c_ptr,
+                problem_size=problem_size,
+                stream=stream,
+                epilogue_op=epilogue_op,
+                epilogue_cache_tag=epilogue_cache_tag,
+                out_dtype=out_dtype,
+                accumulate=accumulate,
+                has_swizzle=has_swizzle,
+                arch=arch,
+            )
+            return compiled, best_config, None
+
+        best_time = float("inf")
+        best_config = None
+        best_compiled = None
+
+        for config in tune_search_space:
+            if config.use_2cta_instrs and config.mma_tiler_mn[0] == 128:
+                continue
+            try:
+                compiled = _compile_kernel_with_config(
+                    config,
+                    a_ptr=a_ptr,
+                    b_ptr=b_ptr,
+                    sfa_ptr=sfa_ptr,
+                    sfb_ptr=sfb_ptr,
+                    c_ptr=c_ptr,
+                    problem_size=problem_size,
+                    stream=stream,
+                    epilogue_op=epilogue_op,
+                    epilogue_cache_tag=epilogue_cache_tag,
+                    out_dtype=out_dtype,
+                    accumulate=accumulate,
+                    has_swizzle=has_swizzle,
+                    arch=arch,
+                )
+                elapsed_us = _benchmark(compiled, benchmark_scope_tensors)
+            except Exception:
+                continue
+            if elapsed_us < best_time:
+                best_time = elapsed_us
+                best_config = config
+                best_compiled = compiled
+
+        if best_compiled is None:
+            raise RuntimeError("autotune failed: no valid NVFP4 CuTeDSL kernel config")
+
+        _INPUT_BEST_CONFIG_CACHE[input_key] = best_config
+        return best_compiled, best_config, best_time
+
+    default_config = GemmTuneConfig(
+        mma_tiler_mn=DEFAULT_MMA_TILER_MN,
+        cluster_shape_mnk=DEFAULT_CLUSTER_SHAPE_MNK,
+        use_2cta_instrs=(DEFAULT_MMA_TILER_MN[0] != 128),
+        num_ab_stage=DEFAULT_NUM_AB_STAGE,
+        num_acc_stage=DEFAULT_NUM_ACC_STAGE,
+    )
+    compiled = _compile_kernel_with_config(
+        default_config,
+        a_ptr=a_ptr,
+        b_ptr=b_ptr,
+        sfa_ptr=sfa_ptr,
+        sfb_ptr=sfb_ptr,
+        c_ptr=c_ptr,
+        problem_size=problem_size,
+        stream=stream,
+        epilogue_op=epilogue_op,
+        epilogue_cache_tag=epilogue_cache_tag,
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+        has_swizzle=has_swizzle,
+        arch=arch,
+    )
+    return compiled, default_config, None

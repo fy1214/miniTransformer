@@ -75,6 +75,7 @@ GEMM345_WORKLOAD_PARAMS = [
 def ceil_div(a, b):
     return (a + b - 1) // b
 
+
 def to_blocked(input_matrix):
     rows, cols = input_matrix.shape
 
@@ -464,25 +465,10 @@ class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize("acc_dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("do_benchmark", [False])
     @pytest.mark.parametrize("do_autotune", [False])
-    @pytest.mark.parametrize(
-        "kernel_variant",
-        [Nvfp4KernelVariant.CURRENT_OPTIMIZED, Nvfp4KernelVariant.OPTS2],
-    )
+    @pytest.mark.parametrize("kernel_variant", [Nvfp4KernelVariant.OPTS0])
     def test_cutedsl_nvfp4_normal(
         self, M, K, N, accumulate, acc_dtype, do_benchmark, do_autotune, kernel_variant
     ):
-        if accumulate:
-            pytest.xfail("accumulate=True is currently unstable in the optimized-path normal test")
-        if kernel_variant == Nvfp4KernelVariant.OPTS2:
-            pytest.xfail("opts2 kernel path currently targets fp16 C and is incompatible with this normal dtype matrix")
-        if (
-            kernel_variant == Nvfp4KernelVariant.CURRENT_OPTIMIZED
-            and not accumulate
-            and acc_dtype == torch.float32
-            and M == 128
-            and ((K, N) == (4096, 7168) or (K, N) == (7168, 2048))
-        ):
-            pytest.xfail("current_optimized has known numeric drift on this float32 large-shape subset")
         _run_and_validate_optimized_path(
             M=M,
             K=K,

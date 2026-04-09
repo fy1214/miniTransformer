@@ -10,8 +10,6 @@ import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
 from cutlass.cute.runtime import make_ptr
 from sympy import true
 from cutlass.cute.runtime import make_ptr
-from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.ops.cuteDSL.nvfp4.scale_factor_swizzle import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 from miniTransformer.ops.cuteDSL.nvfp4 import gemm_cute_opts
 
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (

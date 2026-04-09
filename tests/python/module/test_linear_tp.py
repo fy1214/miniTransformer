@@ -246,28 +246,24 @@ class TestLinearTP:
             out_tp = linear_tp(inp_tp, is_first_microbatch=True)
 
         if rank < tp_size:
-            # AllGather TP output shards -> [batch, out_features]
-            if tp_size > 1:
-                out_tp_gathered = torch.empty(
-                    batch_size, out_features, device="cuda", dtype=out_tp.dtype
-                )
-                dist.all_gather_into_tensor(out_tp_gathered, out_tp, group=tp_group)
-            else:
-                out_tp_gathered = out_tp
+            # Column parallel: rank r holds output columns [r*chunk:(r+1)*chunk].
+            # Compare out_tp (local shard) directly against the matching slice of
+            # out_baseline. No AllGather needed — the column order already matches.
+            tp_out = out_features // tp_size
+            baseline_local = out_baseline[:, rank * tp_out:(rank + 1) * tp_out]
 
-            abs_diff = (out_baseline - out_tp_gathered).abs()
-            rel_diff = abs_diff / (out_baseline.abs() + 1e-8)
+            abs_diff = (baseline_local - out_tp).abs()
+            rel_diff = abs_diff / (baseline_local.abs() + 1e-8)
 
             print(f"Rank {rank}:")
             print(f"  Baseline output shape:        {out_baseline.shape}")
             print(f"  TP output shape (local):      {out_tp.shape}")
-            print(f"  TP output shape (gathered):   {out_tp_gathered.shape}")
             print(f"  Max absolute diff:  {abs_diff.max().item():.6e}")
             print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
             print(f"  Max relative diff:  {rel_diff.max().item():.6e}")
 
             torch.testing.assert_close(
-                out_baseline, out_tp_gathered,
+                baseline_local, out_tp,
                 rtol=1e-2, atol=1e-2,
                 msg=f"Column parallel forward mismatch at rank {rank}"
             )
@@ -359,30 +355,28 @@ class TestLinearTP:
             out_tp = linear_tp(inp_tp, is_first_microbatch=True)
 
         if rank < tp_size:
-            # SP=True : output is ReduceScattered -> [batch/tp_size, out_features] per rank
-            #           AllGather to reconstruct [batch, out_features]
-            # SP=False: output is AllReduced -> [batch, out_features] on every rank, no gather needed
+            # SP=True : out_tp is [batch/tp, out_features] (ReduceScattered along dim 0)
+            #           compare against the matching sequence shard of out_baseline
+            # SP=False: out_tp is [batch, out_features] (AllReduced, full)
+            #           compare directly against out_baseline
             if sequence_parallel and tp_size > 1:
-                out_tp_gathered = torch.empty(
-                    batch_size, out_features, device="cuda", dtype=out_tp.dtype
-                )
-                dist.all_gather_into_tensor(out_tp_gathered, out_tp, group=tp_group)
+                chunk_seq = batch_size // tp_size
+                baseline_local = out_baseline[rank * chunk_seq:(rank + 1) * chunk_seq, :]
             else:
-                out_tp_gathered = out_tp
+                baseline_local = out_baseline
 
-            abs_diff = (out_baseline - out_tp_gathered).abs()
-            rel_diff = abs_diff / (out_baseline.abs() + 1e-8)
+            abs_diff = (baseline_local - out_tp).abs()
+            rel_diff = abs_diff / (baseline_local.abs() + 1e-8)
 
             print(f"Rank {rank}:")
             print(f"  Baseline output shape:        {out_baseline.shape}")
             print(f"  TP output shape (local):      {out_tp.shape}")
-            print(f"  TP output shape (gathered):   {out_tp_gathered.shape}")
             print(f"  Max absolute diff:  {abs_diff.max().item():.6e}")
             print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
             print(f"  Max relative diff:  {rel_diff.max().item():.6e}")
 
             torch.testing.assert_close(
-                out_baseline, out_tp_gathered,
+                baseline_local, out_tp,
                 rtol=1e-2, atol=1e-2,
                 msg=f"Row parallel forward mismatch at rank {rank}"
             )

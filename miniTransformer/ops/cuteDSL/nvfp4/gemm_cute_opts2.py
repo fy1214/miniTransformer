@@ -543,7 +543,7 @@ class Sm100BlockScaledDenseGemmKernel:
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
 
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
-        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], epi_tile)
 
         tCsC, tCgC_tma = cute.nvgpu.cpasync.tma_partition(
             tma_atom_c,
@@ -800,7 +800,7 @@ class Sm100BlockScaledDenseGemmKernel:
             tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
             # (T2R, T2R_M, T2R_N)
             tTR_rAcc = cute.make_rmem_tensor(
-                tTR_gC[(None, None, None, 0, 0)].shape, cutlass.Float32
+                tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, cutlass.Float32
             )
             tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 

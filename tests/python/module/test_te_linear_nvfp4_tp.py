@@ -1,8 +1,8 @@
 """
-TE Linear NVFP4 Tensor Parallel (TP) Accuracy Tests
-=====================================================
+TE Linear NVFP4 / MXFP8 Tensor Parallel (TP) Accuracy Tests
+=============================================================
 
-Tests te.Linear with NVFP4 recipe under Tensor Parallel, split into
+Tests te.Linear with NVFP4 and MXFP8 recipes under Tensor Parallel, split into
 individual forward / backward test functions for easy diagnosis.
 
 Test matrix:
@@ -32,16 +32,45 @@ import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
+from transformer_engine.pytorch.quantization import is_mxfp8_available
 
 
 # ==================== Recipe ====================
 
-def make_nvfp4_recipe():
+def make_nvfp4_recipe() -> recipe.NVFP4BlockScaling:
+    """标准 NVFP4 recipe，input/weight/grad 均使用默认 QParams。"""
     r = recipe.NVFP4BlockScaling()
     r.fp4_quant_fwd_inp    = recipe.QParams()
     r.fp4_quant_fwd_weight = recipe.QParams()
     r.fp4_quant_bwd_grad   = recipe.QParams()
     return r
+
+
+def make_mxfp8_recipe(fp8_format: recipe.Format = recipe.Format.E4M3) -> recipe.MXFP8BlockScaling:
+    """
+    标准 MXFP8 recipe。
+
+    MXFP8 采用 block-wise（每 32 个元素共享一个 E8M0 scale）量化策略，
+    不需要像 NVFP4 那样手动配置 QParams，直接实例化即可。
+
+    参数
+    ----
+    fp8_format : recipe.Format
+        FP8 数据格式，支持 Format.E4M3（默认，精度更高）
+        和 Format.HYBRID（前向 E4M3，反向 E5M2，与 DelayedScaling 一致）。
+
+    用法
+    ----
+    mxfp8_recipe = make_mxfp8_recipe()
+    with te.autocast(enabled=True, recipe=mxfp8_recipe):
+        y = linear(x)
+    """
+    return recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+
+
+# 可用性检查（供调用方跳过不支持的测试）
+nvfp4_available, nvfp4_unavail_reason = te.is_nvfp4_available(return_reason=True)
+mxfp8_available, mxfp8_unavail_reason = is_mxfp8_available(return_reason=True)
 
 
 # ==================== Distributed Utilities ====================
@@ -120,23 +149,35 @@ def build_tp(
 # ==================== Weight Shard Copy ====================
 
 def copy_column_shard(linear_tp, linear_baseline, rank, tp_size):
-    """Column parallel: weight[out/tp, in]. Copy row-slice from baseline."""
+    """Column parallel: weight[out/tp, in]. Copy row-slice from baseline.
+
+    Use nn.Parameter replacement to avoid QuantizedTensor cache issues.
+    """
     out_full = linear_baseline.weight.shape[0]
     chunk = out_full // tp_size
-    with torch.no_grad():
-        linear_tp.weight.data.copy_(
-            linear_baseline.weight.data[rank * chunk:(rank + 1) * chunk, :]
-        )
+    shard = linear_baseline.weight.data[rank * chunk:(rank + 1) * chunk, :].contiguous().clone()
+    linear_tp.weight = torch.nn.Parameter(shard)
+    # Sanity check: verify the weight was actually set
+    assert linear_tp.weight.data.norm() > 0, \
+        f"rank={rank} copy_column_shard produced zero weight! " \
+        f"baseline norm={linear_baseline.weight.data.norm():.4e} " \
+        f"shard shape={shard.shape} shard norm={shard.norm():.4e}"
 
 
 def copy_row_shard(linear_tp, linear_baseline, rank, tp_size):
-    """Row parallel: weight[out, in/tp]. Copy col-slice from baseline."""
+    """Row parallel: weight[out, in/tp]. Copy col-slice from baseline.
+
+    Use nn.Parameter replacement to avoid QuantizedTensor cache issues.
+    """
     in_full = linear_baseline.weight.shape[1]
     chunk = in_full // tp_size
-    with torch.no_grad():
-        linear_tp.weight.data.copy_(
-            linear_baseline.weight.data[:, rank * chunk:(rank + 1) * chunk]
-        )
+    shard = linear_baseline.weight.data[:, rank * chunk:(rank + 1) * chunk].contiguous().clone()
+    linear_tp.weight = torch.nn.Parameter(shard)
+    # Sanity check: verify the weight was actually set
+    assert linear_tp.weight.data.norm() > 0, \
+        f"rank={rank} copy_row_shard produced zero weight! " \
+        f"baseline norm={linear_baseline.weight.data.norm():.4e} " \
+        f"shard shape={shard.shape} shard norm={shard.norm():.4e}"
 
 
 # ==================== Shared Setup Helper ====================
@@ -254,6 +295,7 @@ def test_column_parallel_forward(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Column parallel forward: each rank computes output columns [rank*chunk_out:(rank+1)*chunk_out].
@@ -266,7 +308,7 @@ def test_column_parallel_forward(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_column(tp_size, sequence_parallel, in_features, out_features,
                       total_batch, bias, params_dtype, seed, tp_group)
@@ -275,9 +317,9 @@ def test_column_parallel_forward(
     inp_tp = s["inp_tp_data"].clone().requires_grad_(False)
 
     with torch.no_grad():
-        with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        with te.autocast(enabled=True, recipe=active_recipe):
             out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
-        with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        with te.autocast(enabled=True, recipe=active_recipe):
             out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
 
     if rank < tp_size:
@@ -288,6 +330,12 @@ def test_column_parallel_forward(
                                rank * chunk_out:(rank + 1) * chunk_out]
         else:
             ref = out_baseline[:, rank * chunk_out:(rank + 1) * chunk_out]
+
+        # Debug: print weight norm, ref norm, out_tp norm
+        print(f"  [col fwd debug] rank={rank} "
+              f"weight_norm={s['tp_linear'].weight.data.norm():.4e} "
+              f"ref_shape={ref.shape} ref_norm={ref.detach().norm():.4e} "
+              f"out_tp_norm={out_tp.norm():.4e}")
 
         diff = (ref - out_tp).abs()
         print(f"  [col fwd] rank={rank} out_tp={out_tp.shape} "
@@ -303,6 +351,7 @@ def test_column_parallel_backward_dgrad(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Column parallel dgrad: dx = dy * w.
@@ -315,7 +364,7 @@ def test_column_parallel_backward_dgrad(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_column(tp_size, sequence_parallel, in_features, out_features,
                       total_batch, bias, params_dtype, seed, tp_group)
@@ -323,11 +372,11 @@ def test_column_parallel_backward_dgrad(
     inp_baseline = s["inp_full"].clone().requires_grad_(True)
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
     out_baseline.backward(s["grad_baseline"])
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])
 
@@ -352,6 +401,7 @@ def test_column_parallel_backward_wgrad(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Column parallel wgrad: dw = dy^T * x.
@@ -362,7 +412,7 @@ def test_column_parallel_backward_wgrad(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_column(tp_size, sequence_parallel, in_features, out_features,
                       total_batch, bias, params_dtype, seed, tp_group)
@@ -370,11 +420,11 @@ def test_column_parallel_backward_wgrad(
     inp_baseline = s["inp_full"].clone().requires_grad_(True)
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
     out_baseline.backward(s["grad_baseline"])
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])
 
@@ -398,6 +448,7 @@ def test_row_parallel_forward(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Row parallel forward: each rank holds inp[:, in_shard], computes partial GEMM.
@@ -410,7 +461,7 @@ def test_row_parallel_forward(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_row(tp_size, sequence_parallel, in_features, out_features,
                    total_batch, bias, params_dtype, seed, tp_group)
@@ -419,9 +470,9 @@ def test_row_parallel_forward(
     inp_tp = s["inp_tp_data"].clone().requires_grad_(False)
 
     with torch.no_grad():
-        with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        with te.autocast(enabled=True, recipe=active_recipe):
             out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
-        with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        with te.autocast(enabled=True, recipe=active_recipe):
             out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
 
     if rank < tp_size:
@@ -445,6 +496,7 @@ def test_row_parallel_backward_dgrad(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Row parallel dgrad: inp_tp.grad shape [total_batch, in_features/tp].
@@ -453,7 +505,7 @@ def test_row_parallel_backward_dgrad(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_row(tp_size, sequence_parallel, in_features, out_features,
                    total_batch, bias, params_dtype, seed, tp_group)
@@ -461,11 +513,11 @@ def test_row_parallel_backward_dgrad(
     inp_baseline = s["inp_full"].clone().requires_grad_(True)
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
     out_baseline.backward(s["grad_full"])
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])
 
@@ -486,6 +538,7 @@ def test_row_parallel_backward_wgrad(
     batch_size: int = 64, seq_len: int = 32,
     bias: bool = False, params_dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
+    active_recipe=None,
 ):
     """
     Row parallel wgrad: tp_linear.weight.grad shape [out_features, in/tp].
@@ -494,7 +547,7 @@ def test_row_parallel_backward_wgrad(
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
     total_batch = batch_size * seq_len
-    nvfp4_recipe = make_nvfp4_recipe()
+    active_recipe = active_recipe or make_nvfp4_recipe()
 
     s = _setup_row(tp_size, sequence_parallel, in_features, out_features,
                    total_batch, bias, params_dtype, seed, tp_group)
@@ -502,11 +555,11 @@ def test_row_parallel_backward_wgrad(
     inp_baseline = s["inp_full"].clone().requires_grad_(True)
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
     out_baseline.backward(s["grad_full"])
 
-    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+    with te.autocast(enabled=True, recipe=active_recipe):
         out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])
 
@@ -534,13 +587,30 @@ ALL_TESTS = [
 ]
 
 
-def run_tests(tp_size: int = 2, sequence_parallel: bool = True):
+def run_tests(tp_size: int = 2, sequence_parallel: bool = True, recipe_name: str = "nvfp4"):
     rank = dist.get_rank()
+
+    # 选择 recipe
+    if recipe_name == "nvfp4":
+        if not nvfp4_available:
+            if rank == 0:
+                print(f"跳过：NVFP4 不可用（{nvfp4_unavail_reason}）")
+            return
+        active_recipe = make_nvfp4_recipe()
+    elif recipe_name == "mxfp8":
+        if not mxfp8_available:
+            if rank == 0:
+                print(f"跳过：MXFP8 不可用（{mxfp8_unavail_reason}）")
+            return
+        active_recipe = make_mxfp8_recipe()
+    else:
+        raise ValueError(f"未知 recipe：{recipe_name}，支持 nvfp4 / mxfp8")
 
     if rank == 0:
         print("\n" + "=" * 60)
-        print("TE Linear NVFP4 TP Tests")
+        print("TE Linear TP Tests")
         print("=" * 60)
+        print(f"  recipe:            {recipe_name}")
         print(f"  tp_size:           {tp_size}")
         print(f"  sequence_parallel: {sequence_parallel}")
         print("=" * 60)
@@ -549,7 +619,8 @@ def run_tests(tp_size: int = 2, sequence_parallel: bool = True):
         if rank == 0:
             print(f"\n[{i}/{len(ALL_TESTS)}] {name}")
         try:
-            fn(tp_size=tp_size, sequence_parallel=sequence_parallel)
+            fn(tp_size=tp_size, sequence_parallel=sequence_parallel,
+               active_recipe=active_recipe)
             dist.barrier()
         except Exception as e:
             print(f"\n  ✗ FAILED at rank {rank}: {e}")
@@ -567,16 +638,21 @@ if __name__ == "__main__":
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--sp",    dest="sequence_parallel", action="store_true",  default=True)
     parser.add_argument("--no-sp", dest="sequence_parallel", action="store_false")
+    parser.add_argument(
+        "--recipe", choices=["nvfp4", "mxfp8"], default="nvfp4",
+        help="量化 recipe：nvfp4（默认）或 mxfp8"
+    )
     args = parser.parse_args()
 
     if "RANK" not in os.environ:
-        print("ERROR: run with torchrun")
-        print("  torchrun --nproc_per_node=2 test_te_linear_nvfp4_tp.py")
-        print("  torchrun --nproc_per_node=2 test_te_linear_nvfp4_tp.py --no-sp")
+        print("ERROR: 请用 torchrun 启动")
+        print("  torchrun --nproc_per_node=2 test_te_linear_nvfp4_tp.py --recipe nvfp4")
+        print("  torchrun --nproc_per_node=2 test_te_linear_nvfp4_tp.py --recipe mxfp8 --no-sp")
         raise SystemExit(1)
 
     initialize_distributed()
     try:
-        run_tests(tp_size=args.tp_size, sequence_parallel=args.sequence_parallel)
+        run_tests(tp_size=args.tp_size, sequence_parallel=args.sequence_parallel,
+                  recipe_name=args.recipe)
     finally:
         cleanup_distributed()

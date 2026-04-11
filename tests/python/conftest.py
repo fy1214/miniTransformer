@@ -23,3 +23,7 @@ def pytest_configure(config):
     root = _find_project_root()
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
+    config.addinivalue_line(
+        "markers",
+        "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    )

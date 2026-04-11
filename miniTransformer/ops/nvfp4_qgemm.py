@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from typing import Optional
 
-from miniTransformer.ops.cuteDSL.nvfp4.scale_factor_swizzle import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
+from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import cast_from_fp4x2
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
@@ -18,11 +18,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from miniTransformer.ops.triton.gemm_tl import block_scaled_matmul
 from cutlass.cute.runtime import make_ptr
 
-from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
+from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import (
     ab_dtype,
     sf_dtype,
     sf_vec_size,
     get_compiled_nvfp4_gemm,
+    Nvfp4KernelVariant,
 )
 
 def ceil_div(a, b):
@@ -469,10 +470,12 @@ def cutedsl_nvfp4_gemm_optimized(
     alpha,
     out_dtype,
     device,
+    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.OPTS1,
     out=None,
     accumulate=False,
     has_swizzle=True,
     do_benchmark=False,
+    do_autotune=False,
     warmup_iterations=10,
     iterations=100,
     use_cold_l2=False,
@@ -482,14 +485,29 @@ def cutedsl_nvfp4_gemm_optimized(
     alpha_value = float(alpha.item())
     l = 1
     sf_k = ceil_div(K, sf_vec_size)
+    opts_family_variants = {
+        Nvfp4KernelVariant.OPTS2,
+        Nvfp4KernelVariant.OPTS3,
+        Nvfp4KernelVariant.OPTS4,
+        Nvfp4KernelVariant.OPTS5,
+        Nvfp4KernelVariant.OPTS6,
+    }
+    use_host_accumulate = (kernel_variant in opts_family_variants) and accumulate
+    force_fp32_kernel_output = (kernel_variant in opts_family_variants) and (out_dtype == torch.bfloat16)
+    kernel_out_dtype = torch.float32 if force_fp32_kernel_output else out_dtype
 
     a_ref_f4 = qx.view(torch.float4_e2m1fn_x2).to(device)
     b_ref_f4 = qw.view(torch.float4_e2m1fn_x2).to(device)
+    out_tensor_before = None
     if accumulate:
         assert out is not None, "out must be provided when accumulate=True"
-        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype).to(device)
+        if use_host_accumulate:
+            out_tensor_before = out.to(torch.float32).clone()
+            c_tensor = torch.empty((M, N, l), dtype=torch.float32, device=device)
+        else:
+            c_tensor = out.unsqueeze(-1).contiguous().to(kernel_out_dtype).to(device)
     else:
-        c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
+        c_tensor = torch.empty((M, N, l), dtype=kernel_out_dtype, device=device)
 
     def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
         ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn)
@@ -510,7 +528,13 @@ def cutedsl_nvfp4_gemm_optimized(
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
     stream = cutlass_torch.default_stream()
-    compiled, _, _ = get_compiled_nvfp4_gemm(
+    benchmark_scope_tensors = None
+    if do_autotune:
+        benchmark_scope_tensors = [a_ref_f4, b_ref_f4, sfa_tensor, sfb_tensor, c_tensor]
+    c_tensor_initial_for_autotune = None
+    if do_autotune and accumulate:
+        c_tensor_initial_for_autotune = c_tensor.clone()
+    compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
         a_ptr=a_ptr,
         b_ptr=b_ptr,
         sfa_ptr=sfa_ptr,
@@ -520,16 +544,24 @@ def cutedsl_nvfp4_gemm_optimized(
         stream=stream,
         epilogue_op=lambda x: x,
         epilogue_cache_tag=("scale_alpha",),
-        out_dtype=out_dtype,
-        accumulate=accumulate,
+        out_dtype=kernel_out_dtype,
+        kernel_variant=kernel_variant,
+        accumulate=(False if use_host_accumulate else accumulate),
         has_swizzle=has_swizzle,
-        do_autotune=False,
+        do_autotune=do_autotune,
+        benchmark_scope_tensors=benchmark_scope_tensors,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
         use_cold_l2=use_cold_l2,
     )
+    if do_autotune and accumulate and c_tensor_initial_for_autotune is not None:
+        c_tensor.copy_(c_tensor_initial_for_autotune)
 
     if do_benchmark:
+        c_tensor_initial_for_bench = None
+        if accumulate:
+            c_tensor_initial_for_bench = c_tensor.clone()
+
         def generate_tensors():
             args = cute.testing.JitArguments(
                 a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream
@@ -559,6 +591,8 @@ def cutedsl_nvfp4_gemm_optimized(
             warmup_iterations=warmup_iterations,
             iterations=iterations,
         )
+        if accumulate and c_tensor_initial_for_bench is not None:
+            c_tensor.copy_(c_tensor_initial_for_bench)
 
         print(f"CuTeDSL benchmark time: {elapsed_us:.3f} us")
         peta_flops = (4 * M * N * K * l) / (elapsed_us * 1e-6) / 1e9 / 1000000
@@ -575,6 +609,12 @@ def cutedsl_nvfp4_gemm_optimized(
         print(f"CuTeDSL BW: {bandwidth:.3f} GB/s")
 
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
+    if use_host_accumulate:
+        c_out = c_tensor.squeeze(-1).to(torch.float32)
+        if alpha_value != 1.0:
+            c_out = c_out * alpha_value
+        out.copy_((c_out + out_tensor_before).to(out_dtype))
+        return out
     if alpha_value != 1.0:
         c_tensor.mul_(alpha_value)
     return c_tensor.squeeze(-1).float().to(out_dtype)

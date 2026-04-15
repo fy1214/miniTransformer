@@ -277,17 +277,15 @@ class TestLinearTP:
         """
         Test row parallel forward pass accuracy.
 
-        Row parallel splits in_features across TP ranks.
-        Input to each rank is the output shard from the preceding column parallel
-        layer, i.e. a slice along in_features (dim 1).
+        Row parallel 数学等价性：
+          完整 GEMM: output = inp_full @ W_full.T   [m, n]
+          分片 GEMM: output = sum_r(inp_r @ W_r.T)  [m, n]
+            其中 inp_r = inp_full[:, r*k//tp:(r+1)*k//tp]  [m, k//tp]
+                 W_r   = W_full[:, r*k//tp:(r+1)*k//tp]    [n, k//tp]
 
-        SP=True:
-          - After GEMM, ReduceScatter along dim 0 -> each rank holds [batch/tp_size, out_features]
-          - AllGather outputs across ranks -> [batch, out_features]
-
-        SP=False:
-          - After GEMM, AllReduce -> each rank holds full [batch, out_features]
-          - No gather needed for comparison
+        非 SP：AllReduce 后 out_tp = sum，直接与 out_baseline 比较
+        SP   ：ReduceScatter 后 out_tp = [m//tp, n]（sequence shard），
+               与 out_baseline[rank*chunk:(rank+1)*chunk, :] 比较
         """
         print(f"\n{'='*60}")
         print(f"Testing Row Parallel Forward (tp_size={tp_size}, sp={sequence_parallel})")
@@ -326,8 +324,8 @@ class TestLinearTP:
             sequence_parallel=sequence_parallel,
         )
 
-        # linear_baseline.weight is already synced across all ranks.
-        # Each rank copies its own shard directly (no communication needed).
+        # linear_baseline.weight shape: [out_features, in_features]
+        # row parallel splits in_features (dim 1)，linear_tp.weight shape: [out_features, in_features//tp]
         if tp_size > 1:
             chunk_in = in_features // tp_size
             with torch.no_grad():
@@ -336,13 +334,27 @@ class TestLinearTP:
                 )
 
         # Create full input on rank 0, broadcast to all ranks
+        # 使用整数值初始化 x, w ∈ {-1, 0, 1}，乘积和累加均为整数，
+        # bf16 可精确表示，避免浮点累加误差导致 bit-exact 验证失败
         torch.manual_seed(seed)
-        inp_full = torch.randn(batch_size, in_features, device="cuda", dtype=torch.bfloat16)
+        inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
         if tp_size > 1:
             broadcast_tensor(inp_full, tp_group)
 
-        # Row parallel input is always sharded along in_features (dim 1),
-        # regardless of SP. This is the output from the preceding column parallel.
+        # 同样将 weight 初始化为整数值（需要在 sync/copy 之后覆盖）
+        with torch.no_grad():
+            linear_baseline.weight.data.copy_(
+                torch.randint(-1, 2, linear_baseline.weight.shape, device="cuda").to(torch.bfloat16)
+            )
+        if tp_size > 1:
+            sync_linear_weight(linear_baseline, tp_group)
+            chunk_in = in_features // tp_size
+            linear_tp.weight.data.copy_(
+                linear_baseline.weight.data[:, rank * chunk_in:(rank + 1) * chunk_in]
+            )
+
+        # Row parallel: 每个 rank 输入是 inp_full 的 in_features 切片 [m, k//tp]
+        # 注意：无论 SP 是否开启，row parallel 的输入切分方式都是按 in_features 维度
         if tp_size > 1:
             chunk_in = in_features // tp_size
             inp_tp = inp_full[:, rank * chunk_in:(rank + 1) * chunk_in].contiguous()
@@ -351,14 +363,15 @@ class TestLinearTP:
 
         # Forward
         with torch.no_grad():
+            # baseline: inp_full [m, k] @ W_full.T [k, n] = [m, n]
             out_baseline = linear_baseline(inp_full, is_first_microbatch=True)
+            # tp: inp_tp [m, k//tp] @ W_r.T [k//tp, n] -> AllReduce -> [m, n]
+            #  or ReduceScatter -> [m//tp, n] if SP
             out_tp = linear_tp(inp_tp, is_first_microbatch=True)
 
         if rank < tp_size:
-            # SP=True : out_tp is [batch/tp, out_features] (ReduceScattered along dim 0)
-            #           compare against the matching sequence shard of out_baseline
-            # SP=False: out_tp is [batch, out_features] (AllReduced, full)
-            #           compare directly against out_baseline
+            # 非 SP：out_tp = AllReduce(sum of partial GEMMs) = [m, n]，与 out_baseline 直接比
+            # SP   ：out_tp = ReduceScatter -> [m//tp, n]，与 out_baseline[rank_seq_shard] 比
             if sequence_parallel and tp_size > 1:
                 chunk_seq = batch_size // tp_size
                 baseline_local = out_baseline[rank * chunk_seq:(rank + 1) * chunk_seq, :]
@@ -366,18 +379,18 @@ class TestLinearTP:
                 baseline_local = out_baseline
 
             abs_diff = (baseline_local - out_tp).abs()
-            rel_diff = abs_diff / (baseline_local.abs() + 1e-8)
 
             print(f"Rank {rank}:")
+            print(f"  inp_full shape:               {inp_full.shape}")
+            print(f"  inp_tp shape (this rank):     {inp_tp.shape}")
             print(f"  Baseline output shape:        {out_baseline.shape}")
             print(f"  TP output shape (local):      {out_tp.shape}")
             print(f"  Max absolute diff:  {abs_diff.max().item():.6e}")
             print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
-            print(f"  Max relative diff:  {rel_diff.max().item():.6e}")
 
             torch.testing.assert_close(
                 baseline_local, out_tp,
-                rtol=1e-2, atol=1e-2,
+                rtol=0, atol=0,
                 msg=f"Row parallel forward mismatch at rank {rank}"
             )
             print(f"✓ Row parallel forward pass accuracy verified!")
@@ -390,15 +403,21 @@ class TestLinearTP:
         """
         Test column parallel backward pass gradient accuracy.
 
-        SP=True:
-          - inp_tp is a sequence shard [batch/tp_size, in_features]
-          - dgrad is ReduceScattered -> [batch/tp_size, in_features] per rank
-          - Compare inp_tp.grad against corresponding shard of inp_baseline.grad
+        Column parallel backward 数学等价性：
 
-        SP=False:
-          - inp_tp is the full input [batch, in_features]
-          - dgrad is AllReduced -> [batch, in_features] on every rank
-          - Compare inp_tp.grad directly against inp_baseline.grad
+        dgrad（dx = dy * W_full.T）：
+          tp=1: dx = dy_full * W_full.T              [m, k]
+          tp=2: dx_r = dy_r * W_r.T, AllReduce -> dx [m, k]
+          非 SP: dx_tp == dx_baseline
+          SP  : dx_tp == dx_baseline[seq_shard, :]
+
+        wgrad（dw_r = dy_r.T * x_full）：
+          tp=1: dw = dy_full.T * x_full              [n, k]
+          tp=2: dw_r = dy_r.T * x_full               [n//tp, k]
+          比较: dw_tp == dw_baseline[col_shard, :]
+
+        使用整数初始化（x, w ∈ {-1,0,1}，dy=ones），所有梯度均为整数，
+        bf16 精确表示，bit-exact 验证。
         """
         print(f"\n{'='*60}")
         print(f"Testing Column Parallel Backward (tp_size={tp_size}, sp={sequence_parallel})")
@@ -412,7 +431,7 @@ class TestLinearTP:
         tp_group = create_tp_group(tp_size) if tp_size > 1 else None
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        # Build baseline
+        # Build baseline (tp=1, sp=False)
         linear_baseline = self.build_linear(
             in_features, out_features,
             parallel_mode='column',
@@ -422,7 +441,6 @@ class TestLinearTP:
             seed=seed,
             sequence_parallel=False,
         )
-        # Ensure all ranks have identical baseline weight (rank 0 is authoritative)
         if tp_size > 1:
             sync_linear_weight(linear_baseline, tp_group)
         linear_baseline.weight.main_grad = torch.zeros_like(
@@ -443,21 +461,24 @@ class TestLinearTP:
             linear_tp.weight.data, dtype=torch.float32
         )
 
-        # linear_baseline.weight is already synced across all ranks.
-        # Each rank copies its own shard directly (no communication needed).
+        # 整数初始化 weight（x,w ∈ {-1,0,1}），bit-exact 验证
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            linear_baseline.weight.data.copy_(
+                torch.randint(-1, 2, linear_baseline.weight.shape, device="cuda").to(torch.bfloat16)
+            )
         if tp_size > 1:
+            sync_linear_weight(linear_baseline, tp_group)
             chunk_out = out_features // tp_size
-            with torch.no_grad():
-                linear_tp.weight.data.copy_(
-                    linear_baseline.weight.data[rank * chunk_out:(rank + 1) * chunk_out, :]
-                )
+            linear_tp.weight.data.copy_(
+                linear_baseline.weight.data[rank * chunk_out:(rank + 1) * chunk_out, :]
+            )
             linear_tp.weight.main_grad = torch.zeros_like(
                 linear_tp.weight.data, dtype=torch.float32
             )
 
-        # Create full input on rank 0, broadcast to all ranks
-        torch.manual_seed(seed)
-        inp_full = torch.randn(batch_size, in_features, device="cuda", dtype=torch.bfloat16)
+        # 整数初始化 input，broadcast 保证一致
+        inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
         if tp_size > 1:
             broadcast_tensor(inp_full, tp_group)
 
@@ -471,18 +492,36 @@ class TestLinearTP:
         else:
             inp_tp = inp_full.clone().requires_grad_(True)
 
+        # 显式初始化 dy（整数值），broadcast 保证两边一致
+        # dy_full shape: [batch, out_features]，与 baseline output shape 一致
+        dy_full = torch.randint(-1, 2, (batch_size, out_features), device="cuda").to(torch.bfloat16)
+        if tp_size > 1:
+            broadcast_tensor(dy_full, tp_group)
+
+        # baseline dy: 完整 [batch, out_features]
+        # tp dy: 对应 out_features 列切片（column parallel 每个 rank 只输出自己的列分片）
+        #   非SP: out_tp shape [batch, out//tp]       -> dy_tp = dy_full[:, col_shard]
+        #   SP  : out_tp shape [batch//tp, out//tp]   -> dy_tp = dy_full[seq_shard, col_shard]
+        chunk_out = out_features // tp_size
+        if sequence_parallel and tp_size > 1:
+            chunk_seq = batch_size // tp_size
+            dy_tp = dy_full[rank * chunk_seq:(rank + 1) * chunk_seq,
+                            rank * chunk_out:(rank + 1) * chunk_out].contiguous()
+        else:
+            dy_tp = dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
+
         # Forward + backward
         out_baseline = linear_baseline(inp_baseline, is_first_microbatch=True)
-        out_tp = linear_tp(inp_tp, is_first_microbatch=True)
+        out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
 
-        out_baseline.sum().backward()
-        out_tp.sum().backward()
+        out_baseline.backward(dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous())
+        out_tp.backward(dy_tp)
 
         if rank < tp_size:
-            # --- Input gradient comparison ---
+            chunk_out = out_features // tp_size
+
+            # --- dgrad 验证 ---
             if inp_baseline.grad is not None and inp_tp.grad is not None:
-                # SP=True : dgrad is RS -> [batch/tp_size, in_features]; compare with shard of baseline grad
-                # SP=False: dgrad is AR -> [batch, in_features]; compare directly
                 if sequence_parallel and tp_size > 1:
                     chunk_seq = batch_size // tp_size
                     baseline_dgrad = inp_baseline.grad[rank * chunk_seq:(rank + 1) * chunk_seq, :]
@@ -490,50 +529,206 @@ class TestLinearTP:
                     baseline_dgrad = inp_baseline.grad
 
                 abs_diff = (baseline_dgrad - inp_tp.grad).abs()
-                rel_diff = abs_diff / (baseline_dgrad.abs() + 1e-8)
-
-                print(f"Rank {rank} - Input Gradient:")
-                print(f"  Max absolute diff:  {abs_diff.max().item():.6e}")
-                print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
-                print(f"  Max relative diff:  {rel_diff.max().item():.6e}")
+                print(f"Rank {rank} - dgrad:")
+                print(f"  baseline_dgrad shape: {baseline_dgrad.shape}")
+                print(f"  inp_tp.grad shape:    {inp_tp.grad.shape}")
+                print(f"  Max absolute diff:    {abs_diff.max().item():.6e}")
+                print(f"  Mean absolute diff:   {abs_diff.mean().item():.6e}")
 
                 torch.testing.assert_close(
                     baseline_dgrad, inp_tp.grad,
-                    rtol=1e-2, atol=1e-2,
-                    msg=f"Column parallel input gradient mismatch at rank {rank}"
+                    rtol=0, atol=0,
+                    msg=f"Column parallel dgrad mismatch at rank {rank}"
                 )
 
-            # --- Weight gradient comparison ---
-            # Column parallel weight shard is [out_features/tp_size, in_features].
-            # Compare against the corresponding row-slice of baseline weight grad.
+            # --- wgrad 验证 ---
             if linear_baseline.weight.main_grad is not None and linear_tp.weight.main_grad is not None:
-                if tp_size > 1:
-                    chunk_out = out_features // tp_size
-                    baseline_wgrad = linear_baseline.weight.main_grad[
-                        rank * chunk_out:(rank + 1) * chunk_out, :
-                    ]
-                else:
-                    baseline_wgrad = linear_baseline.weight.main_grad
-
+                baseline_wgrad = linear_baseline.weight.main_grad[
+                    rank * chunk_out:(rank + 1) * chunk_out, :
+                ]
                 abs_diff = (baseline_wgrad - linear_tp.weight.main_grad).abs()
-                rel_diff = abs_diff / (baseline_wgrad.abs() + 1e-8)
-
-                print(f"Rank {rank} - Weight Gradient:")
-                print(f"  Max absolute diff:  {abs_diff.max().item():.6e}")
-                print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
+                print(f"Rank {rank} - wgrad:")
+                print(f"  baseline_wgrad shape: {baseline_wgrad.shape}")
+                print(f"  tp wgrad shape:       {linear_tp.weight.main_grad.shape}")
+                print(f"  Max absolute diff:    {abs_diff.max().item():.6e}")
+                print(f"  Mean absolute diff:   {abs_diff.mean().item():.6e}")
 
                 torch.testing.assert_close(
                     baseline_wgrad, linear_tp.weight.main_grad,
-                    rtol=1e-2, atol=1e-2,
-                    msg=f"Column parallel weight gradient mismatch at rank {rank}"
+                    rtol=0, atol=0,
+                    msg=f"Column parallel wgrad mismatch at rank {rank}"
                 )
 
             print(f"✓ Column parallel backward pass accuracy verified!")
 
         print(f"{'='*60}\n")
 
+    def test_row_parallel_backward(
+        self, qparam: QuantizeRecipe, tp_size: int = 2, sequence_parallel: bool = True
+    ):
+        """
+        Test row parallel backward pass gradient accuracy.
 
-# ==================== Main Test Runner ====================
+        Row parallel backward 数学等价性：
+
+        dgrad（dx_r = dy * W_r.T）：
+          tp=1: dx = dy_full * W_full.T              [m, k]
+          tp=2: dx_r = dy_full * W_r.T               [m, k//tp]
+          比较: dx_tp == dx_baseline[:, in_shard]
+          （row parallel dgrad 不需要通信，每个 rank 直接算自己的 in_features 分片）
+
+        wgrad（dw_r = dy.T * x_r）：
+          tp=1: dw = dy_full.T * x_full              [n, k]
+          tp=2: dw_r = dy_full.T * x_r               [n, k//tp]
+          SP  : dy 先 AllGather 再算 wgrad
+          比较: dw_tp == dw_baseline[:, in_shard]
+
+        使用整数初始化（x, w ∈ {-1,0,1}，dy=ones），所有梯度均为整数，
+        bf16 精确表示，bit-exact 验证。
+        """
+        print(f"\n{'='*60}")
+        print(f"Testing Row Parallel Backward (tp_size={tp_size}, sp={sequence_parallel})")
+        print(f"{'='*60}")
+
+        in_features = 4096
+        out_features = 4096
+        batch_size = 1024
+        seed = 42
+
+        tp_group = create_tp_group(tp_size) if tp_size > 1 else None
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Build baseline (tp=1, sp=False)
+        linear_baseline = self.build_linear(
+            in_features, out_features,
+            parallel_mode='row',
+            tp_size=1,
+            tp_group=None,
+            qparam=qparam,
+            seed=seed,
+            sequence_parallel=False,
+        )
+        if tp_size > 1:
+            sync_linear_weight(linear_baseline, tp_group)
+        linear_baseline.weight.main_grad = torch.zeros_like(
+            linear_baseline.weight.data, dtype=torch.float32
+        )
+
+        # Build TP version
+        linear_tp = self.build_linear(
+            in_features, out_features,
+            parallel_mode='row',
+            tp_size=tp_size,
+            tp_group=tp_group,
+            qparam=qparam,
+            seed=seed,
+            sequence_parallel=sequence_parallel,
+        )
+        linear_tp.weight.main_grad = torch.zeros_like(
+            linear_tp.weight.data, dtype=torch.float32
+        )
+
+        # 整数初始化 weight（{-1,0,1}），bit-exact 验证
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            linear_baseline.weight.data.copy_(
+                torch.randint(-1, 2, linear_baseline.weight.shape, device="cuda").to(torch.bfloat16)
+            )
+        if tp_size > 1:
+            sync_linear_weight(linear_baseline, tp_group)
+            chunk_in = in_features // tp_size
+            linear_tp.weight.data.copy_(
+                linear_baseline.weight.data[:, rank * chunk_in:(rank + 1) * chunk_in]
+            )
+            linear_tp.weight.main_grad = torch.zeros_like(
+                linear_tp.weight.data, dtype=torch.float32
+            )
+
+        # 整数初始化 input，broadcast 保证一致
+        inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
+        if tp_size > 1:
+            broadcast_tensor(inp_full, tp_group)
+
+        inp_baseline = inp_full.clone().requires_grad_(True)
+
+        # row parallel input: 按 in_features 维度切分 [m, k//tp]
+        if tp_size > 1:
+            chunk_in = in_features // tp_size
+            inp_tp = inp_full[:, rank * chunk_in:(rank + 1) * chunk_in].contiguous().requires_grad_(True)
+        else:
+            inp_tp = inp_full.clone().requires_grad_(True)
+
+        # 显式初始化 dy（整数值），broadcast 保证两边一致
+        # dy_full shape: [batch, out_features]，与 baseline output shape 一致
+        dy_full = torch.randint(-1, 2, (batch_size, out_features), device="cuda").to(torch.bfloat16)
+        if tp_size > 1:
+            broadcast_tensor(dy_full, tp_group)
+
+        # baseline dy: 完整 [batch, out_features]
+        # tp dy: row parallel 输出经过 AllReduce/ReduceScatter
+        #   非SP: out_tp shape [batch, out_features]（AllReduce全量）  -> dy_tp = dy_full
+        #   SP  : out_tp shape [batch//tp, out_features]（ReduceScatter）-> dy_tp = dy_full[seq_shard, :]
+        if sequence_parallel and tp_size > 1:
+            chunk_seq = batch_size // tp_size
+            dy_tp = dy_full[rank * chunk_seq:(rank + 1) * chunk_seq, :].contiguous()
+        else:
+            dy_tp = dy_full.contiguous()
+
+        # Forward + backward
+        # baseline: inp_full [m, k] @ W_full.T [k, n] -> AllReduce -> [m, n]
+        # tp:       inp_tp   [m, k//tp] @ W_r.T [k//tp, n] -> AllReduce/RS -> output
+        out_baseline = linear_baseline(inp_baseline, is_first_microbatch=True)
+        out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
+
+        out_baseline.backward(dy_full)
+        out_tp.backward(dy_tp)
+
+        if rank < tp_size:
+            chunk_in = in_features // tp_size
+
+            # --- dgrad 验证 ---
+            # row parallel dgrad: dx_r = dy * W_r.T，shape [m, k//tp]
+            # 与 baseline dgrad 的对应 in_features 列切片比较
+            if inp_baseline.grad is not None and inp_tp.grad is not None:
+                baseline_dgrad = inp_baseline.grad[:, rank * chunk_in:(rank + 1) * chunk_in]
+
+                abs_diff = (baseline_dgrad - inp_tp.grad).abs()
+                print(f"Rank {rank} - dgrad:")
+                print(f"  baseline_dgrad[:, in_shard] shape: {baseline_dgrad.shape}")
+                print(f"  inp_tp.grad shape:                 {inp_tp.grad.shape}")
+                print(f"  Max absolute diff:                 {abs_diff.max().item():.6e}")
+                print(f"  Mean absolute diff:                {abs_diff.mean().item():.6e}")
+
+                torch.testing.assert_close(
+                    baseline_dgrad, inp_tp.grad,
+                    rtol=0, atol=0,
+                    msg=f"Row parallel dgrad mismatch at rank {rank}"
+                )
+
+            # --- wgrad 验证 ---
+            # row parallel wgrad: dw_r = dy.T * x_r，shape [n, k//tp]
+            # 与 baseline wgrad 的对应 in_features 列切片比较
+            if linear_baseline.weight.main_grad is not None and linear_tp.weight.main_grad is not None:
+                baseline_wgrad = linear_baseline.weight.main_grad[
+                    :, rank * chunk_in:(rank + 1) * chunk_in
+                ]
+
+                abs_diff = (baseline_wgrad - linear_tp.weight.main_grad).abs()
+                print(f"Rank {rank} - wgrad:")
+                print(f"  baseline_wgrad[:, in_shard] shape: {baseline_wgrad.shape}")
+                print(f"  tp wgrad shape:                    {linear_tp.weight.main_grad.shape}")
+                print(f"  Max absolute diff:                 {abs_diff.max().item():.6e}")
+                print(f"  Mean absolute diff:                {abs_diff.mean().item():.6e}")
+
+                torch.testing.assert_close(
+                    baseline_wgrad, linear_tp.weight.main_grad,
+                    rtol=0, atol=0,
+                    msg=f"Row parallel wgrad mismatch at rank {rank}"
+                )
+
+            print(f"✓ Row parallel backward pass accuracy verified!")
+
+        print(f"{'='*60}\n")
 
 def run_tp_tests(qparam_id: int = 5, tp_size: int = 2, sequence_parallel: bool = True):
     """
@@ -574,6 +769,9 @@ def run_tp_tests(qparam_id: int = 5, tp_size: int = 2, sequence_parallel: bool =
 
         # Test 3: Column parallel backward
         test.test_column_parallel_backward(qparam, tp_size, sequence_parallel)
+
+        # Test 4: Row parallel backward
+        test.test_row_parallel_backward(qparam, tp_size, sequence_parallel)
 
         if rank == 0:
             print("\n" + "="*60)

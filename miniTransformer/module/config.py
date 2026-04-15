@@ -5,6 +5,7 @@ import os
 import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
+from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
@@ -92,6 +93,7 @@ class QuantizeRecipe(enum.Enum):
 
     # Non-quantize
     NON_QUANTIZE = "non_quantize"
+    BF16_REF = "bf16_ref"
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
     FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
     FP4_SUB_CHANNEL_QUARTET = "fp4_subchannel_scaling_quartet"
@@ -103,6 +105,8 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     if recipe == QuantizeRecipe.NON_QUANTIZE:
         # Non-quantize (bf16)
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
+    elif recipe == QuantizeRecipe.BF16_REF:
+        return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
         return QLinearParams(
             quantize=True,

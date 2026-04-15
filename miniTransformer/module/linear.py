@@ -11,7 +11,7 @@ from miniTransformer.distributed.distributed import (
     get_distributed_rank,
     gather_along_first_dim,
     reduce_scatter_along_first_dim,
-    set_tensor_model_parallel_attributes,
+    set_tensor_model_parallel_attributes, get_distributed_world_size,
 )
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils.env import should_keep_backward_in_bf16
@@ -425,8 +425,8 @@ class _QuantizedLinear(torch.autograd.Function):
 
         # GEMM dgrad
         if ctx.disable_backward_quant:
-            dq_w = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
-            dgrad = dy @ dq_w
+            dq_w_t = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
+            dgrad = dy @ dq_w_t
         else:
             dgrad = ctx.quantize_op.qgemm(
                 qdy,
@@ -468,8 +468,8 @@ class _QuantizedLinear(torch.autograd.Function):
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
         if ctx.disable_backward_quant:
-            dq_x = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
-            wgrad = dy.T @ dq_x
+            dq_x_t = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
+            wgrad = dy.T @ dq_x_t
             if accumulate_wgrad_into_param_main_grad:
                 if ctx.fuse_wgrad_accumulation:
                     w.main_grad.add_(wgrad)

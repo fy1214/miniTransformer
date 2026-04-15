@@ -498,21 +498,16 @@ class TestLinearTP:
         if tp_size > 1:
             broadcast_tensor(dy_full, tp_group)
 
-        # column parallel 每个 rank 只输出自己的 out_features 列分片：
-        #   非SP: out_tp shape [batch, out//tp]
-        #   SP  : out_tp shape [batch//tp, out//tp]
-        # tp dy 取对应切片：
+        # column parallel 输出形状分析：
+        #   forward 内部：AllGather input → GEMM → 输出 [batch, out//tp]
+        #   无论 SP 是否开启，column parallel 的输出都是 [batch, out//tp]
+        #   （SP 影响的是 input 的处理，不影响 output shape）
+        # 所以 dy_tp 始终是 dy_full 的 col_shard：[batch, out//tp]
         chunk_out = out_features // tp_size
-        if sequence_parallel and tp_size > 1:
-            chunk_seq = batch_size // tp_size
-            dy_tp = dy_full[rank * chunk_seq:(rank + 1) * chunk_seq,
-                            rank * chunk_out:(rank + 1) * chunk_out].contiguous()
-        else:
-            dy_tp = dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
+        dy_tp = dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
 
-        # baseline output shape: [batch, out_features]，必须传完整 dy_full
-        # 但为了让 baseline dgrad 与 tp dgrad 可比，
-        # baseline 也只用 col_shard 那一列的 dy（其余列置 0）
+        # baseline output shape: [batch, out_features]
+        # 只激活 col_shard 对应的 dy，其余置 0，保证与 tp dgrad 可比
         dy_baseline = torch.zeros_like(dy_full)
         dy_baseline[:, rank * chunk_out:(rank + 1) * chunk_out] = \
             dy_full[:, rank * chunk_out:(rank + 1) * chunk_out]

@@ -747,6 +747,7 @@ def run_tp_tests(qparam_id: int = 5, tp_size: int = 2, sequence_parallel: bool =
         3: QuantizeRecipe.FP4_SUB_CHANNEL_REF,
         4: QuantizeRecipe.FP4_SUB_CHANNEL,
         5: QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET,
+        6: QuantizeRecipe.BF16_REF
     }
     qparam = qparam_map[qparam_id]
 
@@ -799,9 +800,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--qparam",
         type=int,
-        choices=[1, 2, 3, 4, 5],
-        default=5,
-        help="Quantization recipe: 1=NON, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET (default: 5)"
+        choices=[1, 2, 3, 4, 5, 6],
+        default=1,
+        help="Quantization recipe: 1=NON, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=BF16_REF"
     )
 
     parser.add_argument(

@@ -293,10 +293,20 @@ def test_column_parallel_backward_dgrad(
     """
     Column parallel dgrad 通信正确性验证（bit-exact）。
 
-    SP=True : dgrad ReduceScattered → inp_tp.grad [total_batch//tp, in]
-              compare vs inp_baseline.grad[seq_shard, :]
-    SP=False: dgrad AllReduced → inp_tp.grad [total_batch, in]
-              compare vs inp_baseline.grad
+    数学等价性：
+      tp=1: dx = dy_full * W_full.T           [total_batch, in]
+      tp=2: dx = sum_r(dy_r * W_r.T)         [total_batch, in]
+            AllReduce 后每个 rank 得到完整 dx
+
+    验证：
+      baseline 用完整 dy_full backward → inp_baseline.grad [total_batch, in]
+      tp 用 dy_r（col_shard）backward → AllReduce 后 inp_tp.grad [total_batch, in]
+      两者相等
+
+    SP=True : inp_tp.grad 是 ReduceScatter 后的 seq shard [total_batch//tp, in]
+              比较 inp_tp.grad vs inp_baseline.grad[seq_shard, :]
+    SP=False: inp_tp.grad 是 AllReduce 后的完整 [total_batch, in]
+              比较 inp_tp.grad vs inp_baseline.grad
     """
     tp_group = create_tp_group(tp_size) if tp_size > 1 else None
     rank = dist.get_rank()
@@ -308,13 +318,19 @@ def test_column_parallel_backward_dgrad(
     inp_baseline = s["inp_full"].clone().requires_grad_(True)
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
+    # baseline: 用完整 grad_full backward（dy 包含所有列）
     out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
-    out_baseline.backward(s["grad_baseline"])
+    out_baseline.backward(s["grad_full"])
 
+    # tp: 用 grad_tp（col_shard）backward，内部做 AllReduce/ReduceScatter
     out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])
 
     if rank < tp_size and inp_baseline.grad is not None and inp_tp.grad is not None:
+        # SP=True : tp dgrad 经 ReduceScatter → [total_batch//tp, in]
+        #           比较 baseline dgrad 对应 seq shard
+        # SP=False: tp dgrad 经 AllReduce → [total_batch, in]
+        #           直接比较
         if sequence_parallel and tp_size > 1:
             chunk_seq = total_batch // tp_size
             ref = inp_baseline.grad[rank * chunk_seq:(rank + 1) * chunk_seq, :]
@@ -353,7 +369,7 @@ def test_column_parallel_backward_wgrad(
     inp_tp = s["inp_tp_data"].clone().requires_grad_(True)
 
     out_baseline = s["baseline"](inp_baseline, is_first_microbatch=True)
-    out_baseline.backward(s["grad_baseline"])
+    out_baseline.backward(s["grad_full"])
 
     out_tp = s["tp_linear"](inp_tp, is_first_microbatch=True)
     out_tp.backward(s["grad_tp"])

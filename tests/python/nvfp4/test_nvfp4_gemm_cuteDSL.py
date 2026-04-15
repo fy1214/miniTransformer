@@ -1,18 +1,6 @@
-from re import X
-import time
-import sys
-from pathlib import Path
 import pytest
 import torch
-
-import cutlass
-import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
-
-from cutlass.cute.runtime import make_ptr
-
-from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts0 import ab_dtype, sf_dtype, sf_vec_size
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import Nvfp4KernelVariant
 
 def ceil_div(a, b):
@@ -56,7 +44,7 @@ GEMM_WORKLOAD_PARAMS_BASE = [
 ]
 
 GEMM_WORKLOAD_PARAMS_NORMAL = GEMM_WORKLOAD_PARAMS_BASE + DEEPGEMM_NORMAL_ONLY_PARAMS
-GEMM_WORKLOAD_PARAMS_OPTIMIZED = GEMM_WORKLOAD_PARAMS_BASE
+GEMM_WORKLOAD_PARAMS_OPTIMIZED = GEMM_WORKLOAD_PARAMS_NORMAL
 
 
 def ref_kernel(
@@ -111,7 +99,10 @@ def make_match_reference(
     do_benchmark,
     do_autotune,
     kernel_variant: Nvfp4KernelVariant,
+    use_clc_dynamic_scheduler: bool = False,
     device="cuda",
+    auto_kernel_variant: bool = False,
+    return_dispatch_info: bool = False,
 ):
     seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
     out_init = torch.randn((M, N), dtype=out_dtype, device=device) if accumulate else None
@@ -142,12 +133,19 @@ def make_match_reference(
         out=out_init_dsl,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
+        use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+        auto_kernel_variant=auto_kernel_variant,
+        return_dispatch_info=return_dispatch_info,
         do_benchmark=do_benchmark,
         do_autotune=do_autotune,
         warmup_iterations=10,
         iterations=100,
-        use_cold_l2=False,
+        use_cold_l2=False
     )
+    dispatch_info = None
+    if return_dispatch_info:
+        d_cute, dispatch_info = d_cute
+        print(dispatch_info)
 
     assert d_cute.shape == (M, N)
     assert d_cute.dtype == out_dtype
@@ -164,6 +162,8 @@ def make_match_reference(
         atol=1e-6,
         msg=f"CuTeDSL NVFP4 GEMM mismatch for M={M}, K={K}, N={N}, seed={seed}, accumulate={accumulate}",
     )
+    if return_dispatch_info:
+        return dispatch_info
 
 class TestCuTeDSLNvfp4Gemm:
  
@@ -179,9 +179,6 @@ class TestCuTeDSLNvfp4Gemm:
             Nvfp4KernelVariant.OPTS1,
             Nvfp4KernelVariant.OPTS2,
             Nvfp4KernelVariant.OPTS3,
-            Nvfp4KernelVariant.OPTS4,
-            Nvfp4KernelVariant.OPTS5,
-            Nvfp4KernelVariant.OPTS6,
         ],
     )
     def test_cutedsl_nvfp4_all_kernels(
@@ -205,7 +202,7 @@ class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize("has_swizzle", [False])
     @pytest.mark.parametrize("do_benchmark", [True])
     @pytest.mark.parametrize("do_autotune", [False])
-    @pytest.mark.parametrize("kernel_variant", [Nvfp4KernelVariant.OPTS2])
+    @pytest.mark.parametrize("kernel_variant", [None])
     def test_cutedsl_nvfp4_current_kernels(
         self, M, K, N, accumulate, acc_dtype, has_swizzle, do_benchmark, do_autotune, kernel_variant
     ):
@@ -219,6 +216,8 @@ class TestCuTeDSLNvfp4Gemm:
             do_benchmark=do_benchmark,
             do_autotune=do_autotune,
             kernel_variant=kernel_variant,
+            auto_kernel_variant=True,
+            return_dispatch_info=True,
         )
 
 

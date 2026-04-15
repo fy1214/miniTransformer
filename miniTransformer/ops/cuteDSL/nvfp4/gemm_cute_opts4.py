@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# NVFP4 variant of fp16_gemm_3_1.py: CLC dynamic persistent tile scheduling plus
+# NVFP4 variant of fp16_gemm_3.py: static persistent tile scheduling (no CLC) plus
 # warp-specialized TMA / MMA / epilogue. C is written with SIMT stores like
 # nvfp4_gemm_2.py (no TMA S2G for batched NVFP4 C layouts).
 
@@ -54,7 +54,6 @@ if __name__ == "__main__":
     if examples_dir not in sys.path:
         sys.path.insert(0, examples_dir)
 
-
 mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
@@ -65,22 +64,12 @@ cluster_shape_mnk = (2, 1, 1)
 
 ab_stages = 5
 acc_stages = 1
-num_clc_stage = 1
-num_clc_response_bytes = 16
 
-use_clc_dynamic_scheduler = True
-scheduler_type = utils.ClcDynamicPersistentTileScheduler
-
-"""
-NVFP4 block-scaled GEMM with CLC dynamic persistent scheduling (fp16_gemm_3_1
-structure) and NVFP4 warp-specialized mainloop (nvfp4_gemm_2). Epilogue is SIMT.
-
-Constraints match nvfp4_gemm_2. The CLC scheduler grid includes the batch
-dimension (one tile per batch index, same as the static nvfp4_gemm_2 launch).
-"""
+scheduler_type = utils.StaticPersistentTileScheduler
 
 
-class Sm100BlockScaledDenseGemm3_1Kernel:
+# Warp specialization + Static persistent tile scheduler
+class Sm100BlockScaledDenseGemm4Kernel:
     def __init__(self):
         self.num_tmem_alloc_cols = 512
 
@@ -94,6 +83,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
         c_ptr: cute.Pointer,
         problem_size: tuple,
         stream: cuda.CUstream,
+        max_active_clusters: cutlass.Constexpr,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         accumulate: cutlass.Constexpr = False,
     ):
@@ -283,7 +273,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
 
         # Batched C is 3D; avoid zipped_divide on c_tensor. Match nvfp4_gemm_2 grid:
         # ceil_div(shape, (cta_m, cta_n, 1)) => L dimension has one CTA tile per batch index.
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+        tile_sched_params = utils.PersistentTileSchedulerParams(
             (
                 cute.ceil_div(m, self.cta_tile_shape_mnk[0]),
                 cute.ceil_div(n, self.cta_tile_shape_mnk[1]),
@@ -291,8 +281,8 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             ),
             cluster_shape_mnk,
         )
-        grid_shape = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
-            tile_sched_params
+        grid_shape = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, max_active_clusters
         )
 
         self.kernel(
@@ -318,7 +308,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             accumulate,
         ).launch(
             grid=grid_shape,
-            block=[224, 1, 1],
+            block=[192, 1, 1],
             cluster=cluster_shape_mnk,
             stream=stream,
         )
@@ -344,7 +334,7 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
         sfb_smem_layout_staged: cute.Layout,
         cta_layout_vmnk: cute.Layout,
         cta_layout_sfb_vmnk: cute.Layout,
-        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         accumulate: cutlass.Constexpr,
     ):
@@ -356,7 +346,6 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
         epilogue_warp_ids = (0, 1, 2, 3)
         mma_warp_id = 4
         tma_warp_id = 5
-        sched_warp_id = 6
 
         tmem_alloc_sync_bar_id = 2
 
@@ -375,8 +364,6 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, acc_stages * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
-            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-            clc_response: cute.struct.MemRange[cutlass.Int32, 4]
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -455,45 +442,6 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cta_layout_vmnk,
         ).make_participants()
-
-        if cutlass.const_expr(use_clc_dynamic_scheduler):
-            clc_pipeline_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread
-            )
-            cluster_sz = cute.size(cluster_shape_mnk)
-            num_clc_consumer_threads = 32 * len(
-                (
-                    sched_warp_id,
-                    *(
-                        cluster_sz
-                        * (
-                            mma_warp_id,
-                            tma_warp_id,
-                            *epilogue_warp_ids,
-                        )
-                    ),
-                )
-            )
-            clc_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, num_clc_consumer_threads
-            )
-            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=storage.clc_mbar_ptr.data_ptr(),
-                num_stages=num_clc_stage,
-                producer_group=clc_pipeline_producer_group,
-                consumer_group=clc_pipeline_consumer_group,
-                tx_count=num_clc_response_bytes,
-                cta_layout_vmnk=cta_layout_vmnk,
-                defer_sync=True,
-            )
-            clc_response_ptr = storage.clc_response.data_ptr()
-            clc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, num_clc_stage
-            )
-        else:
-            clc_pipeline = None
-            clc_response_ptr = None
-            clc_consumer_state = None
 
         pipeline_init_arrive(cluster_shape_mn=cluster_shape_mnk, is_relaxed=True)
 
@@ -593,7 +541,6 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
             tile_sched_params,
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
-            clc_response_ptr,
         )
         work_tile = tile_sched.initial_work_tile_info()
 
@@ -647,30 +594,9 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=sfb_full_mcast_mask,
                     )
-                clc_pipeline.consumer_wait(clc_consumer_state)
+                tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
             ab_producer.tail()
-
-        if cutlass.const_expr(use_clc_dynamic_scheduler):
-            is_first_cta_in_cluster = cta_rank_in_cluster == 0
-            if warp_idx == sched_warp_id and is_first_cta_in_cluster:
-                clc_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.ProducerConsumer, num_clc_stage
-                )
-                while work_tile.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    mbarrier_addr = clc_pipeline.producer_get_barrier(
-                        clc_producer_state
-                    )
-                    tile_sched.advance_to_next_work(mbarrier_addr)
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
 
         if warp_idx == mma_warp_id:
             tmem.wait_for_alloc()
@@ -773,10 +699,8 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                         handle.release()
                     acc_empty.commit()
-                clc_pipeline.consumer_wait(clc_consumer_state)
+                tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
             acc_producer.tail()
 
         if warp_idx < mma_warp_id:
@@ -820,10 +744,8 @@ class Sm100BlockScaledDenseGemm3_1Kernel:
                 tTR_rC.store(acc_vec)
                 cute.copy(simt_atom, tTR_rC, tTR_gC)
                 acc_full.release()
-                clc_pipeline.consumer_wait(clc_consumer_state)
+                tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
 
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)

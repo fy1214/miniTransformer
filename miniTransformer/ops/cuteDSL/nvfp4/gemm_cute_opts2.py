@@ -60,31 +60,8 @@ io_dtype = cutlass.Float32
 sf_vec_size = 16
 cluster_shape_mnk = (2, 1, 1)
 
-"""
-The third NVFP4 CuTeDSL block-scaled batched GEMM extends nvfp4_gemm_1.py with:
 
-1. Warp specialization: one warp issues TMA loads (A/B/SFA/SFB), one warp runs
-   MMA (S2T + tcgen05 NVFP4 MMA on the leader CTA), and four warps run the
-   epilogue.
-2. Epilogue: TMEM → registers → global C via SIMT (same as nvfp4_gemm_1.py),
-   while the mainloop remains warp-specialized like fp16_gemm_2.py.
-
-To run this example:
-.. code-block:: bash
-
-    python examples/blackwell/tutorial_gemm/nvfp4_gemm_2.py  \\
-      --mnkl 8192,8192,8192,1 --do_benchmark
-
-Constraints for this example:
-* The problem size of m, n and k must be divisible by the tile size m&n&k (256, 256, 256)
-* The scaling factor vector size is 16.
-* The A/B matrices have data contiguous on the k dimension.
-* The C matrix has data contiguous on the n dimension.
-* The A/B matrix data type is Float4E2M1FN.
-* The SFA/SFB matrix data type is Float8E4M3FN.
-"""
-
-
+# Warp specialization + Epilogue TMA store
 class Sm100BlockScaledDenseGemmKernel:
     def __init__(self):
         self.threads_per_cta = 128
@@ -148,8 +125,8 @@ class Sm100BlockScaledDenseGemmKernel:
         c_tensor = cute.make_tensor(
             c_ptr,
             cute.make_layout(
-                (cute.assume(m, 32), cute.assume(n, 16)),
-                stride=(cute.assume(n, 16), 1,),
+                (cute.assume(m, 32), cute.assume(n, 16), l),
+                stride=(cute.assume(n, 16), 1, cute.assume(m * n, 512)),
             ),
         )
 
@@ -322,7 +299,7 @@ class Sm100BlockScaledDenseGemmKernel:
 
         grid = cute.round_up(
             cute.ceil_div(
-                (*c_tensor.layout.shape, 1),
+                (c_tensor.layout.shape),
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], 1),
             ),
             cluster_shape_mnk,
@@ -487,8 +464,10 @@ class Sm100BlockScaledDenseGemmKernel:
         gSFB_nkl = cute.local_tile(
             mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-  
-        gC_mnl = cute.local_tile(mC_mnl, self.mma_tiler, mma_tile_coord_mnl, proj=(1, 1, None))
+        # (bM, bN, RestM, RestN, RestL)
+        gC_mnl = cute.local_tile(
+            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
 
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
@@ -541,17 +520,6 @@ class Sm100BlockScaledDenseGemmKernel:
         tCrB = tiled_mma.make_fragment_B(sB)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
-        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
-
-        tCsC, tCgC_tma = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sC, 0, 2),
-            cute.group_modes(tCgC_epi, 0, 2),
-        )
 
         # Barrier 1 for epilogue synchronization
         epilogue_sync_barrier = pipeline.NamedBarrier(
@@ -753,6 +721,17 @@ class Sm100BlockScaledDenseGemmKernel:
                 acc_empty.commit()
 
         elif warp_idx < mma_warp_id:
+
+            # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+            tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, *mma_tile_coord_mnl)], epi_tile)
+
+            tCsC, tCgC_tma = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_c,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sC, 0, 2),
+                cute.group_modes(tCgC_epi, 0, 2),
+            )
             # Alloc TMEM
             num_tmem_cols = self.num_tmem_alloc_cols
             tmem.allocate(num_tmem_cols)

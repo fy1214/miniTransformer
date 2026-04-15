@@ -29,6 +29,7 @@ sf_dtype = cutlass.Float8E4M3FN
 sf_vec_size = 16
 
 
+# simple kernel implementation
 class NormalBlockScaledDenseGemmKernel:
     def __init__(self):
         self.threads_per_cta = 128

@@ -23,6 +23,7 @@ from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import (
     sf_dtype,
     sf_vec_size,
     get_compiled_nvfp4_gemm,
+    get_compiled_nvfp4_gemm_multi_variant,
     Nvfp4KernelVariant,
 )
 
@@ -474,11 +475,14 @@ def cutedsl_nvfp4_gemm_optimized(
     out=None,
     accumulate=False,
     has_swizzle=True,
+    use_clc_dynamic_scheduler=False,
+    auto_kernel_variant: bool = False,
     do_benchmark=False,
     do_autotune=False,
     warmup_iterations=10,
     iterations=100,
     use_cold_l2=False,
+    return_dispatch_info: bool = False,
 ):
     """Run CuTeDSL NVFP4 block-scaled GEMM and return D = alpha * GEMM(qx, qw, sx, sw) in out_dtype."""
 
@@ -489,11 +493,13 @@ def cutedsl_nvfp4_gemm_optimized(
         Nvfp4KernelVariant.OPTS2,
         Nvfp4KernelVariant.OPTS3,
         Nvfp4KernelVariant.OPTS4,
-        Nvfp4KernelVariant.OPTS5,
-        Nvfp4KernelVariant.OPTS6,
     }
     use_host_accumulate = (kernel_variant in opts_family_variants) and accumulate
     force_fp32_kernel_output = (kernel_variant in opts_family_variants) and (out_dtype == torch.bfloat16)
+    if auto_kernel_variant:
+        # Keep dispatch path simple and robust for all variants.
+        use_host_accumulate = accumulate
+        force_fp32_kernel_output = out_dtype == torch.bfloat16
     kernel_out_dtype = torch.float32 if force_fp32_kernel_output else out_dtype
 
     a_ref_f4 = qx.view(torch.float4_e2m1fn_x2).to(device)
@@ -528,32 +534,70 @@ def cutedsl_nvfp4_gemm_optimized(
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
     stream = cutlass_torch.default_stream()
+    if do_benchmark and kernel_variant in (
+        Nvfp4KernelVariant.OPTS3,
+        Nvfp4KernelVariant.OPTS4,
+    ):
+        do_benchmark = False
     benchmark_scope_tensors = None
     if do_autotune:
         benchmark_scope_tensors = [a_ref_f4, b_ref_f4, sfa_tensor, sfb_tensor, c_tensor]
     c_tensor_initial_for_autotune = None
     if do_autotune and accumulate:
         c_tensor_initial_for_autotune = c_tensor.clone()
-    compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
-        a_ptr=a_ptr,
-        b_ptr=b_ptr,
-        sfa_ptr=sfa_ptr,
-        sfb_ptr=sfb_ptr,
-        c_ptr=c_ptr,
-        problem_size=(M, N, K, l),
-        stream=stream,
-        epilogue_op=lambda x: x,
-        epilogue_cache_tag=("scale_alpha",),
-        out_dtype=kernel_out_dtype,
-        kernel_variant=kernel_variant,
-        accumulate=(False if use_host_accumulate else accumulate),
-        has_swizzle=has_swizzle,
-        do_autotune=do_autotune,
-        benchmark_scope_tensors=benchmark_scope_tensors,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        use_cold_l2=use_cold_l2,
-    )
+    selected_variant = kernel_variant
+    cache_hit = False
+    if auto_kernel_variant:
+        compiled, selected_config, selected_time, selected_variant, cache_hit = (
+            get_compiled_nvfp4_gemm_multi_variant(
+                a_ptr=a_ptr,
+                b_ptr=b_ptr,
+                sfa_ptr=sfa_ptr,
+                sfb_ptr=sfb_ptr,
+                c_ptr=c_ptr,
+                problem_size=(M, N, K, l),
+                stream=stream,
+                epilogue_op=lambda x: x,
+                epilogue_cache_tag=("scale_alpha",),
+                out_dtype=kernel_out_dtype,
+                accumulate=(False if use_host_accumulate else accumulate),
+                has_swizzle=has_swizzle,
+                use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+                benchmark_scope_tensors=[
+                    a_ref_f4,
+                    b_ref_f4,
+                    sfa_tensor,
+                    sfb_tensor,
+                    c_tensor,
+                ],
+                warmup_iterations=max(2, min(5, warmup_iterations)),
+                iterations=max(10, min(30, iterations)),
+                use_cold_l2=False,
+            )
+        )
+        use_host_accumulate = (selected_variant in opts_family_variants) and accumulate
+    else:
+        compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
+            a_ptr=a_ptr,
+            b_ptr=b_ptr,
+            sfa_ptr=sfa_ptr,
+            sfb_ptr=sfb_ptr,
+            c_ptr=c_ptr,
+            problem_size=(M, N, K, l),
+            stream=stream,
+            epilogue_op=lambda x: x,
+            epilogue_cache_tag=("scale_alpha",),
+            out_dtype=kernel_out_dtype,
+            kernel_variant=kernel_variant,
+            accumulate=(False if use_host_accumulate else accumulate),
+            has_swizzle=has_swizzle,
+            use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+            do_autotune=do_autotune,
+            benchmark_scope_tensors=benchmark_scope_tensors,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+            use_cold_l2=use_cold_l2,
+        )
     if do_autotune and accumulate and c_tensor_initial_for_autotune is not None:
         c_tensor.copy_(c_tensor_initial_for_autotune)
 
@@ -614,7 +658,20 @@ def cutedsl_nvfp4_gemm_optimized(
         if alpha_value != 1.0:
             c_out = c_out * alpha_value
         out.copy_((c_out + out_tensor_before).to(out_dtype))
+        if return_dispatch_info:
+            return out, {
+                "selected_variant": selected_variant.value,
+                "selected_time_us": selected_time,
+                "cache_hit": cache_hit,
+            }
         return out
     if alpha_value != 1.0:
         c_tensor.mul_(alpha_value)
-    return c_tensor.squeeze(-1).float().to(out_dtype)
+    result = c_tensor.squeeze(-1).float().to(out_dtype)
+    if return_dispatch_info:
+        return result, {
+            "selected_variant": selected_variant.value,
+            "selected_time_us": selected_time,
+            "cache_hit": cache_hit,
+        }
+    return result

@@ -493,15 +493,15 @@ class TestLinearTP:
             inp_tp = inp_full.clone().requires_grad_(True)
 
         # 显式初始化 dy（整数值），broadcast 保证两边一致
-        # dy_full shape: [batch, out_features]，与 baseline output shape 一致
+        # dy_full shape: [batch, out_features]
         dy_full = torch.randint(-1, 2, (batch_size, out_features), device="cuda").to(torch.bfloat16)
         if tp_size > 1:
             broadcast_tensor(dy_full, tp_group)
 
-        # baseline dy: 完整 [batch, out_features]
-        # tp dy: 对应 out_features 列切片（column parallel 每个 rank 只输出自己的列分片）
-        #   非SP: out_tp shape [batch, out//tp]       -> dy_tp = dy_full[:, col_shard]
-        #   SP  : out_tp shape [batch//tp, out//tp]   -> dy_tp = dy_full[seq_shard, col_shard]
+        # column parallel 每个 rank 只输出自己的 out_features 列分片：
+        #   非SP: out_tp shape [batch, out//tp]
+        #   SP  : out_tp shape [batch//tp, out//tp]
+        # tp dy 取对应切片：
         chunk_out = out_features // tp_size
         if sequence_parallel and tp_size > 1:
             chunk_seq = batch_size // tp_size
@@ -510,11 +510,18 @@ class TestLinearTP:
         else:
             dy_tp = dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
 
+        # baseline output shape: [batch, out_features]，必须传完整 dy_full
+        # 但为了让 baseline dgrad 与 tp dgrad 可比，
+        # baseline 也只用 col_shard 那一列的 dy（其余列置 0）
+        dy_baseline = torch.zeros_like(dy_full)
+        dy_baseline[:, rank * chunk_out:(rank + 1) * chunk_out] = \
+            dy_full[:, rank * chunk_out:(rank + 1) * chunk_out]
+
         # Forward + backward
         out_baseline = linear_baseline(inp_baseline, is_first_microbatch=True)
         out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
 
-        out_baseline.backward(dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous())
+        out_baseline.backward(dy_baseline)
         out_tp.backward(dy_tp)
 
         if rank < tp_size:

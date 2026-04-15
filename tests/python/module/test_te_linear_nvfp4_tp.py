@@ -219,15 +219,15 @@ def _setup_column(tp_size, sequence_parallel, in_features, out_features,
         inp_tp_data = inp_full
 
     # grad for TP output
-    if sequence_parallel and tp_size > 1:
-        chunk_seq = total_batch // tp_size
-        grad_tp = grad_full[rank * chunk_seq:(rank + 1) * chunk_seq,
-                            rank * chunk_out:(rank + 1) * chunk_out].contiguous()
-    else:
-        grad_tp = grad_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
+    # column parallel 无论 SP 是否开启，out_tp shape 均为 [total_batch, out//tp]
+    # （SP 影响 input AllGather，不影响 output shape）
+    grad_tp = grad_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
 
-    # grad for baseline (only the column shard this rank owns)
-    grad_baseline = grad_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
+    # grad for baseline (tp=1): out_baseline shape [total_batch, out_features]
+    # 只激活 col_shard 对应的列，其余置 0，保证与 tp dgrad 数学等价
+    grad_baseline = torch.zeros_like(grad_full)
+    grad_baseline[:, rank * chunk_out:(rank + 1) * chunk_out] = \
+        grad_full[:, rank * chunk_out:(rank + 1) * chunk_out]
 
     return dict(
         baseline=baseline, tp_linear=tp_linear,

@@ -196,20 +196,19 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
-        device = B[0].device
         if grad:
             if layout == "NN":
                 out = torch.empty(
                     [sum(m_splits), B[0]._rowwise_data.size(1) * 2],
                     dtype=activation_dtype,
-                    device=device,
+                    device=B[0].device,
                 )
                 out = [out]
         else:
             out = torch.empty(
                 [sum(m_splits), B[0]._rowwise_data.size(0)],
                 dtype=activation_dtype,
-                device=device,
+                device=B[0].device,
             )
             out = [out]
 

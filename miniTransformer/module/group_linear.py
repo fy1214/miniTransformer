@@ -225,11 +225,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                                               qresult_dy_list.scale_t,
                                               qresult_dy_list.tensor_scale_t)
 
-        # GEMM dgrad 1Dx2D = dy @ w_t ([groups*m, h_out], [m, h_in, h_out])
-        logger.debug(f"[Hybrid] Before DGRAD Grouped QGEMM"
-                   f", qdy shapes: {[list(t.shape) for t in qdy]}"
-                   f", qw_t shapes: {[list(t.shape) for t in qw_t]}")
-
         dgrad = ctx.quantize_op.grouped_gemm(
             A=qdy,
             B=qw_t,

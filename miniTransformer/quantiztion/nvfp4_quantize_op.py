@@ -1,14 +1,15 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
-import transformer_engine_torch as tex
+import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer
+from transformer_engine.pytorch.cpp_extensions import split_quantize
 from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
 
 nvfp4_output_t = torch.uint8
@@ -138,26 +139,31 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
         If param type is Y, the shape is [m_sum, n].
         """
-        x_quantizer = NVFP4Quantizer(
-            rowwise=True,
-            columnwise=return_transpose,
-            with_amax_reduction=False,
-            amax_reduction_group=None,
-            with_rht=qparams.with_rht,
-            with_post_rht_amax=qparams.with_rht,
-            with_2d_quantization=False,
-            stochastic_rounding=qparams.stochastic_rounding
-        )
-        if qparams.param_type == qparams.param_type.W:
+        num_gemms = len(m_splits)
+        quantizers = []
+        for i in range(num_gemms):
+            x_quantizer = NVFP4Quantizer(
+                rowwise=True,
+                columnwise=return_transpose,
+                with_amax_reduction=False,
+                amax_reduction_group=None,
+                with_rht=qparams.with_rht,
+                with_post_rht_amax=qparams.with_rht,
+                with_2d_quantization=False,
+                stochastic_rounding=qparams.stochastic_rounding
+            )
+            quantizers.append(x_quantizer)
+
+        if qparams.param_type == qparams.param_type.WEIGHT:
             quantize_tensor_list = []
             x = torch.split(x, m_splits)
-            for i in range(len(m_splits)):
-                quantize_tensor_list.append(x_quantizer(x[i]))
+            for i in range(num_gemms):
+                quantize_tensor_list.append(quantizers[i](x[i]))
         else:
             quantize_tensor_list = tex.split_quantize(
                 x,
                 m_splits,
-                x_quantizer,
+                quantizers,
                 disable_bulk_allocation=False,
             )
 

@@ -2,6 +2,7 @@
 
 
 test_linear_tp.py
+执行方式：torchrun --nproc_per_node=2 test_linear_tp.py --qparam 6 --tp-size 2 --no-sp
 
 假设tp=1的case下：
 forward：

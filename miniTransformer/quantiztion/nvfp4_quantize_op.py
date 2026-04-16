@@ -156,7 +156,6 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
 
         if qparams.param_type == qparams.param_type.WEIGHT:
             quantize_tensor_list = []
-            x = torch.split(x, m_splits)
             for i in range(num_gemms):
                 quantize_tensor_list.append(quantizers[i](x[i]))
         else:

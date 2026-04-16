@@ -339,6 +339,10 @@ def test_backward_wgrad(
         print(f"  expert {i}: wgrad shape={wgrad_mini.shape}  "
               f"max={diff.max():.4e}  mean={diff.mean():.4e}  "
               f"max_rel={rel_diff.max():.4e}")
+        print(f"    TE   wgrad: min={wgrad_te_f.min():.4f} max={wgrad_te_f.max():.4f} "
+              f"mean={wgrad_te_f.mean():.4f} dtype={wgrad_te.dtype}")
+        print(f"    mini wgrad: min={wgrad_mini_f.min():.4f} max={wgrad_mini_f.max():.4f} "
+              f"mean={wgrad_mini_f.mean():.4f} dtype={wgrad_mini.dtype}")
 
         try:
             torch.testing.assert_close(

@@ -164,7 +164,6 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
                 x,
                 m_splits,
                 quantizers,
-                disable_bulk_allocation=False,
             )
 
         return GroupQuantizeResult(

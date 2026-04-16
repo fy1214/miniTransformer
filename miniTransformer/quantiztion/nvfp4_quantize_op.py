@@ -171,7 +171,9 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             data=quantize_tensor_list,
             data_t=quantize_tensor_list,
             scale=quantize_tensor_list,
-            scale_t=quantize_tensor_list
+            scale_t=quantize_tensor_list,
+            tensor_scale=quantize_tensor_list,
+            tensor_scale_t=quantize_tensor_list,
         )
 
 
@@ -196,32 +198,31 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
-        device = A[0].device
+        device = B[0].device
         if grad:
             if layout == "NN":
                 out = torch.empty(
-                    [sum(m_splits), B[0]._rowwise_data.size(1)],
-                    dtype=A[0].dtype,
+                    [sum(m_splits), B[0]._rowwise_data.size(1) * 2],
+                    dtype=activation_dtype,
                     device=device,
                 )
                 out = [out]
         else:
             out = torch.empty(
                 [sum(m_splits), B[0]._rowwise_data.size(0)],
-                dtype=A[0].dtype,
+                dtype=activation_dtype,
                 device=device,
             )
             out = [out]
 
         general_grouped_gemm(
-            B,
-            A,
-            out,
-            None,
-            activation_dtype,
-            single_output=True,
-            m_splits=m_splits,
+            A=B,
+            B=A,
+            out=out,
+            out_dtype=activation_dtype,
             layout=layout,
+            m_splits=m_splits,
+            single_output=False if (grad and layout == "NT") else True,
             grad=grad,
             bias=bias,
             use_bias=use_bias,

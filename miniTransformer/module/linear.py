@@ -313,7 +313,7 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.sequence_parallel = sequence_parallel
             ctx.tp_group = tp_group
             ctx.tp_size = tp_size
-            ctx.tp_rank = get_distributed_rank(tp_group)
+            ctx.tp_rank = get_distributed_rank(tp_group) if tp_group is not None else 0
             ctx.x_gather_required = gather_required
             ctx.parallel_mode = parallel_mode
             ctx.x_shape = x_shape

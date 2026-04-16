@@ -68,6 +68,12 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             m_splits=m_splits,
             return_transpose=is_grad_enabled
         )
+        qx, sx, tx, qx_t, sx_t, tx_t = (qresult_x_list.data,
+                                          qresult_x_list.scale,
+                                          qresult_x_list.tensor_scale,
+                                          qresult_x_list.data_t,
+                                          qresult_x_list.scale_t,
+                                          qresult_x_list.tensor_scale_t)
 
 
         # Quantize w only for is_first_microbatch is True or None
@@ -83,7 +89,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             # save FP8 weight cache between microbatches
             qw = weight_qresult_cache.data = qresult_w_list.data
             sw = weight_qresult_cache.scale = qresult_w_list.scale
-            qw_t =weight_qresult_cache.data_t = qresult_w_list.data_t
+            qw_t = weight_qresult_cache.data_t = qresult_w_list.data_t
             sw_t = weight_qresult_cache.scale_t = qresult_w_list.scale_t
             tw = weight_qresult_cache.global_amax_row = qresult_w_list.tensor_scale
             tw_t = weight_qresult_cache.global_amax_col = qresult_w_list.tensor_scale_t
@@ -98,14 +104,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         assert qw is not None, "FP8 weight cache should not be None"
 
-        # Forward pass GEMM 1D2D = x @ w [groups*m, in], [groups, out, in] -> [groups*m, out]
-        logger.debug(
-            f"[Hybrid] Before FWD Grouped QGEMM\n"
-            f"  qx shapes [m, k]  : {[list(t.shape) for t in qx]}\n"
-            f"  sx shapes          : {[list(t.shape) for t in sx]}\n"
-            f"  qw shapes [g, n, k]: {[list(t.shape) for t in qw]}\n"
-            f"  sw shapes          : {[list(t.shape) for t in sw]}"
-        )
         y = quantize_op.grouped_gemm(
             A=qx,
             B=qw,
@@ -129,7 +127,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             ctx.m_splits = m_splits
             ctx.tp_group = tp_group
             ctx.tp_size = tp_size
-            ctx.tp_rank = get_distributed_rank(tp_group)
+            ctx.tp_rank = get_distributed_rank(tp_group) if tp_group is not None else 0
             # ctx.x_gather_required = gather_required
             ctx.parallel_mode = parallel_mode
             ctx.x_shape = x_shape
@@ -155,10 +153,16 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
 
-            # Flatten lists for save_for_backward (it only accepts individual tensors)
-            # Save order: qx_t (N), sx_t (N), tx_t (N), qw_t (N), sw_t (N), tw_t (N), weights (N)
-            tensor_lists = [qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights]
-            ctx.save_for_backward(*[t for lst in tensor_lists for t in lst])
+            # save_for_backward only accepts plain torch.Tensor.
+            # NVFP4TensorStorage / NVFP4Tensor are TE custom objects, store them on ctx directly.
+            # Only plain weight tensors go into save_for_backward.
+            ctx.qx_t  = qx_t
+            ctx.sx_t  = sx_t
+            ctx.tx_t  = tx_t
+            ctx.qw_t  = qw_t
+            ctx.sw_t  = sw_t
+            ctx.tw_t  = tw_t
+            ctx.save_for_backward(*weights)
 
         # JQ: sequence parallel not ready yet
         # if parallel_mode == "row" and sequence_parallel:
@@ -181,17 +185,15 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        
-        # Reconstruct lists from saved_tensors
-        # Order: qx_t (N), sx_t (N), tx_t (N), qw_t (N), sw_t (N), tw_t (N), weights (N)
-        saved = ctx.saved_tensors
-        total_saved = len(saved)
-        assert total_saved == N * 7, f"Expected {N * 7} saved tensors, got {total_saved}"
-        
-        # Split saved tensors into 7 groups of N tensors each
-        qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights = [
-            list(saved[i*N:(i+1)*N]) for i in range(7)
-        ]
+
+        # Restore quantized tensors stored directly on ctx (not via save_for_backward)
+        qx_t = ctx.qx_t
+        sx_t = ctx.sx_t
+        tx_t = ctx.tx_t
+        qw_t = ctx.qw_t
+        sw_t = ctx.sw_t
+        tw_t = ctx.tw_t
+        weights = list(ctx.saved_tensors)   # plain weight tensors
 
         assert qw_t is not None and sw_t is not None
 

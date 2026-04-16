@@ -74,6 +74,26 @@ class QuantizeResult:
 
 
 @dataclasses.dataclass
+class GroupQuantizeResult:
+    """A container to hold quantization result, including quantized tensor, optional
+    transposed quantized tensor, and corresponding decoding scales.
+
+    data: the quantized tensor.
+    scale: the decoding scale for the quantized tensor. Shape depends on the scaling granularity.
+        - if scaling type is PER_TENSOR, it should be a 1D scalar tensor.
+    data_t: the transposed quantized tensor.
+    scale_t: the decoding scale for the transposed quantized tensor.
+    """
+
+    data: List[torch.Tensor]
+    scale: List[torch.Tensor]
+    data_t: List[torch.Tensor] | None = None
+    scale_t: List[torch.Tensor] | None = None
+    tensor_scale: List[torch.Tensor] | None = None
+    tensor_scale_t: List[torch.Tensor] | None = None
+
+
+@dataclasses.dataclass
 class QuantizeResultCache:
     """
     Cache of quantized tensors

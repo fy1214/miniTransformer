@@ -1,13 +1,15 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional
+from typing import Optional, List
 
 from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
+import transformer_engine_torch as tex
 from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
+from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -77,6 +79,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         )
         return quantization.QuantizeResult(data=nvfp4_tensor, scale=nvfp4_tensor, data_t=nvfp4_tensor, scale_t=nvfp4_tensor)
 
+
     def qgemm(
         self,
         qx: torch.Tensor,
@@ -118,3 +121,109 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             bulk_overlap=False
         )[0]
         return gemm_out
+
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+    ) -> GroupQuantizeResult:
+        """
+        If param type is weight, the shape is [num_gemms, n, k].
+        If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
+        If param type is Y, the shape is [m_sum, n].
+        """
+        x_quantizer = NVFP4Quantizer(
+            rowwise=True,
+            columnwise=return_transpose,
+            with_amax_reduction=False,
+            amax_reduction_group=None,
+            with_rht=qparams.with_rht,
+            with_post_rht_amax=qparams.with_rht,
+            with_2d_quantization=False,
+            stochastic_rounding=qparams.stochastic_rounding
+        )
+        if qparams.param_type == qparams.param_type.W:
+            quantize_tensor_list = []
+            x = torch.split(x, m_splits)
+            for i in range(len(m_splits)):
+                quantize_tensor_list.append(x_quantizer(x[i]))
+        else:
+            quantize_tensor_list = tex.split_quantize(
+                x,
+                m_splits,
+                x_quantizer,
+                disable_bulk_allocation=False,
+            )
+
+        return GroupQuantizeResult(
+            data=quantize_tensor_list,
+            data_t=quantize_tensor_list,
+            scale=quantize_tensor_list,
+            scale_t=quantize_tensor_list
+        )
+
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad=False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+        activation_dtype = out_dtype
+        device = A[0].device
+        if grad:
+            if layout == "NN":
+                out = torch.empty(
+                    [sum(m_splits), B[0]._rowwise_data.size(1)],
+                    dtype=A[0].dtype,
+                    device=device,
+                )
+                out = [out]
+        else:
+            out = torch.empty(
+                [sum(m_splits), B[0]._rowwise_data.size(0)],
+                dtype=A[0].dtype,
+                device=device,
+            )
+            out = [out]
+
+        general_grouped_gemm(
+            B,
+            A,
+            out,
+            None,
+            activation_dtype,
+            single_output=True,
+            m_splits=m_splits,
+            layout=layout,
+            grad=grad,
+            bias=bias,
+            use_bias=use_bias,
+            use_split_accumulator=False,
+            accumulate=accumulate
+        )
+
+        if grad and layout == "NT":
+            return out
+        else:
+            return out[0]

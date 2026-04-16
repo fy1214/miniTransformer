@@ -17,18 +17,6 @@ def log_rank_0(msg):
         logger.info(msg)
 
 
-def unpack_quantize_results(qresult_list):
-    """将 QuantizeResult 列表拆分成各字段的列表。"""
-    return (
-        [r.data for r in qresult_list],
-        [r.scale for r in qresult_list],
-        [r.tensor_scale for r in qresult_list],
-        [r.data_t for r in qresult_list],
-        [r.scale_t for r in qresult_list],
-        [r.tensor_scale_t for r in qresult_list],
-    )
-
-
 class _QuantizedGroupedLinear(torch.autograd.Function):
     """Optimized Linear Function with quantization support.
 
@@ -81,7 +69,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             return_transpose=is_grad_enabled
         )
 
-        qx, sx, tx, qx_t, sx_t, tx_t = unpack_quantize_results(qresult_x_list)
 
         # Quantize w only for is_first_microbatch is True or None
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
@@ -93,14 +80,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 m_splits=m_splits,
                 return_transpose=is_grad_enabled
             )
-            qw, sw, tw, qw_t, sw_t, tw_t = unpack_quantize_results(qresult_w_list)
             # save FP8 weight cache between microbatches
-            weight_qresult_cache.data = qw
-            weight_qresult_cache.scale = sw
-            weight_qresult_cache.data_t = qw_t
-            weight_qresult_cache.scale_t = sw_t
-            weight_qresult_cache.global_amax_row = tw
-            weight_qresult_cache.global_amax_col = tw_t
+            qw = weight_qresult_cache.data = qresult_w_list.data
+            sw = weight_qresult_cache.scale = qresult_w_list.scale
+            qw_t =weight_qresult_cache.data_t = qresult_w_list.data_t
+            sw_t = weight_qresult_cache.scale_t = qresult_w_list.scale_t
+            tw = weight_qresult_cache.global_amax_row = qresult_w_list.tensor_scale
+            tw_t = weight_qresult_cache.global_amax_col = qresult_w_list.tensor_scale_t
         else:
             w = None
             qw, sw, tw, qw_t, sw_t, tw_t  = (weight_qresult_cache.data,
@@ -169,10 +155,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
 
-            qw_t = weight_qresult_cache.data_t
-            sw_t = weight_qresult_cache.scale_t
-            tw_t = weight_qresult_cache.global_amax_col
-
             # Flatten lists for save_for_backward (it only accepts individual tensors)
             # Save order: qx_t (N), sx_t (N), tx_t (N), qw_t (N), sw_t (N), tw_t (N), weights (N)
             tensor_lists = [qx_t, sx_t, tx_t, qw_t, sw_t, tw_t, weights]
@@ -234,7 +216,12 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             m_splits=ctx.m_splits,
             return_transpose=True,  # Need transpose for wgrad computation
         )
-        qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = unpack_quantize_results(qresult_dy_list)
+        qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = (qresult_dy_list.data,
+                                              qresult_dy_list.scale,
+                                              qresult_dy_list.tensor_scale,
+                                              qresult_dy_list.data_t,
+                                              qresult_dy_list.scale_t,
+                                              qresult_dy_list.tensor_scale_t)
 
         # GEMM dgrad 1Dx2D = dy @ w_t ([groups*m, h_out], [m, h_in, h_out])
         logger.debug(f"[Hybrid] Before DGRAD Grouped QGEMM"

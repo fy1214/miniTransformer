@@ -366,6 +366,7 @@ class _QuantizedLinear(torch.autograd.Function):
             assert tp_group is not None
             y, _ = reduce_scatter_along_first_dim(y, tp_group)
         # Allreduce for rowwise parallel
+        # TODO: symmetric_all_reduce to replace allreduce
         elif parallel_mode == "row" and tp_size > 1:
             y, _ = allreduce(y, tp_group)
 
@@ -395,6 +396,7 @@ class _QuantizedLinear(torch.autograd.Function):
 
         # Quantize dy (with transpose)
         # Will also perform AllGather if needed
+        # TODO: we can overlap the x allgather to w quant
         gather_required = ctx.parallel_mode == "row" and ctx.sequence_parallel
         qresult_dy = _QuantizedLinear.quantize_optionally_allgather(
             ctx.quantize_op,

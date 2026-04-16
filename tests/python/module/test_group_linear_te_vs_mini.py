@@ -66,6 +66,7 @@ def build_mini_grouped_linear(
     bias: bool = False,
     seed: int = 42,
     qparam: QuantizeRecipe = QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET,
+    fuse_wgrad_accumulation: bool = False,
 ) -> MiniGroupedLinear:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -75,7 +76,7 @@ def build_mini_grouped_linear(
         in_features=in_features,
         out_features=out_features,
         sequence_parallel=False,
-        fuse_wgrad_accumulation=True,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         tp_group=None,
         tp_size=1,
         get_rng_state_tracker=None,
@@ -285,7 +286,10 @@ def test_backward_wgrad(
     nvfp4_recipe = make_nvfp4_recipe()
 
     te_model   = build_te_grouped_linear(num_gemms, in_features, out_features, bias, seed)
-    mini_model = build_mini_grouped_linear(num_gemms, in_features, out_features, bias, seed, qparam)
+    mini_model = build_mini_grouped_linear(
+        num_gemms, in_features, out_features, bias, seed, qparam,
+        fuse_wgrad_accumulation=True,   # wgrad 测试需要 main_grad
+    )
 
     # mini 需要 main_grad 才能做 fuse_wgrad_accumulation
     init_integer_weights(te_model,   num_gemms, seed + 10)

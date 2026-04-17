@@ -212,7 +212,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=a0.device if is_quantized else a0.device,
+                    device=B[0].device,
                 )
                 out = [out]
         else:
@@ -224,7 +224,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             out = torch.empty(
                 [sum(m_splits), n_cols],
                 dtype=activation_dtype,
-                device=a0.device if not is_quantized else a0.device,
+                device=B[0].device,
             )
             out = [out]
 

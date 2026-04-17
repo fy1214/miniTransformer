@@ -376,6 +376,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             None,        # is_grad_enabled
             None,        # is_first_microbatch
             None,        # fuse_wgrad_accumulation
+            None,
             *wgrad_list,      # *weights
         )
 

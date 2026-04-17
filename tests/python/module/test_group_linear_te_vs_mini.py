@@ -114,17 +114,6 @@ def sync_weights_te_to_mini(te_model: te.GroupedLinear,
             mini_w.copy_(te_w)
 
 
-def init_integer_weights(model, num_gemms: int, seed: int = 42) -> None:
-    """将所有权重初始化为整数值 {-1, 0, 1}，消除量化 amax 差异的影响。"""
-    torch.manual_seed(seed)
-    with torch.no_grad():
-        for i in range(num_gemms):
-            w = getattr(model, f"weight{i}")
-            w.data.copy_(
-                torch.randint(-1, 2, w.shape, device=w.device).to(w.dtype)
-            )
-
-
 # ==================== Test Functions ====================
 
 def test_forward(
@@ -158,15 +147,12 @@ def test_forward(
     te_model   = build_te_grouped_linear(num_gemms, in_features, out_features, bias, seed)
     mini_model = build_mini_grouped_linear(num_gemms, in_features, out_features, bias, seed, qparam)
 
-    # 整数 weight 初始化（消除 amax 差异）
-    init_integer_weights(te_model,   num_gemms, seed + 10)
-    init_integer_weights(mini_model, num_gemms, seed + 10)
     # mini 从 TE 同步 weight，保证完全一致
     sync_weights_te_to_mini(te_model, mini_model, num_gemms)
 
-    # 整数 input
+    # 随机 input
     torch.manual_seed(seed + 100)
-    inp = torch.randint(-1, 2, (total_m, in_features), device="cuda").to(torch.bfloat16)
+    inp = torch.randn(total_m, in_features, device="cuda", dtype=torch.bfloat16)
 
     # TE forward
     with torch.no_grad():
@@ -221,15 +207,13 @@ def test_backward_dgrad(
     te_model   = build_te_grouped_linear(num_gemms, in_features, out_features, bias, seed)
     mini_model = build_mini_grouped_linear(num_gemms, in_features, out_features, bias, seed, qparam)
 
-    init_integer_weights(te_model,   num_gemms, seed + 10)
-    init_integer_weights(mini_model, num_gemms, seed + 10)
     sync_weights_te_to_mini(te_model, mini_model, num_gemms)
 
-    # 整数 input 和 dy
+    # 随机 input 和 dy
     torch.manual_seed(seed + 100)
-    inp = torch.randint(-1, 2, (total_m, in_features), device="cuda").to(torch.bfloat16)
+    inp = torch.randn(total_m, in_features, device="cuda", dtype=torch.bfloat16)
     torch.manual_seed(seed + 200)
-    dy  = torch.randint(-1, 2, (total_m, out_features), device="cuda").to(torch.bfloat16)
+    dy  = torch.randn(total_m, out_features, device="cuda", dtype=torch.bfloat16)
 
     # TE backward
     inp_te = inp.clone().requires_grad_(True)
@@ -276,6 +260,9 @@ def test_backward_wgrad(
 ):
     """
     Backward wgrad 精度对比：miniTransformer vs TE。
+
+    wgrad 值域约 [-30, 30]（取决于 m_per_expert 和 in_features 大小），
+    NVFP4 量化误差约 ±5（两边 recipe 实现细节不同），
     """
     print(f"\n{'='*60}")
     print(f"[Backward wgrad] num_gemms={num_gemms}, in={in_features}, out={out_features}")
@@ -292,8 +279,6 @@ def test_backward_wgrad(
     )
 
     # mini 需要 main_grad 才能做 fuse_wgrad_accumulation
-    init_integer_weights(te_model,   num_gemms, seed + 10)
-    init_integer_weights(mini_model, num_gemms, seed + 10)
     sync_weights_te_to_mini(te_model, mini_model, num_gemms)
 
     for i in range(num_gemms):
@@ -301,9 +286,9 @@ def test_backward_wgrad(
         w_mini.main_grad = torch.zeros_like(w_mini.data, dtype=torch.float32)
 
     torch.manual_seed(seed + 100)
-    inp = torch.randint(-1, 2, (total_m, in_features), device="cuda").to(torch.bfloat16)
+    inp = torch.randn(total_m, in_features, device="cuda", dtype=torch.bfloat16)
     torch.manual_seed(seed + 200)
-    dy  = torch.randint(-1, 2, (total_m, out_features), device="cuda").to(torch.bfloat16)
+    dy  = torch.randn(total_m, out_features, device="cuda", dtype=torch.bfloat16)
 
     # TE backward（weight.grad）
     inp_te = inp.clone().requires_grad_(True)
@@ -334,11 +319,13 @@ def test_backward_wgrad(
         wgrad_mini_f = wgrad_mini.float()
 
         diff     = (wgrad_te_f - wgrad_mini_f).abs()
-        rel_diff = diff / (wgrad_te_f.abs() + 1e-6)
+        # 用值域范围做 rel_diff，避免分母接近 0 导致虚高
+        scale    = wgrad_te_f.abs().max().clamp(min=1.0)
+        rel_diff = diff / scale
 
         print(f"  expert {i}: wgrad shape={wgrad_mini.shape}  "
               f"max={diff.max():.4e}  mean={diff.mean():.4e}  "
-              f"max_rel={rel_diff.max():.4e}")
+              f"max_rel(vs_max)={rel_diff.max():.4e}")
         print(f"    TE   wgrad: min={wgrad_te_f.min():.4f} max={wgrad_te_f.max():.4f} "
               f"mean={wgrad_te_f.mean():.4f} dtype={wgrad_te.dtype}")
         print(f"    mini wgrad: min={wgrad_mini_f.min():.4f} max={wgrad_mini_f.max():.4f} "
@@ -389,20 +376,25 @@ def run_all_tests(
     print(f"  atol:         {atol}")
     print("=" * 60)
 
-    kwargs = dict(
+    base_kwargs = dict(
         num_gemms=num_gemms,
         in_features=in_features,
         out_features=out_features,
         m_per_expert=m_per_expert,
         qparam=qparam,
         rtol=rtol,
-        atol=atol,
     )
+    # wgrad 的量化误差比 forward/dgrad 大，使用独立的 atol
+    per_test_atol = {
+        "Forward":          atol,
+        "Backward dgrad":   atol,
+        "Backward wgrad":   atol,
+    }
 
     for i, (name, fn) in enumerate(ALL_TESTS, 1):
         print(f"\n[{i}/{len(ALL_TESTS)}] {name}")
         try:
-            fn(**kwargs)
+            fn(**base_kwargs, atol=per_test_atol[name])
         except Exception as e:
             print(f"\n  ✗ FAILED: {e}")
             traceback.print_exc()
@@ -432,8 +424,8 @@ if __name__ == "__main__":
     parser.add_argument("--qparam",       type=str,   default="fp4",
                         choices=list(QPARAM_MAP.keys()),
                         help="mini 侧量化 recipe（默认 fp4）")
-    parser.add_argument("--atol",         type=float, default=0.5)
-    parser.add_argument("--rtol",         type=float, default=0.5)
+    parser.add_argument("--atol",         type=float, default=1e-2)
+    parser.add_argument("--rtol",         type=float, default=1e-2)
     args = parser.parse_args()
 
     run_all_tests(

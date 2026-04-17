@@ -11,6 +11,7 @@ import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer
 from transformer_engine.pytorch.cpp_extensions import split_quantize
 from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -196,19 +197,34 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
+
+        # 判断输入是量化 tensor 还是 BF16 plain tensor
+        a0 = A[0]
+        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
         if grad:
             if layout == "NN":
+                if is_quantized:
+                    n_cols = B[0]._rowwise_data.size(1) * 2
+                else:
+                    # BF16: B[i] shape [n, k]，dgrad shape [m_sum, k]
+                    n_cols = B[0].size(1)
                 out = torch.empty(
-                    [sum(m_splits), B[0]._rowwise_data.size(1) * 2],
+                    [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].device,
+                    device=a0.device if is_quantized else a0.device,
                 )
                 out = [out]
         else:
+            if is_quantized:
+                n_cols = B[0]._rowwise_data.size(0)
+            else:
+                # BF16 fprop: B[i] shape [n, k]，output shape [m_sum, n]
+                n_cols = B[0].size(0)
             out = torch.empty(
-                [sum(m_splits), B[0]._rowwise_data.size(0)],
+                [sum(m_splits), n_cols],
                 dtype=activation_dtype,
-                device=B[0].device,
+                device=a0.device if not is_quantized else a0.device,
             )
             out = [out]
 

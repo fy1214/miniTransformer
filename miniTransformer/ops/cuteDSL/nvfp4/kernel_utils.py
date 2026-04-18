@@ -17,6 +17,18 @@ import torch
 _PERSISTENT_CACHE_VERSION = "v1"
 
 
+def validate_group_shapes_basic(
+    m_list: List[int], n_list: List[int], k_list: List[int]
+) -> None:
+    if not (len(m_list) == len(n_list) == len(k_list)):
+        raise ValueError("m_list, n_list and k_list must have identical lengths")
+    if len(m_list) == 0:
+        raise ValueError("grouped problem cannot be empty")
+    for idx, (m, n, k) in enumerate(zip(m_list, n_list, k_list)):
+        if m <= 0 or n <= 0 or k <= 0:
+            raise ValueError(f"group {idx}: non-positive shape ({m}, {n}, {k})")
+
+
 class Nvfp4KernelVariant(str, Enum):
     OPTS0 = "opts0"
     OPTS1 = "opts1"

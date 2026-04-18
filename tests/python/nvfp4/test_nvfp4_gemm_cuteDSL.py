@@ -1,3 +1,5 @@
+from typing import Optional
+
 import pytest
 import torch
 import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
@@ -98,7 +100,7 @@ def make_match_reference(
     has_swizzle,
     do_benchmark,
     do_autotune,
-    kernel_variant: Nvfp4KernelVariant,
+    kernel_variant: Optional[Nvfp4KernelVariant],
     use_clc_dynamic_scheduler: bool = False,
     device="cuda",
     auto_kernel_variant: bool = False,
@@ -182,7 +184,16 @@ class TestCuTeDSLNvfp4Gemm:
         ],
     )
     def test_cutedsl_nvfp4_all_kernels(
-        self, M, K, N, accumulate, acc_dtype, do_benchmark, do_autotune, kernel_variant
+        self,
+        M,
+        K,
+        N,
+        accumulate,
+        acc_dtype,
+        do_benchmark,
+        do_autotune,
+        kernel_variant,
+        nvfp4_cuda_device,
     ):
         make_match_reference(
             M=M,
@@ -194,6 +205,7 @@ class TestCuTeDSLNvfp4Gemm:
             do_benchmark=do_benchmark,
             do_autotune=do_autotune,
             kernel_variant=kernel_variant,
+            device=nvfp4_cuda_device,
         )
 
     @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
@@ -203,8 +215,19 @@ class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize("do_benchmark", [True])
     @pytest.mark.parametrize("do_autotune", [False])
     @pytest.mark.parametrize("kernel_variant", [None])
+    @pytest.mark.parametrize("nvfp4_cuda_device", ["cuda:7"])
     def test_cutedsl_nvfp4_current_kernels(
-        self, M, K, N, accumulate, acc_dtype, has_swizzle, do_benchmark, do_autotune, kernel_variant
+        self,
+        M,
+        K,
+        N,
+        accumulate,
+        acc_dtype,
+        has_swizzle,
+        do_benchmark,
+        do_autotune,
+        kernel_variant,
+        nvfp4_cuda_device,
     ):
         make_match_reference(
             M=M,
@@ -216,6 +239,7 @@ class TestCuTeDSLNvfp4Gemm:
             do_benchmark=do_benchmark,
             do_autotune=do_autotune,
             kernel_variant=kernel_variant,
+            device=nvfp4_cuda_device,
             auto_kernel_variant=True,
             return_dispatch_info=True,
         )

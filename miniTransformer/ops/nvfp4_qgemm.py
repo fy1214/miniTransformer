@@ -534,11 +534,6 @@ def cutedsl_nvfp4_gemm_optimized(
     sfb_ptr = make_ptr(sf_dtype, sfb_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=32)
 
     stream = cutlass_torch.default_stream()
-    if do_benchmark and kernel_variant in (
-        Nvfp4KernelVariant.OPTS3,
-        Nvfp4KernelVariant.OPTS4,
-    ):
-        do_benchmark = False
     benchmark_scope_tensors = None
     if do_autotune:
         benchmark_scope_tensors = [a_ref_f4, b_ref_f4, sfa_tensor, sfb_tensor, c_tensor]

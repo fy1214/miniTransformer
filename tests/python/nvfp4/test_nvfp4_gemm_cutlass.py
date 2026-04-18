@@ -42,6 +42,14 @@ GEMM_WORKLOAD_PARAMS_BASE = [
 GEMM_WORKLOAD_PARAMS_NORMAL = GEMM_WORKLOAD_PARAMS_BASE + DEEPGEMM_NORMAL_ONLY_PARAMS
 GEMM_WORKLOAD_PARAMS_OPTIMIZED = GEMM_WORKLOAD_PARAMS_NORMAL
 
+
+def _sync_cuda_device(device_str: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    with torch.cuda.device(device_str):
+        torch.cuda.synchronize()
+
+
 class TestCutlassNvfp4Gemm:
 
     @pytest.mark.parametrize(
@@ -50,11 +58,12 @@ class TestCutlassNvfp4Gemm:
     )
     @pytest.mark.parametrize("seed", [1234])
     @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-    def test_cutlass_nvfp4_matches_ref(self, M, K, N, seed, out_dtype):
+    @pytest.mark.parametrize("nvfp4_cuda_device", ["cuda:7"])
+    def test_cutlass_nvfp4_matches_ref(self, M, K, N, seed, out_dtype, nvfp4_cuda_device):
         warmup = 10
         bench_iters = 100
 
-        device = "cuda"
+        device = nvfp4_cuda_device
 
         qx, qw, sx, sw, global_amax_qx, global_amax_qw, qparams = (
             initialize_nvfp4_for_qgemm(M, N, K, device=device, seed=seed)
@@ -100,8 +109,7 @@ class TestCutlassNvfp4Gemm:
                 sw_4d,
                 alpha,
             )
-            if device == "cuda":
-                torch.cuda.synchronize()
+            _sync_cuda_device(device)
 
         start = time.time()
         for _ in range(bench_iters):
@@ -113,8 +121,7 @@ class TestCutlassNvfp4Gemm:
                 sw_4d,      # B_sf：block‑scaled scale for B
                 alpha,      # alpha
             )
-        if device == "cuda":
-            torch.cuda.synchronize()
+        _sync_cuda_device(device)
         cutlass_time = (time.time() - start) / bench_iters
 
         assert D_cutlass.shape == (M, N)
@@ -128,7 +135,7 @@ class TestCutlassNvfp4Gemm:
         abs_diff = (y_ref_f32 - y_cutlass_f32).abs()
         rel_diff = abs_diff / (y_ref_f32.abs() + 1e-8)
 
-        print(f"\nCutlass NVFP4 GEMM M={M}, K={K}, N={N}, seed={seed}")
+        print(f"\nCutlass NVFP4 GEMM device={device} M={M}, K={K}, N={N}, seed={seed}")
         print(
             f"  Cutlass time (avg over {bench_iters} iters, "
             f"warmup={warmup}): {cutlass_time * 1e6:.3f} us"

@@ -1,13 +1,17 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
+import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
+from transformer_engine.pytorch.cpp_extensions import split_quantize
+from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -77,6 +81,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         )
         return quantization.QuantizeResult(data=nvfp4_tensor, scale=nvfp4_tensor, data_t=nvfp4_tensor, scale_t=nvfp4_tensor)
 
+
     def qgemm(
         self,
         qx: torch.Tensor,
@@ -118,3 +123,127 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             bulk_overlap=False
         )[0]
         return gemm_out
+
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+    ) -> GroupQuantizeResult:
+        """
+        If param type is weight, the shape is [num_gemms, n, k].
+        If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
+        If param type is Y, the shape is [m_sum, n].
+        """
+        num_gemms = len(m_splits)
+        quantizers = []
+        for i in range(num_gemms):
+            x_quantizer = NVFP4Quantizer(
+                rowwise=True,
+                columnwise=return_transpose,
+                with_amax_reduction=False,
+                amax_reduction_group=None,
+                with_rht=qparams.with_rht,
+                with_post_rht_amax=qparams.with_rht,
+                with_2d_quantization=False,
+                stochastic_rounding=qparams.stochastic_rounding
+            )
+            quantizers.append(x_quantizer)
+
+        if qparams.param_type == qparams.param_type.WEIGHT:
+            quantize_tensor_list = []
+            for i in range(num_gemms):
+                quantize_tensor_list.append(quantizers[i](x[i]))
+        else:
+            quantize_tensor_list = tex.split_quantize(
+                x,
+                m_splits,
+                quantizers,
+            )
+
+        return GroupQuantizeResult(
+            data=quantize_tensor_list,
+            data_t=quantize_tensor_list,
+            scale=quantize_tensor_list,
+            scale_t=quantize_tensor_list,
+            tensor_scale=quantize_tensor_list,
+            tensor_scale_t=quantize_tensor_list,
+        )
+
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad=False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+        activation_dtype = out_dtype
+
+        # 判断输入是量化 tensor 还是 BF16 plain tensor
+        a0 = A[0]
+        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
+        if grad:
+            if layout == "NN":
+                if is_quantized:
+                    n_cols = B[0]._rowwise_data.size(1) * 2
+                else:
+                    # BF16: B[i] shape [n, k]，dgrad shape [m_sum, k]
+                    n_cols = B[0].size(1)
+                out = torch.empty(
+                    [sum(m_splits), n_cols],
+                    dtype=activation_dtype,
+                    device=B[0].device,
+                )
+                out = [out]
+        else:
+            if is_quantized:
+                n_cols = B[0]._rowwise_data.size(0)
+            else:
+                # BF16 fprop: B[i] shape [n, k]，output shape [m_sum, n]
+                n_cols = B[0].size(0)
+            out = torch.empty(
+                [sum(m_splits), n_cols],
+                dtype=activation_dtype,
+                device=B[0].device,
+            )
+            out = [out]
+
+        general_grouped_gemm(
+            A=B,
+            B=A,
+            out=out,
+            out_dtype=activation_dtype,
+            layout=layout,
+            m_splits=m_splits,
+            single_output=False if (grad and layout == "NT") else True,
+            grad=grad,
+            bias=bias,
+            use_bias=use_bias,
+            use_split_accumulator=False,
+            accumulate=accumulate
+        )
+
+        if grad and layout == "NT":
+            return out
+        else:
+            return out[0]

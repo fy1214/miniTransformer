@@ -2,12 +2,26 @@ import math
 import torch
 import fp4_gemm
 from typing import Optional, Tuple, List
+
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils.utils import _empty_tensor
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
+
+
+def unpack_quantize_results(qresult_list):
+    """将 QuantizeResult 列表拆分成各字段的列表。"""
+    return (
+        [r.data for r in qresult_list],
+        [r.scale for r in qresult_list],
+        [r.tensor_scale for r in qresult_list],
+        [r.data_t for r in qresult_list],
+        [r.scale_t for r in qresult_list],
+        [r.tensor_scale_t for r in qresult_list],
+    )
 
 
 def cast_to_e8(decode_scale):
@@ -217,7 +231,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         transform = H * scale
         out = x_mat @ transform
         return out.view(original_shape)
-    
+
+
     @staticmethod
     def _pad_tensor(
         tensor: torch.Tensor, row_divisor: Optional[int], col_divisor: Optional[int]
@@ -469,7 +484,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         reduce_amax: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
-    ) -> List[quantization.QuantizeResult]:
+    ) -> GroupQuantizeResult:
         """
         If param type is weight, the shape is [num_gemms, n, k].
         If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
@@ -483,7 +498,16 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             for xi in x
         ]
 
-        return results
+        qx, sx, tx, qx_t, sx_t, tx_t = unpack_quantize_results(results)
+
+        return GroupQuantizeResult(
+            data=qx,
+            data_t=qx_t,
+            scale=sx,
+            scale_t=sx_t,
+            tensor_scale=tx,
+            tensor_scale_t=tx_t
+        )
 
 
     def _ref_qgemm(

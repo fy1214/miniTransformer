@@ -377,7 +377,7 @@ Examples:
         "--qparam",
         type=int,
         choices=[1, 2, 3, 4, 5],
-        default=5,
+        default=4,
         help="Quantization recipe to use: 1=NON_QUANTIZE, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET (default: 5)"
     )
     

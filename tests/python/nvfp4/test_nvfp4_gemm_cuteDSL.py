@@ -3,7 +3,33 @@ from typing import Optional
 import pytest
 import torch
 import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
+
+from sympy import true
+from cutlass.cute.runtime import make_ptr
+from miniTransformer.ops.cuteDSL.nvfp4 import gemm_cute_opts
+
+from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_norm import (
+    NormalBlockScaledDenseGemmKernel,
+    ab_dtype,
+    sf_dtype,
+    sf_vec_size,
+)
+from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts import (
+    OptimizedBlockScaledDenseGemmKernel,
+)
+
+GEMM_WORKLOAD_PARAMS = [
+    pytest.param(2048, 5120, 10240, id="linear_qkv"),
+    pytest.param(8192, 2048, 1280, id="linear_proj"),
+    pytest.param(2048, 5120, 51200, id="linear_fc1"),
+    pytest.param(8192, 6400, 1280, id="linear_fc2"),
+   
+    pytest.param(256, 256, 256, id="function_test0"),
+    pytest.param(8192, 8192, 8192, id="function_test1"),
+]
+=======
 from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import Nvfp4KernelVariant
+>>>>>>> tests/python/nvfp4/test_nvfp4_gemm_cuteDSL.py
 
 def ceil_div(a, b):
     return (a + b - 1) // b

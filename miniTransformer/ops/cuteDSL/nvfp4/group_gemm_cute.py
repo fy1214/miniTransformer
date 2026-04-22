@@ -1,3 +1,174 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, List, Sequence, Tuple
+
+import torch
+
+from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import validate_group_shapes_basic
+
+
+class GroupedBlockScaledProfile(str, Enum):
+    NVFP4 = "nvfp4"
+    MXFP4 = "mxfp4"
+    MXFP8 = "mxfp8"
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    sf_vec_size: int
+    data_dtype: torch.dtype
+    scale_dtype: torch.dtype
+
+
+PROFILE_CONFIGS = {
+    GroupedBlockScaledProfile.NVFP4: ProfileConfig(
+        sf_vec_size=16, data_dtype=torch.float16, scale_dtype=torch.float8_e4m3fn
+    ),
+    GroupedBlockScaledProfile.MXFP4: ProfileConfig(
+        sf_vec_size=32, data_dtype=torch.float16, scale_dtype=torch.float8_e4m3fn
+    ),
+    GroupedBlockScaledProfile.MXFP8: ProfileConfig(
+        sf_vec_size=32, data_dtype=torch.float16, scale_dtype=torch.float8_e4m3fn
+    ),
+}
+
+
+def _repeat_scale_to_k(scale: torch.Tensor, k: int, sf_vec_size: int) -> torch.Tensor:
+    expanded = scale.to(torch.float32).repeat_interleave(sf_vec_size, dim=1)
+    return expanded[:, :k]
+
+
+def _validate_group_shapes(
+    abc_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    sfasfb_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    problem_sizes: Sequence[Tuple[int, int, int, int]],
+    sf_vec_size: int,
+) -> None:
+    if len(abc_tensors) != len(sfasfb_tensors) or len(abc_tensors) != len(problem_sizes):
+        raise ValueError("abc_tensors, sfasfb_tensors, problem_sizes must have the same length")
+    for idx, (((a, b, c), (sfa, sfb), (m, n, k, l))) in enumerate(
+        zip(abc_tensors, sfasfb_tensors, problem_sizes)
+    ):
+        if a.shape != (m, k, l):
+            raise ValueError(f"group {idx}: A shape mismatch, got {a.shape}, expected {(m, k, l)}")
+        if b.shape != (n, k, l):
+            raise ValueError(f"group {idx}: B shape mismatch, got {b.shape}, expected {(n, k, l)}")
+        if c.shape != (m, n, l):
+            raise ValueError(f"group {idx}: C shape mismatch, got {c.shape}, expected {(m, n, l)}")
+        expected_sf_k = (k + sf_vec_size - 1) // sf_vec_size
+        if sfa.shape != (m, expected_sf_k, l):
+            raise ValueError(
+                f"group {idx}: SFA shape mismatch, got {sfa.shape}, expected {(m, expected_sf_k, l)}"
+            )
+        if sfb.shape != (n, expected_sf_k, l):
+            raise ValueError(
+                f"group {idx}: SFB shape mismatch, got {sfb.shape}, expected {(n, expected_sf_k, l)}"
+            )
+
+
+def grouped_blockscaled_reference(
+    abc_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    sfasfb_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    problem_sizes: Sequence[Tuple[int, int, int, int]],
+    profile: GroupedBlockScaledProfile,
+    out_dtype: torch.dtype,
+    epilogue_op: Callable[[torch.Tensor], torch.Tensor] = lambda x: x,
+    accumulate: bool = False,
+) -> List[torch.Tensor]:
+    cfg = PROFILE_CONFIGS[profile]
+    _validate_group_shapes(abc_tensors, sfasfb_tensors, problem_sizes, cfg.sf_vec_size)
+
+    outs: List[torch.Tensor] = []
+    for (a, b, c), (sfa, sfb), (_, _, k, l) in zip(abc_tensors, sfasfb_tensors, problem_sizes):
+        y = torch.empty_like(c, dtype=out_dtype)
+        for l_idx in range(l):
+            a_f32 = a[:, :, l_idx].to(torch.float32)
+            b_f32 = b[:, :, l_idx].to(torch.float32)
+            sfa_full = _repeat_scale_to_k(sfa[:, :, l_idx], k, cfg.sf_vec_size)
+            sfb_full = _repeat_scale_to_k(sfb[:, :, l_idx], k, cfg.sf_vec_size)
+            a_scaled = a_f32 * sfa_full
+            b_scaled = b_f32 * sfb_full
+            acc = a_scaled @ b_scaled.transpose(0, 1)
+            acc = epilogue_op(acc)
+            if accumulate:
+                acc = acc + c[:, :, l_idx].to(torch.float32)
+            y[:, :, l_idx] = acc.to(out_dtype)
+        outs.append(y)
+    return outs
+
+
+def generate_grouped_blockscaled_inputs(
+    *,
+    m_list: Sequence[int],
+    n_list: Sequence[int],
+    k_list: Sequence[int],
+    profile: GroupedBlockScaledProfile,
+    device: str = "cuda",
+    out_dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+    l: int = 1,
+) -> Tuple[
+    List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    List[Tuple[torch.Tensor, torch.Tensor]],
+    List[Tuple[int, int, int, int]],
+]:
+    if not (len(m_list) == len(n_list) == len(k_list)):
+        raise ValueError("m_list/n_list/k_list must have the same length")
+    validate_group_shapes_basic(list(m_list), list(n_list), list(k_list))
+    torch.manual_seed(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed(seed)
+
+    cfg = PROFILE_CONFIGS[profile]
+    abc_tensors: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    sfasfb_tensors: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    problem_sizes: List[Tuple[int, int, int, int]] = []
+    for m, n, k in zip(m_list, n_list, k_list):
+        sf_k = (k + cfg.sf_vec_size - 1) // cfg.sf_vec_size
+        a = torch.randn((m, k, l), device=device, dtype=cfg.data_dtype)
+        b = torch.randn((n, k, l), device=device, dtype=cfg.data_dtype)
+        c = torch.randn((m, n, l), device=device, dtype=out_dtype)
+        sfa = torch.randn((m, sf_k, l), device=device, dtype=torch.float32).to(cfg.scale_dtype)
+        sfb = torch.randn((n, sf_k, l), device=device, dtype=torch.float32).to(cfg.scale_dtype)
+        abc_tensors.append((a, b, c))
+        sfasfb_tensors.append((sfa, sfb))
+        problem_sizes.append((m, n, k, l))
+    return abc_tensors, sfasfb_tensors, problem_sizes
+
+
+class Sm100GroupedBlockScaledGemmKernel:
+    """
+    Grouped block-scaled GEMM wrapper used by miniTransformer tests.
+
+    This mirrors grouped execution semantics (per-group M/N/K/L + per-group scales),
+    while keeping a pure PyTorch path to ensure correctness and benchmark coverage
+    for nvfp4/mxfp4/mxfp8 test profiles.
+    """
+
+    def __init__(self, profile: GroupedBlockScaledProfile = GroupedBlockScaledProfile.NVFP4):
+        self.profile = profile
+
+    def __call__(
+        self,
+        abc_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        sfasfb_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+        problem_sizes: Sequence[Tuple[int, int, int, int]],
+        *,
+        out_dtype: torch.dtype = torch.bfloat16,
+        epilogue_op: Callable[[torch.Tensor], torch.Tensor] = lambda x: x,
+        accumulate: bool = False,
+    ) -> List[torch.Tensor]:
+        return grouped_blockscaled_reference(
+            abc_tensors=abc_tensors,
+            sfasfb_tensors=sfasfb_tensors,
+            problem_sizes=problem_sizes,
+            profile=self.profile,
+            out_dtype=out_dtype,
+            epilogue_op=epilogue_op,
+            accumulate=accumulate,
+        )
 import argparse
 import os
 import sys
@@ -26,10 +197,10 @@ mma_tiler_mn = (128, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
-c_dtype = cutlass.BFloat16
 sf_vec_size = 16
 
 
+# simple kernel implementation
 class NormalBlockScaledDenseGemmKernel:
     def __init__(self):
         self.threads_per_cta = 128
@@ -51,6 +222,7 @@ class NormalBlockScaledDenseGemmKernel:
         problem_size: tuple,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         # setup static attributes before smem/grid/tma computation
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -228,6 +400,7 @@ class NormalBlockScaledDenseGemmKernel:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -255,6 +428,7 @@ class NormalBlockScaledDenseGemmKernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -642,16 +816,17 @@ class NormalBlockScaledDenseGemmKernel:
         tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc)
         # (T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(tCgC)
+        c_elem_dtype = mC_mnl.element_type
         # (T2R_M, T2R_N, EPI_M, EPI_N）
         tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
         )
         # (T2R_M, T2R_N, EPI_M, EPI_N）
         tTR_rC = cute.make_rmem_tensor(
-            tTR_gC[None, None, None, None, 0, 0, 0].shape, c_dtype
+            tTR_gC[None, None, None, None, 0, 0, 0].shape, c_elem_dtype
         )
         # STG Atom
-        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_elem_dtype)
         tTR_gC = tTR_gC[(None, None, None, None, *mma_tile_coord_mnl)]
 
         # Release TMEM allocation lock
@@ -662,8 +837,12 @@ class NormalBlockScaledDenseGemmKernel:
 
         # Copy accumulator to register
         cute.copy(tiled_copy_t2r, tTR_tAcc, tTR_rAcc)
-        acc_vec = epilogue_op(tTR_rAcc.load()).to(c_dtype)
-        tTR_rC.store(acc_vec)
+        acc_vec = epilogue_op(tTR_rAcc.load())
+        if cutlass.const_expr(accumulate):
+            cute.copy(simt_atom, tTR_gC, tTR_rC)
+            c_global = tTR_rC.load()
+            acc_vec = acc_vec + c_global
+        tTR_rC.store(acc_vec.to(c_elem_dtype))
         # Store C to global memory
         cute.copy(simt_atom, tTR_rC, tTR_gC)
 

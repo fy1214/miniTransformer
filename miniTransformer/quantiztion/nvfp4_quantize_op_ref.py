@@ -369,6 +369,117 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
 
         return cast_to_fp4x2(clipped_x), decode_scale.squeeze(-1)
 
+    @classmethod
+    def _dequantize_blockwise_reference(
+        cls,
+        qx: torch.Tensor,
+        decode_scale: torch.Tensor,
+        original_shape: Tuple[int, int],
+        tile_len_x: int,
+        tile_len_y: int,
+        *,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        Blockwise NVFP4 dequantize; inverse of _quantize_blockwise_reference.
+
+        Args:
+            qx          : packed uint8 tensor, shape [M, N//2]
+                          （每个字节存 2 个 FP4，低 4 bit 为偶数列，高 4 bit 为奇数列）
+            decode_scale: fp8_e4m3fn tensor, shape [M, N//tile_len_x]
+                          （每个 tile 对应一个 scale）
+            original_shape: (M, N) 原始未 pad 的尺寸
+            tile_len_x  : tile 的列数（一般为 16）
+            tile_len_y  : tile 的行数（1D 量化为 1，2D 量化为 16）
+            out_dtype   : 输出 dtype
+
+        Returns:
+            dequantized tensor, shape [M, N]，dtype=out_dtype
+        """
+        M_orig, N_orig = original_shape
+
+        # 1. 解包 packed uint8 → float，shape [M, N]
+        #    cast_from_fp4x2 输出 shape [M_packed, N_orig]（已裁剪到原始列数）
+        x_fp4 = cast_from_fp4x2(qx, torch.float32)   # [M, N]，每个元素是 FP4 的浮点值
+
+        M, N = x_fp4.shape
+
+        # 2. reshape 成 tile 视图，乘以 decode_scale
+        #    decode_scale shape: [M, N//tile_len_x]，对应每行每 tile 一个 scale
+        #    x_fp4 reshape: [M, N//tile_len_x, tile_len_x]
+        x_tiles = x_fp4.view(M, N // tile_len_x, tile_len_x)          # [M, num_tiles, tile_len_x]
+
+        # decode_scale 是 fp8_e4m3fn，转 float32 再用
+        scale = decode_scale.to(torch.float32)                          # [M, num_tiles]
+
+        # tile_len_y > 1 时（2D 量化），scale 的行维度已经被 repeat_interleave 展开，
+        # 此时 scale shape 仍是 [M, N//tile_len_x]，与 1D 路径一致，无需额外处理
+        x_dequant = x_tiles * scale.unsqueeze(-1)                       # [M, num_tiles, tile_len_x]
+        x_dequant = x_dequant.view(M, N)                                # [M, N]
+
+        # 3. 裁剪到原始尺寸（去掉 padding）
+        x_dequant = x_dequant[:M_orig, :N_orig].contiguous()
+
+        return x_dequant.to(out_dtype)
+
+    def dequantize(
+        self,
+        qx: torch.Tensor,
+        sx: torch.Tensor,
+        global_amax: torch.Tensor,
+        out_dtype: torch.dtype = torch.bfloat16,
+        qparams: Optional["quantization.QParams"] = None,
+    ) -> torch.Tensor:
+        """
+        对应 quantize() 的反操作。
+
+        Args:
+            qx         : packed uint8，shape [M, N//2]
+            sx         : decode_scale，fp8_e4m3fn，shape [M, N//tile_len_x]
+            global_amax: 全局 amax（pow_2_scales=False 时用于还原 global_decode_scale）
+            out_dtype  : 输出 dtype（默认 bfloat16）
+            qparams    : 量化参数，None 时使用默认值
+
+        Returns:
+            dequantized tensor，shape [M, N]，dtype=out_dtype
+        """
+        if qparams is None:
+            # 默认参数：1x16 tile，非 pow_2_scales，非 2D 量化
+            tile_len_x = 16
+            tile_len_y = 1
+            pow_2_scales = False
+            with_2d_quantization = False
+        else:
+            tile_len_x = qparams.quant_tile_shape[1]
+            tile_len_y = qparams.quant_tile_shape[0]
+            pow_2_scales = qparams.pow_2_scales
+            with_2d_quantization = qparams.with_2d_quantization
+
+        # qx shape: [M, N//2]，原始 N = qx.shape[1] * 2
+        M = qx.shape[0]
+        N = qx.shape[1] * 2
+
+        if pow_2_scales:
+            # pow_2_scales 路径：decode_scale 直接就是 scale，不需要 global_decode_scale
+            actual_scale = sx
+        else:
+            # 非 pow_2_scales 路径：
+            # 量化时 decode_scale = (vec_max / E2M1_MAX) * global_encode_scale
+            # 反量化时需要乘以 global_decode_scale = 1 / global_encode_scale = global_amax / (E4M3_MAX * E2M1_MAX)
+            FLOAT8_E4M3_MAX = 448.0
+            FLOAT4_E2M1_MAX = 6.0
+            global_decode_scale = global_amax.to(torch.float32) / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+            actual_scale = sx.to(torch.float32) * global_decode_scale
+
+        return self._dequantize_blockwise_reference(
+            qx,
+            actual_scale,
+            original_shape=(M, N),
+            tile_len_x=tile_len_x,
+            tile_len_y=tile_len_y,
+            out_dtype=out_dtype,
+        )
+
     def _quantize(
         self,
         x: torch.Tensor,

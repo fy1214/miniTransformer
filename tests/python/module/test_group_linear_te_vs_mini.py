@@ -25,6 +25,7 @@ from transformer_engine.common import recipe
 
 from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
 from miniTransformer.module.group_linear import GroupedLinear as MiniGroupedLinear
+from miniTransformer.quantiztion.quantization import QParams, ParamType
 
 
 # ==================== Recipe ====================
@@ -32,9 +33,13 @@ from miniTransformer.module.group_linear import GroupedLinear as MiniGroupedLine
 def make_nvfp4_recipe() -> recipe.NVFP4BlockScaling:
     """标准 NVFP4BlockScaling recipe。"""
     r = recipe.NVFP4BlockScaling()
-    r.fp4_quant_fwd_inp    = recipe.QParams()
-    r.fp4_quant_fwd_weight = recipe.QParams()
-    r.fp4_quant_bwd_grad   = recipe.QParams()
+
+    # # Stochastic_rounding will random the quantize result. So we disable it.
+    r.fp4_quant_bwd_grad   = recipe.QParams(
+        random_hadamard_transform=True,
+        stochastic_rounding=False,
+        fp4_2d_quantization=False,
+    )
     return r
 
 
@@ -71,6 +76,18 @@ def build_mini_grouped_linear(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     qlinear_params = get_qlinear_params_from_predefined(qparam)
+
+    # Stochastic_rounding will random the quantize result. So we disable it.
+    qlinear_params.g_params =QParams(
+        output_dtype=torch.uint8,
+        scaling_dtype=torch.float8_e4m3fn,
+        quant_tile_shape=(1, 16),
+        with_2d_quantization=False,
+        with_rht=True,
+        stochastic_rounding=False,
+        param_type=ParamType.Y
+    )
+
     return MiniGroupedLinear(
         num_gemms=num_gemms,
         in_features=in_features,

@@ -8,7 +8,7 @@ from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
 import transformer_engine.pytorch.cpp_extensions as tex
-from transformer_engine.pytorch import NVFP4Quantizer
+from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
 from transformer_engine.pytorch.cpp_extensions import split_quantize
 from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
@@ -150,7 +150,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
                 amax_reduction_group=None,
                 with_rht=qparams.with_rht,
                 with_post_rht_amax=qparams.with_rht,
-                with_2d_quantization=False,
+                with_2d_quantization=qparams.with_2d_quantization,
                 stochastic_rounding=qparams.stochastic_rounding
             )
             quantizers.append(x_quantizer)

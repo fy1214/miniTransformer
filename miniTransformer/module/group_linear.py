@@ -208,7 +208,8 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         tw_t = ctx.tw_t
         weights = list(ctx.saved_tensors)   # plain weight tensors
 
-        assert qw_t is not None and sw_t is not None
+        if not ctx.disable_backward_quant:
+            assert qw_t is not None and sw_t is not None
 
         # Set dtypes, shapes
         out_dtype_dgrad = (

@@ -15,7 +15,7 @@ def get_hadamard_matrix(group_size: int, dtype: torch.dtype, device: torch.devic
         dtype=dtype,
         device=device,
         requires_grad=False,
-        )
+    )
 
 
 def rerotate_hadamard(hadamard_matrix):
@@ -203,7 +203,8 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]
         # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
 
-        alpha = global_amax_qx * global_amax_qw
+        #alpha = global_amax_qx * global_amax_qw
+        alpha = 1.0 * global_amax_qw
         backend = dispatch_gemm_backend(custom_gemm_backend, "nvfp4")
         out = backend.gemm(
             qx, qw, out_dtype, sx, sw,

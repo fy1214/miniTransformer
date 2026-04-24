@@ -3,11 +3,11 @@ from typing import Dict, List
 import pytest
 import torch
 
-from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_cute import (
-    GroupedBlockScaledProfile,
-    Sm100GroupedBlockScaledGemmKernel,
-    generate_grouped_blockscaled_inputs,
-    grouped_blockscaled_reference,
+from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_fp8 import (
+    BlockwiseGroupedFp8Profile,
+    BlockwiseContiguousGroupedGemmKernel,
+    generate_grouped_blockwise_fp8_inputs,
+    grouped_blockwise_fp8_reference,
 )
 
 
@@ -29,36 +29,20 @@ BENCHMARK_CASES: List[Dict[str, object]] = [
 ]
 
 PROFILE_CASES = [
-    pytest.param(GroupedBlockScaledProfile.NVFP4, id="nvfp4"),
-    pytest.param(GroupedBlockScaledProfile.MXFP4, id="mxfp4"),
-    pytest.param(GroupedBlockScaledProfile.MXFP8, id="mxfp8"),
+    pytest.param(BlockwiseGroupedFp8Profile.FP8, id="fp8"),
 ]
 CASE_PARAMS = [
     pytest.param(case, id=f"bench_case_{idx}") for idx, case in enumerate(BENCHMARK_CASES)
 ]
 
 
-def _benchmark_kernel_call(kernel_call, warmup: int = 2, iters: int = 5) -> float:
-    for _ in range(warmup):
-        _ = kernel_call()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(iters):
-        _ = kernel_call()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) * 1000.0 / iters
-
-
-class TestGroupedBlockScaledGemm:
+class TestBlockwiseGroupedFp8Gemm:
     @pytest.mark.parametrize("profile", PROFILE_CASES)
     @pytest.mark.parametrize("case", CASE_PARAMS)
     def test_grouped_gemm_correctness(self, profile, case):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
-        abc_tensors, sfasfb_tensors, problem_sizes = generate_grouped_blockscaled_inputs(
+        abc_tensors, scale_tensors, problem_sizes = generate_grouped_blockwise_fp8_inputs(
             m_list=case["m"],
             n_list=case["n"],
             k_list=case["k"],
@@ -68,19 +52,18 @@ class TestGroupedBlockScaledGemm:
             seed=7,
             l=1,
         )
-        kernel = Sm100GroupedBlockScaledGemmKernel(profile=profile)
-        got = kernel(
+        kernel = BlockwiseContiguousGroupedGemmKernel(profile=profile)
+        got = kernel.run_from_grouped_inputs(
             abc_tensors=abc_tensors,
-            sfasfb_tensors=sfasfb_tensors,
+            scale_tensors=scale_tensors,
             problem_sizes=problem_sizes,
             out_dtype=torch.bfloat16,
             accumulate=False,
         )
-        ref = grouped_blockscaled_reference(
+        ref = grouped_blockwise_fp8_reference(
             abc_tensors=abc_tensors,
-            sfasfb_tensors=sfasfb_tensors,
+            scale_tensors=scale_tensors,
             problem_sizes=problem_sizes,
-            profile=profile,
             out_dtype=torch.bfloat16,
             accumulate=False,
         )
@@ -91,7 +74,7 @@ class TestGroupedBlockScaledGemm:
                 r.to(torch.float32),
                 rtol=1e-2,
                 atol=1e-6,
-                msg=f"group {idx} mismatch for profile={profile.value}",
+                msg=f"group {idx} mismatch for profile={profile.name.lower()}",
             )
 
     @pytest.mark.parametrize("profile", PROFILE_CASES)
@@ -99,7 +82,7 @@ class TestGroupedBlockScaledGemm:
     def test_grouped_gemm_benchmark_shapes(self, profile, case):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
-        abc_tensors, sfasfb_tensors, problem_sizes = generate_grouped_blockscaled_inputs(
+        abc_tensors, scale_tensors, problem_sizes = generate_grouped_blockwise_fp8_inputs(
             m_list=case["m"],
             n_list=case["n"],
             k_list=case["k"],
@@ -109,21 +92,41 @@ class TestGroupedBlockScaledGemm:
             seed=17,
             l=1,
         )
-        kernel = Sm100GroupedBlockScaledGemmKernel(profile=profile)
-        elapsed_us = _benchmark_kernel_call(
-            lambda: kernel(
-                abc_tensors=abc_tensors,
-                sfasfb_tensors=sfasfb_tensors,
-                problem_sizes=problem_sizes,
-                out_dtype=torch.bfloat16,
-                accumulate=False,
+        kernel = BlockwiseContiguousGroupedGemmKernel(profile=profile)
+        got = kernel.run_from_grouped_inputs(
+            abc_tensors=abc_tensors,
+            scale_tensors=scale_tensors,
+            problem_sizes=problem_sizes,
+            out_dtype=torch.bfloat16,
+            accumulate=False,
+            warmup_iterations=2,
+            iterations=5,
+            use_cold_l2=True,
+        )
+        ref = grouped_blockwise_fp8_reference(
+            abc_tensors=abc_tensors,
+            scale_tensors=scale_tensors,
+            problem_sizes=problem_sizes,
+            out_dtype=torch.bfloat16,
+            accumulate=False,
+        )
+        for idx, (g, r) in enumerate(zip(got, ref)):
+            torch.testing.assert_close(
+                g.to(torch.float32),
+                r.to(torch.float32),
+                rtol=1e-2,
+                atol=1e-6,
+                msg=f"group {idx} benchmark mismatch for profile={profile.name.lower()}",
             )
-        )
+        metrics = kernel.last_benchmark_metrics
         print(
-            f"[group-gemm-bench] profile={profile.value}, "
-            f"g={case['g']}, elapsed={elapsed_us:.3f} us"
+            f"[group-gemm-bench] profile={profile.name.lower()}, "
+            f"g={case['g']}, metrics={metrics}"
         )
-        assert elapsed_us > 0.0
+       
+        for metric in metrics:
+            assert metric["avg_runtime_us"] > 0.0
+            assert metric["gflops"] > 0.0
 
 
 if __name__ == "__main__":

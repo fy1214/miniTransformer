@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from typing import Callable, Dict, Optional, Tuple, Union, Any
 from miniTransformer.module import config
@@ -249,7 +250,7 @@ class LayerNormLinear(Linear):
             use_te_norm = should_switch_to_hybrid_linear()
 
         if use_te_norm:
-            self.layer_norm_weight = make_te_norm(
+            _norm = make_te_norm(
                 normalization,
                 in_features,
                 eps=eps,
@@ -259,7 +260,7 @@ class LayerNormLinear(Linear):
                 device=device,
             )
         else:
-            self.layer_norm_weight = make_torch_norm(
+            _norm = make_torch_norm(
                 normalization,
                 in_features,
                 eps=eps,
@@ -268,6 +269,21 @@ class LayerNormLinear(Linear):
                 zero_centered_gamma=zero_centered_gamma,
                 device=device,
             )
+
+        # 把 gamma/beta 直接注册为当前模块的参数，与 TE 对齐：
+        #   TE  : layer_norm_weight  (nn.Parameter)
+        #   mini: layer_norm_weight  (nn.Parameter)  ← 不再是 layer_norm_weight.weight
+        # 同时把 _norm 存为普通 Python 属性（绕过 nn.Module.__setattr__），
+        # 避免它作为子模块出现在 state_dict 里
+        self.register_parameter("layer_norm_weight", _norm._parameters.pop("weight", None))
+        if normalization == "LayerNorm":
+            self.register_parameter("layer_norm_bias", _norm._parameters.pop("bias", None))
+        else:
+            self.layer_norm_bias = None
+
+        # 保存 norm 所需的元信息，forward 时用 F.layer_norm / F.rms_norm 直接调用
+        self._layer_norm_eps = _norm.eps
+        self._layer_norm_normalized_shape = getattr(_norm, "normalized_shape", (in_features,))
 
     @torch._dynamo.disable(recursive=True)
     def forward(
@@ -299,8 +315,22 @@ class LayerNormLinear(Linear):
         """
         inp = inp.contiguous()
 
-        # Run normalization without fusion
-        ln_out = self.layer_norm_weight(inp)
+        # 用 F.layer_norm / F.rms_norm 直接计算，避免引入带参数的子模块
+        if self.normalization == "LayerNorm":
+            ln_out = F.layer_norm(
+                inp,
+                self._layer_norm_normalized_shape,
+                weight=self.layer_norm_weight,
+                bias=self.layer_norm_bias,
+                eps=self._layer_norm_eps,
+            )
+        else:  # RMSNorm
+            ln_out = F.rms_norm(
+                inp,
+                self._layer_norm_normalized_shape,
+                weight=self.layer_norm_weight,
+                eps=self._layer_norm_eps,
+            )
         input_meta = None
 
         # Run the linear layer by calling parent's forward

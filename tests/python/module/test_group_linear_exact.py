@@ -418,7 +418,7 @@ def list_available_qparams():
 
 # ==================== Main Test Runner ====================
 
-def run_all_tests(qparam_id: int = 5, test_ids: list = None):
+def run_all_tests(qparam_id: int = 4, test_ids: list = None):
     """
     Run GroupLinear tests.
     

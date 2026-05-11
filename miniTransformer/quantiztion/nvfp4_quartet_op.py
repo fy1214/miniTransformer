@@ -1,7 +1,10 @@
+import os
 import torch
 import fp4_gemm
-from typing import Optional
+from typing import Optional, List, Tuple
 from scipy.linalg import hadamard
+from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend
 from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
@@ -39,6 +42,95 @@ def unblock(blocked_scales, rows, cols):
     rearranged = rearranged.permute(0, 2, 1, 3)
     # Reverse: view(n_row_blocks, 128, n_col_blocks, 4)
     return rearranged.reshape(n_row_blocks * 128, n_col_blocks * 4)
+
+
+_NVFP4_SF_VEC_SIZE = 16
+_NVFP4_FP4_MAX = 6.0
+_NVFP4_FP8_MAX = 448.0
+_GROUPED_GEMM_CUTEDSL_ENV = "MINITRANSFORMER_ENABLE_GROUPED_GEMM_CUTEDSL"
+
+
+def is_sm100() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+
+
+def is_grouped_gemm_cutedsl_enabled() -> bool:
+    value = os.environ.get(_GROUPED_GEMM_CUTEDSL_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _make_fp4_tensor_for_cutedsl(
+    data_uint8: torch.Tensor, mode0: int, K: int, device: torch.device
+) -> torch.Tensor:
+    buf = torch.empty(mode0 * K, dtype=torch.int8, device=device)
+    buf[: mode0 * K // 2].copy_(data_uint8.reshape(-1).view(torch.int8))
+    return buf.view(mode0, K, 1)
+
+
+def _make_cute_sf(
+    sf_2d: torch.Tensor, mn: int, sf_k: int, l: int = 1
+) -> torch.Tensor:
+    from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
+
+    if sf_2d.dtype == torch.uint8:
+        sf_fp8 = sf_2d[:mn, :sf_k].contiguous().view(torch.float8_e4m3fn)
+    else:
+        sf_fp8 = sf_2d[:mn, :sf_k]
+    ref = sf_fp8.cpu().unsqueeze(-1)
+    return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+
+
+def grouped_gemm_cutedsl(
+    A: list,
+    B: list,
+    m_splits: list,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute import (
+        Sm100GroupedBlockScaledGemmKernel,
+        GroupedBlockScaledProfile,
+    )
+
+    device = A[0]._rowwise_data.device
+    K = A[0]._rowwise_data.shape[1] * 2
+    sf_k = K // _NVFP4_SF_VEC_SIZE
+    alpha_denom = _NVFP4_FP8_MAX * _NVFP4_FP8_MAX * _NVFP4_FP4_MAX * _NVFP4_FP4_MAX
+
+    abc_torch, sfasfb_torch, problem_sizes, alphas = [], [], [], []
+    for i, m_i in enumerate(m_splits):
+        n_i = B[i]._rowwise_data.shape[0]
+
+        a_fp4 = _make_fp4_tensor_for_cutedsl(A[i]._rowwise_data, m_i, K, device)
+        b_fp4 = _make_fp4_tensor_for_cutedsl(B[i]._rowwise_data, n_i, K, device)
+        c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
+
+        sfa = _make_cute_sf(A[i]._rowwise_scale_inv, m_i, sf_k)
+        sfb = _make_cute_sf(B[i]._rowwise_scale_inv, n_i, sf_k)
+
+        abc_torch.append([a_fp4, b_fp4, c_out])
+        sfasfb_torch.append([sfa, sfb])
+        problem_sizes.append((m_i, n_i, K, 1))
+
+        amax_a = A[i]._amax_rowwise.float().item()
+        amax_b = B[i]._amax_rowwise.float().item()
+        alphas.append(amax_a * amax_b / alpha_denom)
+
+    try:
+        kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
+    except AttributeError as exc:
+        raise NotImplementedError(
+            "grouped_gemm_cutedsl requires newer cuteDSL/cutlass with required arch helpers"
+        ) from exc
+
+    results = kernel.run_from_grouped_inputs(
+        abc_tensors={"torch": abc_torch},
+        sfasfb_tensors={"torch": sfasfb_torch},
+        problem_sizes=problem_sizes,
+        out_dtype=out_dtype,
+        accumulate=False,
+    )
+    corrected = [r.float() * a for r, a in zip(results, alphas)]
+    return torch.cat(corrected, dim=0).to(out_dtype)
 
 
 class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
@@ -213,3 +305,89 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         )
 
         return out
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad: bool = False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+        activation_dtype = out_dtype
+
+        a0 = A[0]
+        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
+        if (
+            is_grouped_gemm_cutedsl_enabled()
+            and is_quantized
+            and not grad
+            and not gelu
+            and not accumulate
+            and layout == "TN"
+            and is_sm100()
+        ):
+            try:
+                # Keep compatibility with existing tests/tools that patch the
+                # legacy nvfp4_quantize_op entrypoint.
+                from miniTransformer.quantiztion.nvfp4_quantize_op import _grouped_gemm_cutedsl
+
+                return _grouped_gemm_cutedsl(A, B, m_splits, activation_dtype)
+            except (TypeError, NotImplementedError):
+                pass
+
+        if grad:
+            if layout == "NN":
+                if is_quantized:
+                    n_cols = B[0]._rowwise_data.size(1) * 2
+                else:
+                    n_cols = B[0].size(1)
+                out = torch.empty(
+                    [sum(m_splits), n_cols],
+                    dtype=activation_dtype,
+                    device=B[0].device,
+                )
+                out = [out]
+        else:
+            if is_quantized:
+                n_cols = B[0]._rowwise_data.size(0)
+            else:
+                n_cols = B[0].size(0)
+            out = torch.empty(
+                [sum(m_splits), n_cols],
+                dtype=activation_dtype,
+                device=B[0].device,
+            )
+            out = [out]
+
+        general_grouped_gemm(
+            A=B,
+            B=A,
+            out=out,
+            out_dtype=activation_dtype,
+            layout=layout,
+            m_splits=m_splits,
+            single_output=False if (grad and layout == "NT") else True,
+            grad=grad,
+            bias=bias,
+            use_bias=use_bias,
+            use_split_accumulator=False,
+            accumulate=accumulate,
+        )
+
+        if grad and layout == "NT":
+            return out
+        return out[0]

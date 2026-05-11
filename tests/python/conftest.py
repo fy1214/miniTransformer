@@ -13,6 +13,10 @@ import pytest
 import torch
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _find_project_root() -> Path:
     """Walk up from this file until we find the directory that contains the miniTransformer package."""
     path = Path(__file__).resolve().parent
@@ -87,3 +91,24 @@ def pytest_configure(config):
         "markers",
         "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     )
+
+
+def pytest_ignore_collect(collection_path, config):
+    path_str = str(collection_path)
+    if path_str.endswith("test_group_linear_cutedsl_forward.py"):
+        return not _env_enabled("MINITRANSFORMER_ENABLE_GROUPED_GEMM_CUTEDSL")
+    return False
+
+
+def pytest_collection_modifyitems(config, items):
+    if _env_enabled("MINITRANSFORMER_ENABLE_GROUPED_GEMM_CUTEDSL"):
+        return
+
+    skip_reason = (
+        "requires MINITRANSFORMER_ENABLE_GROUPED_GEMM_CUTEDSL=1 "
+        "to run grouped cuteDSL forward tests"
+    )
+    skip_marker = pytest.mark.skip(reason=skip_reason)
+    for item in items:
+        if "test_group_linear_cutedsl_forward.py" in str(item.fspath):
+            item.add_marker(skip_marker)

@@ -28,6 +28,15 @@ block scale 设计（参考 nvfp4_quantize_op_ref._quantize_blockwise_reference�
     实际 activation shape=(146, 2560) 时会 skip（146 不整除）
 """
 import torch
+
+# CUDA Graph compatible: lazy pos_vals cache per device
+_POS_VALS_CACHE: dict = {}
+
+def _get_cached_pos_vals(name: str, vals_cpu: torch.Tensor, device) -> torch.Tensor:
+    key = f"{name}:{device}"
+    if key not in _POS_VALS_CACHE:
+        _POS_VALS_CACHE[key] = vals_cpu.to(device)
+    return _POS_VALS_CACHE[key]
 from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
 
 
@@ -85,7 +94,7 @@ def reconstruct_fp(sign, e_stored, m_int, bias, m_max):
     is_denorm = (e_stored == 0) & (m_int != 0)
 
     val_norm = torch.pow(2.0, e_f - bias) * (1.0 + m_f / m_max)
-    val_denorm = torch.pow(2.0, torch.tensor(1.0 - bias)) * (m_f / m_max)
+    val_denorm = (2.0 ** (1.0 - bias)) * (m_f / m_max)
 
     val = torch.where(~is_zero & ~is_denorm, val_norm,
                       torch.where(is_denorm, val_denorm,
@@ -116,16 +125,17 @@ def quantize_scale_to_e4m3(scale: torch.Tensor) -> torch.Tensor:
 # MX E2M1 查表量化（用于 FP4 格式）
 # ============================================================
 
+_MX_E2M1_POS = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
 def mx_e2m1_quantize(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                            dtype=torch.float32).cuda()
-    x32 = x.float()
+    pos_vals = _get_cached_pos_vals("MX_E2M1", _MX_E2M1_POS, x.device)
+    x32  = x.float()
     sign = torch.sign(x32)
     sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    abs_x = x32.abs()
-
-    diff = (abs_x.unsqueeze(-1).cuda() - pos_vals.unsqueeze(0)).abs()
-    idx = diff.argmin(dim=-1)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
     return sign * pos_vals[idx]
 
 
@@ -152,12 +162,10 @@ def quant_dequant_block(
     """
     orig_shape = x.shape
     x32 = x.float().reshape(-1)
-    N = x32.numel()
-
-    # 补齐
-    pad = (block_size - N % block_size) % block_size
-    if pad > 0:
-        x32 = torch.cat([x32, torch.zeros(pad)])
+    N   = x32.numel()
+    assert N % block_size == 0, (
+        f"numel()={N} 必须是 block_size={block_size} 的整数倍，请在调用前 pad"
+    )
     x_blocks = x32.reshape(-1, block_size)  # [B, block_size]
 
     # ── 计算 block scale ──────────────────────────────────────
@@ -165,31 +173,23 @@ def quant_dequant_block(
     raw_scale = block_max / fp_max  # 未量化的 scale
 
     if scale_type == "e8m0":
-        log2_s = torch.ceil(torch.log2(raw_scale)).clamp(-127, 127)
-        scale_q = torch.pow(2.0, log2_s)  # 纯指数，精确 2 的幂
+        log2_s  = torch.ceil(torch.log2(raw_scale)).clamp(-127, 127)
+        scale_q = torch.pow(2.0, log2_s)
     elif scale_type == "e4m3":
-        # E4M3 存储 scale：ceil 后量化，保证 x_scaled 不超出 fp_max
-        # 先 ceil 到最近的 E4M3 可表示值（向上）
-        scale_q = quantize_scale_to_e4m3(raw_scale)
-        # 若量化后 scale 比 raw_scale 小（E4M3 向下舍入），则取下一个 E4M3 值
-        # 简单保守处理：只要 scale_q < raw_scale 就乘以 (1 + 1/8) 步进
-        # 更精确：重新用 ceil 语义量化
-        scale_q = _e4m3_ceil(raw_scale)
+        scale_q = raw_scale.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float32)
     else:
         raise ValueError(f"未知 scale_type: {scale_type}")
 
-    # ── 量化 ──────────────────────────────────────────────────
-    x_scaled = x_blocks / scale_q  # 缩放到 [-fp_max, fp_max]
+    # encode_scale 从量化后 scale_q 反算，保证 encode/decode 互逆
+    encode_scale = torch.reciprocal(scale_q.clamp(min=1e-38))
+    x_scaled = x_blocks * encode_scale
 
-    if debug and debug_name:
-        print(f"  [{debug_name}] fp_max={fp_max:.2f}, scale_type={scale_type}")
-        print(f"    x_scaled 范围: [{x_scaled.min():.4f}, {x_scaled.max():.4f}]")
-        print(f"    scale_q  范围: [{scale_q.min():.6f}, {scale_q.max():.6f}]")
+
 
     x_q = quantize_fn(x_scaled.reshape(-1)).reshape(-1, block_size)
 
     # ── 反量化 ────────────────────────────────────────────────
-    x_dq = (x_q * scale_q).reshape(-1)[:N].reshape(orig_shape)
+    x_dq = (x_q * scale_q).reshape(-1).reshape(orig_shape)
     return x_dq.bfloat16()
 
 
@@ -213,22 +213,49 @@ def _e4m3_ceil(raw_scale: torch.Tensor) -> torch.Tensor:
 # 各格式量化函数
 # ============================================================
 
-# ── E4M3 量化函数 ──
-def _quantize_e4m3(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=4, m_bits=3)
-    return reconstruct_fp(sign, e, m, bias, mm)
+_POS_VALS_E4M3 = torch.tensor(
+    [0, 0.001953125, 0.00390625, 0.005859375, 0.0078125, 0.01171875, 0.015625, 0.0234375, 0.03125, 0.046875, 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0, 256.0, 384.0, 448.0],
+    dtype=torch.float32
+)
+
+def _quantize_e4m3(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E4M3", _POS_VALS_E4M3, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
 
 
-# ── E4M1 量化函数 ──
-def _quantize_e4m1(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=4, m_bits=1)
-    return reconstruct_fp(sign, e, m, bias, mm)
+_POS_VALS_E4M1 = torch.tensor(
+    [0, 0.0078125, 0.015625, 0.0234375, 0.03125, 0.046875, 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384],
+    dtype=torch.float32
+)
+
+def _quantize_e4m1(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E4M1", _POS_VALS_E4M1, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
 
 
-# ── E2M3 量化函数 ──
-def _quantize_e2m3(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=2, m_bits=3)
-    return reconstruct_fp(sign, e, m, bias, mm)
+_POS_VALS_E2M3 = torch.tensor(
+    [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 3.75, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5],
+    dtype=torch.float32
+)
+
+def _quantize_e2m3(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E2M3", _POS_VALS_E2M3, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
 
 
 def fp_format_max(e_bits: int, m_bits: int) -> float:
@@ -344,46 +371,34 @@ def quant_dequant_nvfp4(x, block_size=16, debug=False):
     """
     orig_shape = x.shape
     x32 = x.float().reshape(-1)
-    N = x32.numel()
-    pad = (-N) % block_size
-    if pad:
-        x32 = torch.cat([x32, x32.new_zeros(pad)])
+    N   = x32.numel()
+    if N == 0:
+        return x
+    assert N % block_size == 0, f"numel()={N} 必须是 block_size={block_size} 的整数倍"
     x_blk = x32.reshape(-1, block_size)  # [B, 16]
     # ── Step 1: global scale（fp32，不量化）───────────────
-    amax = x32.abs().max().clamp(min=1e-38)
+    amax = x32.abs().amax().clamp(min=1e-38)
     global_scale = amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
     # global_scale ∈ fp32，原始 NVIDIA 实现不对它量化
-    if debug:
-        print(f"\n  [NVFP4-v1] amax={amax:.6f}")
-        print(f"    global_scale = {amax:.6f} / "
-              f"({_FP8_E4M3_MAX:.1f} * {_FP4_E2M1_MAX:.1f}) "
-              f"= {global_scale:.8f}")
+
     # ── Step 2: normalize ─────────────────────────────────
     x_norm = x_blk / global_scale  # 值域应在 ±448*6 内
     # 理想情况：x_norm 的 amax ≈ 448 * 6 = 2688
-    if debug:
-        print(f"    x_norm 范围: [{x_norm.min():.4f}, {x_norm.max():.4f}]")
-        print(f"    期望 x_norm amax ≈ {_FP8_E4M3_MAX * _FP4_E2M1_MAX:.1f}")
+
     # ── Step 3: per-block decode_scale，round-to-nearest（ref 风格）──
     block_amax = x_norm.abs().amax(dim=1, keepdim=True).clamp(min=1e-38)
     raw_bscale = block_amax / _FP4_E2M1_MAX  # 应在 [0, 448] 范围内
     bscale_q = cast_bscale_to_e4m3(raw_bscale)  # round-to-nearest，不 ceil
     # encode_scale 从量化后的 bscale_q 反算，保证 encode/decode 严格互逆
     encode_scale = torch.reciprocal(bscale_q.clamp(min=1e-38))
-    if debug:
-        print(f"    raw_bscale 范围: [{raw_bscale.min():.6f}, "
-              f"{raw_bscale.max():.6f}]")
-        print(f"    bscale_q   范围: [{bscale_q.min():.6f}, "
-              f"{bscale_q.max():.6f}]")
+
     # ── Step 4 & 5: scale + clamp 兜底 + quantize ─────────
     x_scaled = x_norm * encode_scale  # 应在 ±6.0 附近
     x_scaled = torch.clamp(x_scaled, -_FP4_E2M1_MAX, _FP4_E2M1_MAX)  # clamp 兜底
-    if debug:
-        print(f"    x_scaled 范围: [{x_scaled.min():.4f}, "
-              f"{x_scaled.max():.4f}]")
+
     x_q = mx_e2m1_quantize(x_scaled.reshape(-1)).reshape(-1, block_size)
     # ── Step 6: 重建 ──────────────────────────────────────
-    x_dq = (x_q * bscale_q * global_scale).reshape(-1)[:N].reshape(orig_shape)
+    x_dq = (x_q * bscale_q * global_scale).reshape(-1).reshape(orig_shape)
     return x_dq.bfloat16()
 
 
@@ -399,16 +414,17 @@ def quant_nvfp4_pertoken(x, block_size=16, debug=False):
       - block_scale  : [M*B, 1]    每 block 一个，B = K // block_size
     """
     orig_shape = x.shape
-    assert x.dim() == 2, f"期望 2D 输入 [M, K]，得到 {x.shape}"
     M, K = x.shape
+    if x.numel() == 0:
+        return x
+    if x.dim() != 2:
+        raise ValueError(f"期望 2D 输入 [M, K]，得到 {x.shape}")
     x32 = x.float()  # [M, K]
 
-    # ── pad K 到 block_size 的倍数 ────────────────────────────
-    pad = (-K) % block_size
-    if pad:
-        x32 = torch.cat([x32, x32.new_zeros(M, pad)], dim=1)
-    K_pad = x32.shape[1]
-    B = K_pad // block_size  # 每行的 block 数
+    assert K % block_size == 0, (
+        f"K={K} 必须是 block_size={block_size} 的整数倍，请在调用前 pad"
+    )
+    B = K // block_size  # 每行的 block 数
 
     # ── Step 1: Per-Token Global Scale ────────────────────────
     # 原始：amax(全局) / (448 * 6)
@@ -417,21 +433,13 @@ def quant_nvfp4_pertoken(x, block_size=16, debug=False):
     global_scale = token_amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)  # [M,1]
     # global_scale 保持 fp32，不量化（与原始一致）
 
-    if debug:
-        print(f"\n  [NVFP4-pertoken]  x: {tuple(orig_shape)}")
-        print(f"    token_amax  : [{token_amax.min():.4f}, "
-              f"{token_amax.max():.4f}]  shape={tuple(token_amax.shape)}")
-        print(f"    global_scale: [{global_scale.min():.8f}, "
-              f"{global_scale.max():.8f}]  shape={tuple(global_scale.shape)}")
+
 
     # ── Step 2: Per-Token Normalize ───────────────────────────
-    x_norm = x32 / global_scale  # [M, K_pad]
+    x_norm = x32 / global_scale  # [M, K]
     # 每行的 amax 现在都是 448 * 6 = 2688
 
-    if debug:
-        row_amax = x_norm.abs().amax(dim=1)
-        print(f"    x_norm 行 amax: [{row_amax.min():.2f}, "
-              f"{row_amax.max():.2f}]  期望 ≈ {_FP8_E4M3_MAX * _FP4_E2M1_MAX:.0f}")
+
 
     # ── Step 3: Per-Block decode_scale，round-to-nearest（ref 风格）──
     x_blocks = x_norm.reshape(M * B, block_size)  # [M*B, 16]
@@ -441,26 +449,20 @@ def quant_nvfp4_pertoken(x, block_size=16, debug=False):
     # encode_scale 从量化后的 bscale_q 反算，保证 encode/decode 严格互逆
     encode_scale = torch.reciprocal(bscale_q.clamp(min=1e-38))  # [M*B, 1]
 
-    if debug:
-        print(f"    raw_bscale  : [{raw_bscale.min():.4f}, "
-              f"{raw_bscale.max():.4f}]  shape={tuple(raw_bscale.shape)}")
-        print(f"    bscale_q    : [{bscale_q.min():.4f}, "
-              f"{bscale_q.max():.4f}]")
+
 
     # ── Step 4: scale + clamp 兜底 + quantize ─────────────────
     x_scaled = x_blocks * encode_scale  # [M*B, 16]
     x_scaled = torch.clamp(x_scaled, -_FP4_E2M1_MAX, _FP4_E2M1_MAX)  # clamp 兜底
-    if debug:
-        print(f"    x_scaled    : [{x_scaled.min():.4f}, {x_scaled.max():.4f}]")
+
     x_q = mx_e2m1_quantize(x_scaled.reshape(-1)).reshape(M * B, block_size)
 
     # ── Step 5: Dequantize ────────────────────────────────────
     # bscale_q:    [M*B, 1]
     # global_scale:[M,   1]  → 需要扩展到 [M*B, 1]
-    global_scale_expanded = global_scale.repeat_interleave(B, dim=0)  # [M*B, 1]
+    global_scale_expanded = global_scale.unsqueeze(1).expand(M, B, 1).reshape(M * B, 1)
 
-    x_dq = (x_q * bscale_q * global_scale_expanded)  # [M*B, 16]
-    x_dq = x_dq.reshape(M, K_pad)[:, :K]  # [M, K] 去掉 pad
+    x_dq = (x_q * bscale_q * global_scale_expanded).reshape(M, K)
 
     return x_dq.to(x.dtype)
 

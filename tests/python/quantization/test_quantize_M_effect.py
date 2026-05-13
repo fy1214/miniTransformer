@@ -23,6 +23,17 @@ quantize_exp_1.py
 """
 import torch
 
+# CUDA Graph compatible: lazy pos_vals cache per device
+_POS_VALS_CACHE: dict = {}
+
+def _get_cached_pos_vals(name: str, vals_cpu: torch.Tensor, device) -> torch.Tensor:
+    """First call moves tensor to device and caches; subsequent calls return cache.
+    Warmup before CUDA Graph capture triggers the H2D copy; capture sees no H2D ops."""
+    key = f"{name}:{device}"
+    if key not in _POS_VALS_CACHE:
+        _POS_VALS_CACHE[key] = vals_cpu.to(device)
+    return _POS_VALS_CACHE[key]
+
 # ============================================================
 # 核心：浮点分解 + 重建（与 quantize_exp.py 相同）
 # ============================================================
@@ -75,7 +86,7 @@ def reconstruct_fp(sign, e_stored, m_int, bias, m_max):
     is_denorm = (e_stored == 0) & (m_int != 0)
 
     val_norm   = torch.pow(2.0, e_f - bias) * (1.0 + m_f / m_max)
-    val_denorm = torch.pow(2.0, torch.tensor(1.0 - bias)) * (m_f / m_max)
+    val_denorm = (2.0 ** (1.0 - bias)) * (m_f / m_max)
 
     val = torch.where(~is_zero & ~is_denorm, val_norm,
           torch.where(is_denorm,             val_denorm,
@@ -115,10 +126,9 @@ def quant_dequant_block(
     orig_shape = x.shape
     x32 = x.float().reshape(-1)
     N   = x32.numel()
-
-    pad = (block_size - N % block_size) % block_size
-    if pad > 0:
-        x32 = torch.cat([x32, torch.zeros(pad)])
+    assert N % block_size == 0, (
+        f"numel()={N} 必须是 block_size={block_size} 的整数倍，请在调用前 pad"
+    )
     x_blocks = x32.reshape(-1, block_size)
 
     # step1: raw decode_scale
@@ -140,16 +150,13 @@ def quant_dequant_block(
     x_scaled = x_blocks * encode_scale
     x_scaled = torch.clamp(x_scaled, -fp_max, fp_max)
 
-    if debug and debug_name:
-        print(f"  [{debug_name}] fp_max={fp_max:.2f}, scale_type={scale_type}")
-        print(f"    x_scaled 范围: [{x_scaled.min():.4f}, {x_scaled.max():.4f}]")
-        print(f"    decode_scale_q 范围: [{decode_scale_q.min():.6f}, {decode_scale_q.max():.6f}]")
+
 
     # step5: 量化数据
     x_q = quantize_fn(x_scaled.reshape(-1)).reshape(-1, block_size)
 
     # step6: 反量化
-    x_dq = (x_q * decode_scale_q).reshape(-1)[:N].reshape(orig_shape)
+    x_dq = (x_q * decode_scale_q).reshape(-1).reshape(orig_shape)
     return x_dq.bfloat16()
 
 
@@ -157,21 +164,61 @@ def quant_dequant_block(
 # 各格式量化函数（固定 E=2，变化 M）
 # ============================================================
 
-def _quantize_e2m4(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=2, m_bits=4)
-    return reconstruct_fp(sign, e, m, bias, mm)
+_POS_VALS_E2M4 = torch.tensor(
+    [0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 0.9375, 1, 1.0625, 1.125, 1.1875, 1.25, 1.3125, 1.375, 1.4375, 1.5, 1.5625, 1.625, 1.6875, 1.75, 1.8125, 1.875, 1.9375, 2, 2.125, 2.25, 2.375, 2.5, 2.625, 2.75, 2.875, 3, 3.125, 3.25, 3.375, 3.5, 3.625, 3.75, 3.875, 4, 4.25, 4.5, 4.75, 5, 5.25, 5.5, 5.75, 6, 6.25, 6.5, 6.75, 7, 7.25, 7.5, 7.75],
+    dtype=torch.float32
+)
 
-def _quantize_e2m3(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=2, m_bits=3)
-    return reconstruct_fp(sign, e, m, bias, mm)
+def _quantize_e2m4(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E2M4", _POS_VALS_E2M4, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
 
-def _quantize_e2m2(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=2, m_bits=2)
-    return reconstruct_fp(sign, e, m, bias, mm)
+_POS_VALS_E2M3 = torch.tensor(
+    [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 3.75, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5],
+    dtype=torch.float32
+)
 
-def _quantize_e2m1(x_scaled: torch.Tensor) -> torch.Tensor:
-    sign, e, m, bias, _, mm = get_fp_components(x_scaled, e_bits=2, m_bits=1)
-    return reconstruct_fp(sign, e, m, bias, mm)
+def _quantize_e2m3(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E2M3", _POS_VALS_E2M3, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
+
+_POS_VALS_E2M2 = torch.tensor(
+    [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6, 7],
+    dtype=torch.float32
+)
+
+def _quantize_e2m2(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E2M2", _POS_VALS_E2M2, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
+
+_POS_VALS_E2M1 = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6],
+    dtype=torch.float32
+)
+
+def _quantize_e2m1(x: torch.Tensor) -> torch.Tensor:
+    pos_vals = _get_cached_pos_vals("E2M1", _POS_VALS_E2M1, x.device)
+    x32  = x.float()
+    sign = torch.sign(x32)
+    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
+    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
+    idx  = diff.argmin(dim=-1)
+    return sign * pos_vals[idx]
 
 
 def fp_format_max(e_bits: int, m_bits: int) -> float:

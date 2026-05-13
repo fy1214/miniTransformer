@@ -6,11 +6,13 @@ import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
 from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
+from miniTransformer.quantiztion.int4_quantize_op import Int4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType
 from miniTransformer.quantiztion import quantization
+import miniTransformer.utils.env as env
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,26 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
     elif recipe == QuantizeRecipe.BF16_REF:
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
+    elif recipe == QuantizeRecipe.INT4_SUB_CHANNEL:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.INT4,
+            x_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.X
+            ),
+            w_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.WEIGHT
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.Y
+            ),
+            quantize_op=Int4TiledQuantizeOp())
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
         return QLinearParams(
             quantize=True,
@@ -116,14 +138,14 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True,
+                with_rht=not env.should_disable_rht(),
                 param_type=ParamType.X
             ),
             w_params=QParams(
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(16, 16),
-                with_2d_quantization=True,
+                with_2d_quantization=not env.should_disable_2d_quantization(),
                 with_rht=False,
                 param_type=ParamType.WEIGHT
             ),
@@ -132,7 +154,8 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True,
+                with_rht=not env.should_disable_rht(),
+                stochastic_rounding=not env.should_disable_stochastic_rounding(),
                 param_type=ParamType.Y
             ),
             quantize_op=Nvfp4TiledQuantizeRefOp(),
@@ -149,7 +172,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True,
+                with_rht=not env.should_disable_rht(),
                 stochastic_rounding=False,
                 param_type=ParamType.X
             ),
@@ -157,7 +180,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 output_dtype=torch.uint8,
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(16, 16),
-                with_2d_quantization=True,
+                with_2d_quantization=not env.should_disable_2d_quantization(),
                 with_rht=False,
                 stochastic_rounding = False,
                 param_type=ParamType.WEIGHT
@@ -167,8 +190,8 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 scaling_dtype=torch.float8_e4m3fn,
                 quant_tile_shape=(1, 16),
                 with_2d_quantization=False,
-                with_rht=True,
-                stochastic_rounding=True,
+                with_rht=not env.should_disable_rht(),
+                stochastic_rounding=not env.should_disable_stochastic_rounding(),
                 param_type=ParamType.Y
             ),
             quantize_op=Nvfp4TiledQuantizeOp(),

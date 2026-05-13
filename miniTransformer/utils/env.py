@@ -17,3 +17,20 @@ def get_keep_in_bf16_layer_numbers():
 def should_keep_backward_in_bf16():
     disable_backward_quant = int(os.getenv("DISABLE_BACKWARD_QUANT", "0"))
     return disable_backward_quant == 1
+
+
+def should_disable_rht():
+    disable_rht = os.getenv("NVTE_NVFP4_DISABLE_RHT", "0") == "1"
+    return disable_rht
+
+
+def should_disable_stochastic_rounding():
+    disable_stochastic_rounding = (
+        os.getenv("NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "0") == "1"
+    )
+    return disable_stochastic_rounding
+
+
+def should_disable_2d_quantization():
+    disable_2d_quantization= os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
+    return disable_2d_quantization

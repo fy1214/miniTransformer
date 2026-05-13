@@ -7,11 +7,24 @@ from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
-import transformer_engine.pytorch.cpp_extensions as tex
-from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
-from transformer_engine.pytorch.cpp_extensions import split_quantize
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
-from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
+# TE imports are deferred to avoid circular import:
+# TE's grouped_linear.py imports miniTransformer, which would trigger TE re-initialization
+# before transformer_engine.pytorch is fully loaded.
+def _get_tex():
+    import transformer_engine.pytorch.cpp_extensions as tex
+    return tex
+
+def _get_te_quantizers():
+    from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
+    return NVFP4Quantizer, MXFP8Quantizer
+
+def _get_te_gemm():
+    from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+    return general_gemm, general_grouped_gemm
+
+def _get_te_quantized_tensor():
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
+    return QuantizedTensor, QuantizedTensorStorage
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -38,6 +51,7 @@ def _grouped_gemm_cutedsl(
 class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
+        self.should_update_quantize_weights = True
 
     @property
     def supports_allgather(self) -> bool:
@@ -54,7 +68,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         device = x.device
         x_dtype = x.dtype
 
-        nvfp4_quantizer = NVFP4Quantizer(
+        nvfp4_quantizer = _get_te_quantizers()[0](  # NVFP4Quantizer
             rowwise=True,
             columnwise=return_transpose,
             with_amax_reduction=False,
@@ -119,6 +133,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         custom_gemm_backend: str = "cutlass",  # cutlass, triton, cuteDSL
     ) -> torch.Tensor:
 
+        general_gemm, _ = _get_te_gemm()
         gemm_out = general_gemm(
             A=qw,
             B=qx,
@@ -158,25 +173,41 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         If param type is Y, the shape is [m_sum, n].
         """
         num_gemms = len(m_splits)
-        quantizers = []
-        for i in range(num_gemms):
-            x_quantizer = NVFP4Quantizer(
-                rowwise=True,
-                columnwise=return_transpose,
-                with_amax_reduction=False,
-                amax_reduction_group=None,
-                with_rht=qparams.with_rht,
-                with_post_rht_amax=qparams.with_rht,
-                with_2d_quantization=qparams.with_2d_quantization,
-                stochastic_rounding=qparams.stochastic_rounding
-            )
-            quantizers.append(x_quantizer)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
+            # Weight always needs columnwise data for backward dgrad GEMM,
+            # regardless of the return_transpose flag.
+            # If columnwise=False, _columnwise_data is None, and general_grouped_gemm
+            # cannot find the transposed weight needed for dgrad, triggering a swizzle
+            # assertion (NVTE_NVFP4_1D_SCALING not supported in that path).
             quantize_tensor_list = []
             for i in range(num_gemms):
-                quantize_tensor_list.append(quantizers[i](x[i]))
+                w_quantizer = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=True,   # always True: backward dgrad needs weight transpose
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding
+                )
+                quantize_tensor_list.append(w_quantizer.quantize(x[i]))
         else:
+            # ACT / GRAD path: columnwise controlled by return_transpose
+            quantizers = []
+            for i in range(num_gemms):
+                x_quantizer = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=return_transpose,
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding
+                )
+                quantizers.append(x_quantizer)
             quantize_tensor_list = tex.split_quantize(
                 x,
                 m_splits,

@@ -7,24 +7,12 @@ from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 
-# TE imports are deferred to avoid circular import:
-# TE's grouped_linear.py imports miniTransformer, which would trigger TE re-initialization
-# before transformer_engine.pytorch is fully loaded.
-def _get_tex():
-    import transformer_engine.pytorch.cpp_extensions as tex
-    return tex
+import transformer_engine.pytorch.cpp_extensions as tex
+from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
+from transformer_engine.pytorch.cpp_extensions import split_quantize
+from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
-def _get_te_quantizers():
-    from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
-    return NVFP4Quantizer, MXFP8Quantizer
-
-def _get_te_gemm():
-    from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
-    return general_gemm, general_grouped_gemm
-
-def _get_te_quantized_tensor():
-    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
-    return QuantizedTensor, QuantizedTensorStorage
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
@@ -68,7 +56,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         device = x.device
         x_dtype = x.dtype
 
-        nvfp4_quantizer = _get_te_quantizers()[0](  # NVFP4Quantizer
+        nvfp4_quantizer = NVFP4Quantizer(  # NVFP4Quantizer
             rowwise=True,
             columnwise=return_transpose,
             with_amax_reduction=False,
@@ -133,7 +121,6 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         custom_gemm_backend: str = "cutlass",  # cutlass, triton, cuteDSL
     ) -> torch.Tensor:
 
-        general_gemm, _ = _get_te_gemm()
         gemm_out = general_gemm(
             A=qw,
             B=qx,

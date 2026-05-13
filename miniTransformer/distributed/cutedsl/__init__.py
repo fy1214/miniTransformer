@@ -9,7 +9,7 @@ miniTransformer.distributed.cutedsl
     from miniTransformer.distributed.cutedsl import init_nvshmem_with_dist, finalize_nvshmem
 """
 
-from .nvshmem_init import init_nvshmem_with_dist, finalize_nvshmem
+from .nvshmem_communicator import init_nvshmem_with_dist, finalize_nvshmem
 from .gemm_allreduce import GemmAllReduceCtx
 
 __all__ = [

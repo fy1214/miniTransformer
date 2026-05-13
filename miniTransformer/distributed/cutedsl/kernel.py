@@ -50,6 +50,79 @@ except RuntimeError as exc:
         "  For CUDA 13: pip install nvidia-nvshmem-cu13\n"
     ) from None
 
+
+# ── SM 级 inter-GPU barrier（acquire 语义）────────────────────────────────────
+# 参考：FlashInfer PR #2171
+# https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/cute_dsl/gemm_allreduce_two_shot.py
+#
+# 与 CUTLASS 示例的 spin_lock_atom_cas_relaxed_wait 的区别：
+#   - 使用 acquire 内存序（不是 relaxed），确保 wait 成功后其他 rank 的写操作可见
+#   - wait 前插入 fence_proxy("alias")，确保 multimem.st 的广播结果对后续操作可见
+# 这样去掉 Python 侧 dist.barrier() 后 kernel 也能正确工作。
+
+import functools
+import inspect
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import T
+from cutlass._mlir.dialects.nvvm import (
+    MemOrderKind,
+    MemScopeKind,
+    AtomicOpKind,
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _nvvm_atomicrmw_has_res_param():
+    """CUDA 12 vs CUDA 13 API 兼容性检测。"""
+    return "res" in inspect.signature(nvvm.atomicrmw).parameters
+
+
+def _nvvm_atomicrmw_compat(
+    res_type, op, ptr, a, *, b=None, mem_order=None, syncscope=None, loc=None, ip=None
+):
+    """nvvm.atomicrmw 兼容 CUDA 12 和 CUDA 13 的封装。"""
+    if _nvvm_atomicrmw_has_res_param():
+        return nvvm.atomicrmw(
+            res_type, op, ptr, a,
+            b=b, mem_order=mem_order, syncscope=syncscope, loc=loc, ip=ip,
+        )
+    else:
+        return nvvm.atomicrmw(
+            op, ptr, a,
+            b=b, mem_order=mem_order, syncscope=syncscope, loc=loc, ip=ip,
+        )
+
+
+@cute.jit
+def _spin_lock_atom_cas_acquire_wait_sys(
+    lock_ptr,
+    *,
+    expected_val: Int32,
+    reset_val: Int32,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    SM 级 inter-GPU barrier：acquire 语义的 CAS spin-wait（sys scope）。
+
+    相比 spin_lock_atom_cas_relaxed_wait：
+    - 使用 acquire 内存序，确保 wait 成功后能看到其他 rank 的写操作
+    - 搭配 release 写入和 fence_proxy("alias") 使用
+    """
+    result = 0
+    while result != expected_val:
+        result = _nvvm_atomicrmw_compat(
+            T.i32(),
+            AtomicOpKind.CAS,
+            lock_ptr.llvm_ptr,
+            Int32(reset_val).ir_value(loc=loc, ip=ip),
+            b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+            mem_order=MemOrderKind.ACQUIRE,
+            syncscope=MemScopeKind.SYS,
+            loc=loc,
+            ip=ip,
+        )
+
 """
 A high-performance persistent batched dense GEMM AR example for the NVIDIA Blackwell SM100 architecture
 using CUTE DSL.
@@ -167,31 +240,42 @@ def _compute_stages(
     :rtype: tuple[int, int, int]
     """
     # Default ACC stages
-    num_acc_stage = 2
+    num_acc_stage = 2   # accumulator（TMEM）的 stage 数，固定 2
 
     # Default C stages
     num_c_stage = 2 if use_tma_store else 0
 
     # Calculate smem layout and size for one stage of A, B, and C with 1-stage
+    # [128, 64] bf16 = 128×64×2 = 16 KB
     a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
         tiled_mma, mma_tiler_mnk, a_dtype, 1
     )
+    # B 1-stage: [128, 64] bf16 = 128×64×2 = 16 KB
     b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
         tiled_mma, mma_tiler_mnk, b_dtype, 1
     )
 
+    # 计算每个 A/B stage 占多少 SMEM， 32 KB
     ab_bytes_per_stage = cute.size_in_bytes(
         a_dtype, a_smem_layout_stage_one
     ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
     mbar_helpers_bytes = 1024
 
     c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout)
-    c_bytes = c_bytes_per_stage * num_c_stage
+    # C staging 占多少 SMEM
+    c_bytes = c_bytes_per_stage * num_c_stage        # 我们：0
 
     # Calculate A/B stages:
     # Start with total smem per CTA (capacity / occupancy)
     # Subtract reserved bytes and initial C stages bytes
     # Divide remaining by bytes needed per A/B stage
+    '''
+    smem_capacity = 256KB
+    occupancy = 1
+    mbar_helpers ≈ 1KB
+    c_bytes = 0（use_tma_store = False）
+    '''
+    # 7 个 stage 意味着 TMA warp 可以提前预取 7 个 k_tile 的数据，充分 hide TMA latency。
     num_ab_stage = (
         smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
     ) // ab_bytes_per_stage
@@ -373,15 +457,15 @@ class PersistentDenseGemmKernel:
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
         self.mma_tiler = (
-            self.mma_tiler[0],
-            self.mma_tiler[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            self.mma_tiler[0],                      # M tile，由用户指定，默认 128
+            self.mma_tiler[1],                      # N tile，由用户指定，默认 128
+            mma_inst_shape_k * mma_inst_tile_k,     # K tile = 16 × 4 = 64
         )
         self.cta_tile_shape_mnk = (
-            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape), # tiled_mma.thr_id.shape 是 MMA 的 CTA 组大小， 1或2
             self.mma_tiler[1],
             self.mma_tiler[2],
-        )
+        )   # use_2cta_instrs=False， (128, 128, 64)
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -396,7 +480,9 @@ class PersistentDenseGemmKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        if cutlass.const_expr(self.use_tma_store):
+        if cutlass.const_expr(self.use_tma_store): # 这里是用来处理C的写出的
+            # 如果用TMA写出，需要考虑SMEM的容量是否能放入整个Ctile，因此会把Ctile切成更小的epi_tile,根据 SMEM 剩余容量、C dtype、layout 自动计算合适的子 tile 大小
+            # TMEM → REG → SMEM → TMA bulk store → GMEM
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
                 self.cta_tile_shape_mnk,
                 self.use_2cta_instrs,
@@ -404,6 +490,7 @@ class PersistentDenseGemmKernel:
                 self.c_dtype,
             )
         else:
+            # TMEM → REG → GMEM（simt store），没有 SMEM 容量限制
             self.epi_tile = self.cta_tile_shape_mnk[:2]
 
         c_smem_layout = None
@@ -426,6 +513,8 @@ class PersistentDenseGemmKernel:
         )
 
         # Compute A/B/C shared memory layout
+        # 如果tma_store = False的情况
+        # a_smem_layout_staged=b_smem_layout_staged=[128, 64, 7]
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma, self.mma_tiler, self.a_dtype, self.num_ab_stage
         )
@@ -749,15 +838,15 @@ class PersistentDenseGemmKernel:
         #
         # Local_tile partition global tensors
         #
-        # (bM, bK, RestM, RestK, RestL)
+        # (bM, bK, RestM, RestK, RestL) (bM=128, bK=64, RestM=M/128, RestK=K/64, RestL=L)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, RestN, RestK, RestL)
+        # (bN, bK, RestN, RestK, RestL) (bN=128, bK=64, RestN=N/128, RestK=K/64, RestL=L)
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-        # (bM, bN, RestM, RestN, RestL)
+        # (bM, bN, RestM, RestN, RestL) (bM=128, bN=128, RestM=M/128, RestN=N/128, RestL=L)
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
@@ -766,12 +855,19 @@ class PersistentDenseGemmKernel:
         #
         # Partition global tensor for TiledMMA_A/B/C
         #
+        # mma_tile_coord_v = bidx % thr_id.shape
+        # use_2cta=False：mma_tile_coord_v=0，所有 CTA 拿 slice 0
+        # use_2cta=True ：mma_tile_coord_v=0 或 1，两个 CTA 各拿一半
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
+        # (MMA_frag, MMA_M, MMA_K, RestM, RestK, RestL)
+        # 每个线程负责的 A 分片 × 所有 tile 坐标
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
+        # (MMA_frag, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+        # (MMA_frag, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
@@ -806,7 +902,7 @@ class PersistentDenseGemmKernel:
 
         #
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
-        #
+        # tCrA 和 tCrB 描述的不是真正的寄存器数据，而是"MMA 指令如何从 SMEM 读取 A/B"的映射关系。tcgen05 MMA 直接从 SMEM 读取，不经过寄存器中转。
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -1142,15 +1238,15 @@ class PersistentDenseGemmKernel:
                     self.all_reduce_sync_barrier.arrive_and_wait()
                     # partition and slice at tile level
                     gC_mc = cute.local_tile(
-                        c_mc,
+                        c_mc,       # C_mc: [M, N, L]（nvshmem fp32）
                         cute.slice_(self.mma_tiler, (None, None, 0)),
                         (None, None, None),
-                    )
+                    )   # (128, 128, RestM=M/128, RestN=N/128, RestL)
                     cC = cute.local_tile(
                         idC, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
                     )
                     
-                    tCgC_mc = thr_mma.partition_C(gC_mc)
+                    tCgC_mc = thr_mma.partition_C(gC_mc)    # (MMA_frag, MMA_M, MMA_N, RestM, RestN, RestL)
                     tCpC = thr_mma.partition_C(cC)
                     tCgC_mc_slice = tCgC_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
                     tCpC_slice = tCpC[((None, None), 0, 0, *mma_tile_coord_mnl)]
@@ -1164,18 +1260,26 @@ class PersistentDenseGemmKernel:
                         tCgC_mc_slice, (m_local_rank, self.mma_tiler[1])
                     )
                     tCpC_slice_partitioned = cute.zipped_divide(tCpC_slice, (m_local_rank, self.mma_tiler[1]))
+                    # zipped_divide 把 [128, 128] 切成 2 个 [64, 128] 的块：
+                    # 结果形状：((MMA_frag, 64, 128), num_m_parts=2, num_n_parts=1)
+                    #           ↑ 每个块的内部数据   ↑ M 方向 2 个块   ↑ N 方向 1 个块
                     tCgC_mc_local_rank = cute.slice_(
                         tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0))
                     )
-                    tCpC_local_rank = cute.slice_(tCpC_slice_partitioned, ((None, None), (rank_id, 0)))
+                    # rank_id=0 → 取 M=0:64  的块，形状：(MMA_frag, 64, 128)
+                    # rank_id=1 → 取 M=64:128 的块，形状：(MMA_frag, 64, 128)
+                    tCpC_local_rank = cute.slice_(tCpC_slice_partitioned, ((None, None), (rank_id, 0))) # (MMA_frag, 64, 128)
 
                     # partition at thread level
-                    frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
+                    frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank) # (atom=1, loop_m=16, loop_n=1) thr_copy_fake:(4,32)(1,4)=(4,128), 因此每个线程的loop_m=16,loop_n=1
                     frpC = thr_copy_fake.partition_S(tCpC_local_rank)
                     atom, loop_m, loop_n = frgC_mc.shape
-                    for i in cutlass.range_constexpr(loop_m):
-                        for j in cutlass.range_constexpr(loop_n):
+                    for i in cutlass.range_constexpr(loop_m):    # = 16 次（M 方向）
+                        for j in cutlass.range_constexpr(loop_n):   # = 1 次（N 方向）
                             if cute.elem_less(frpC[0, i, j], c_mc.shape):
+                                # frgC_mc[None, i, j]：第 i 次 M 循环、第 j 次 N 循环对应的元素
+                                # .iterator：取这个元素在 nvshmem multicast 内存里的指针
+                                # mc_ptr 指向的是 NVLS 的虚拟地址，multimem 指令用这个地址做跨 GPU 操作
                                 mc_ptr = frgC_mc[None, i, j].iterator
                                 x, y, z, w = 0, 0, 0, 0
                                 if cutlass.const_expr(self.c_dtype == Float16):
@@ -1234,6 +1338,9 @@ class PersistentDenseGemmKernel:
                             order="release",
                         )
                         # Relaxed spin-lock wait flag with sys scope
+                        # TODO: upgrade to acquire semantics + fence_proxy("alias")
+                        # to remove the Python-side dist.barrier() requirement.
+                        # Reference: FlashInfer PR #2171
                         utils.distributed.spin_lock_atom_cas_relaxed_wait(
                             lock_ptr=barrier_flag.iterator
                             + last_tile_id_linear
@@ -1696,9 +1803,16 @@ class PersistentDenseGemmKernel:
         :return: The number of tensor memory allocation columns.
         :rtype: int
         """
-        acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        '''
+        tcgen05 MMA 的 accumulator 形状：每个 MMA warp 持有 [128,128] 的 fp32 分片
+        fp32 accumulator：128 × 128 × 4 bytes = 64 KB
+        加上 2 个 stage：64 KB × 2 = 128 KB
+        TMEM 每列 = 32 × 4 bytes = 128 bytes
+        num_tmem_alloc_cols ≈ 128 KB / 128 = 1024 列
+        '''
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])  # MMA 指令对 [128,128] C tile 的分片形状
+        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))  # 包含 2 个 stage 的 accumulator 张量
+        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)    # 需要多少列 TMEM 来存放这个 accumulator
 
         return num_tmem_alloc_cols
 

@@ -105,6 +105,93 @@ def test_row_parallel_gemm(M: int = 1024, K: int = 4096, N: int = 1024, seed: in
         print(f"  ✓ o0 + o1 == o（bf16 整数值 bit-exact）")
 
 
+def test_fp32_allreduce_precision(
+    M: int = 1024, K: int = 4096, N: int = 1024, seed: int = 42
+):
+    """
+    对比三种 row parallel 方案在随机 bf16 输入下的精度差异：
+
+    方案 A：bf16 GEMM → bf16 AllReduce（当前常见实现）
+    方案 B：bf16 GEMM → fp32 AllReduce → cast bf16（升精度 reduce）
+    方案 C：fp32 GEMM → fp32 AllReduce → cast bf16（全程高精度）
+
+    baseline：tp=1 完整 GEMM（bf16）
+
+    理论分析：
+      - 方案 A：GEMM 内部 bf16 累加误差 + AllReduce bf16 加法截断
+      - 方案 B：GEMM 内部 bf16 累加误差，但 AllReduce 在 fp32 精度下求和，减少截断
+      - 方案 C：GEMM 内部 fp32 精度（或 TF32）累加，AllReduce fp32 精度，误差最小
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    assert world_size == 2
+    assert K % world_size == 0
+
+    chunk = K // world_size
+
+    # rank 0 生成随机 bf16，broadcast
+    x = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(N, K, device="cuda", dtype=torch.bfloat16)
+    if rank == 0:
+        torch.manual_seed(seed)
+        x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
+        w = torch.randn(N, K, device="cuda").to(torch.bfloat16)
+    dist.broadcast(x, src=0)
+    dist.broadcast(w, src=0)
+
+    # baseline：tp=1，bf16 完整 GEMM
+    o_baseline = x @ w.T   # [M, N]，bf16
+
+    x_local = x[:, rank * chunk:(rank + 1) * chunk].contiguous()
+    w_local = w[:, rank * chunk:(rank + 1) * chunk].contiguous()
+
+    # ── 方案 A：bf16 GEMM + bf16 AllReduce ──────────────────────────────────
+    o_a = (x_local @ w_local.T).clone()                     # bf16 GEMM → bf16
+    dist.all_reduce(o_a, op=dist.ReduceOp.SUM)              # bf16 AllReduce
+
+    # ── 方案 B：bf16 GEMM + fp32 AllReduce → cast bf16 ──────────────────────
+    o_b = (x_local @ w_local.T).float()                     # bf16 GEMM → cast fp32
+    dist.all_reduce(o_b, op=dist.ReduceOp.SUM)              # fp32 AllReduce
+    o_b = o_b.to(torch.bfloat16)                            # cast 回 bf16
+
+    # ── 方案 C：fp32 GEMM + fp32 AllReduce → cast bf16 ──────────────────────
+    o_c = (x_local.float() @ w_local.float().T)             # fp32 GEMM
+    dist.all_reduce(o_c, op=dist.ReduceOp.SUM)              # fp32 AllReduce
+    o_c = o_c.to(torch.bfloat16)                            # cast 回 bf16
+
+    # ── 方案 D：fp32 GEMM + bf16 AllReduce ──────────────────────────────────
+    o_d = (x_local.float() @ w_local.float().T).to(torch.bfloat16)  # fp32 GEMM → cast bf16
+    dist.all_reduce(o_d, op=dist.ReduceOp.SUM)              # bf16 AllReduce
+
+    if rank == 0:
+        diff_a = (o_a.float() - o_baseline.float()).abs()
+        diff_b = (o_b.float() - o_baseline.float()).abs()
+        diff_c = (o_c.float() - o_baseline.float()).abs()
+        diff_d = (o_d.float() - o_baseline.float()).abs()
+
+        print(f"\n  精度对比（baseline = tp=1 bf16 GEMM）：")
+        print(f"  {'方案':<42} {'max diff':>12} {'mean diff':>12}")
+        print(f"  {'-'*66}")
+        print(f"  {'A: bf16 GEMM + bf16 AllReduce':<42} "
+              f"{diff_a.max().item():>12.4e} {diff_a.mean().item():>12.4e}")
+        print(f"  {'B: bf16 GEMM + fp32 AllReduce → bf16':<42} "
+              f"{diff_b.max().item():>12.4e} {diff_b.mean().item():>12.4e}")
+        print(f"  {'C: fp32 GEMM + fp32 AllReduce → bf16':<42} "
+              f"{diff_c.max().item():>12.4e} {diff_c.mean().item():>12.4e}")
+        print(f"  {'D: fp32 GEMM + bf16 AllReduce':<42} "
+              f"{diff_d.max().item():>12.4e} {diff_d.mean().item():>12.4e}")
+        print()
+        print(f"  分析：")
+        print(f"    A vs B：AllReduce 升精度的收益  = {(diff_a.mean() - diff_b.mean()).item():+.4e}")
+        print(f"    A vs D：GEMM 升精度的收益       = {(diff_a.mean() - diff_d.mean()).item():+.4e}")
+        print(f"    D vs C：AllReduce 升精度在fp32GEMM下的额外收益 = {(diff_d.mean() - diff_c.mean()).item():+.4e}")
+
+        # 检验 B 比 A 更精确
+        assert diff_b.mean() <= diff_a.mean() + 1e-6, \
+            "方案 B 应比方案 A 更精确（fp32 AllReduce 减少截断误差）"
+        print(f"\n  ✓ 方案 B（fp32 AllReduce）精度 ≥ 方案 A（bf16 AllReduce）")
+
+
 if __name__ == "__main__":
     if "RANK" not in os.environ:
         print("请用 torchrun 启动：")
@@ -115,17 +202,25 @@ if __name__ == "__main__":
     rank = dist.get_rank()
 
     if rank == 0:
-        print("\n" + "=" * 55)
+        print("\n" + "=" * 64)
         print("Row Parallel GEMM AllReduce 正确性测试")
-        print("=" * 55)
-        print(f"  M=1024, K=4096, N=1024, dtype=bfloat16, x/w∈{{-1,0,1}}")
-        print("=" * 55)
+        print("=" * 64)
+        print(f"  M=1024, K=4096, N=1024")
+        print("=" * 64)
 
     try:
+        if rank == 0:
+            print("\n[1] 整数输入 bit-exact 验证")
         test_row_parallel_gemm(M=1024, K=4096, N=1024)
         dist.barrier()
+
         if rank == 0:
-            print("\n✓ 测试通过！\n" + "=" * 55)
+            print("\n[2] 随机 bf16 输入：三种方案精度对比")
+        test_fp32_allreduce_precision(M=1024, K=4096, N=1024)
+        dist.barrier()
+
+        if rank == 0:
+            print("\n✓ 全部测试完成！\n" + "=" * 64)
     except Exception as e:
         print(f"✗ Rank {rank} 失败: {e}")
         import traceback; traceback.print_exc()

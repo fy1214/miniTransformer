@@ -144,13 +144,13 @@ def mx_e2m1_quantize(x: torch.Tensor) -> torch.Tensor:
 # ============================================================
 
 def quant_dequant_block(
-        x: torch.Tensor,
-        block_size: int,
-        fp_max: float,
-        quantize_fn,  # 将 x_scaled (float32) 量化并返回 float32
-        scale_type: str,  # "e8m0" | "e4m3"
-        debug_name: str = "",
-        debug: bool = False,
+    x: torch.Tensor,
+    block_size: int,
+    fp_max: float,
+    quantize_fn,  # 将 x_scaled (float32) 量化并返回 float32
+    scale_type: str,  # "e8m0" | "e4m3"
+    debug_name: str = "",
+    debug: bool = False,
 ) -> torch.Tensor:
     """
     通用 per-block 量化/反量化框架

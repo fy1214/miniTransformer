@@ -62,6 +62,9 @@ from .kernel import PersistentDenseGemmKernel, create_mc_tensor
 
 
 # ── 默认 kernel 配置（bf16 row-parallel 场景）─────────────────────────────────
+# ncu 结果：SM 76%，MMA 76%，long_scoreboard stall 87%，warps_active 7%
+# 当前瓶颈是 dist.barrier() 同步开销，不是 tile 大小
+# 256×128 + 2-CTA 在小矩阵下反而因 cluster 同步开销更慢，保持 128×128
 _DEFAULT_MMA_TILER_MN    = (128, 128)
 _DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 _DEFAULT_USE_2CTA        = False
@@ -146,8 +149,11 @@ class GemmAllReduceCtx:
         N    = b.shape[0]
         self._M, self._N, self._K = M, N, K
 
+        # A/B 使用 BFloat16（保持 bf16 GEMM 吞吐）
+        # C 使用 Float32（让 tile-level AllReduce 在 fp32 精度下进行）
+        # 最后 cast fp32→bf16 输出
         ab_dtype = cutlass.BFloat16
-        c_dtype  = cutlass.BFloat16
+        c_dtype  = cutlass.Float32
 
         num_tiles = (
             (M // self._mma_tiler_mn[0]) *
@@ -156,13 +162,14 @@ class GemmAllReduceCtx:
         num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
 
         # ── Step 1: 分配 nvshmem 对称内存给 C 和 barrier_flag ─────────────────
-        # C: [M, N] bfloat16
-        c_cpu   = torch.zeros(M, N, dtype=torch.bfloat16)
-        # barrier_flag: [num_tiles + num_sms] int32（含 SM-level barrier 区域）
-        flag_cpu = torch.zeros(num_tiles + num_sms, dtype=torch.int32, device="cuda")
+        # C 需要 [M, N, L=1] 形状（kernel 内部使用 3D tensor），dtype Float32
+        # 最后返回时 cast 回 bf16
+        c_cpu   = torch.zeros(M, N, 1, dtype=torch.float32)   # CPU tensor，nvshmem 会 copy 到 GPU
+        # barrier_flag: [num_tiles + num_sms] int32，必须是 CPU tensor
+        flag_cpu = torch.zeros(num_tiles + num_sms, dtype=torch.int32)  # CPU，不能用 device="cuda"
 
         # create_mc_tensor: nvshmem.core.tensor + multicast view
-        # leading_dim=1 表示 row-major C（N 是 leading dimension）
+        # leading_dim=1 表示 row-major C（N 是 leading dimension，col-major 用 0）
         self._c_cute, self._c_mc_cute, self._c_torch, self._c_mc_torch = create_mc_tensor(
             c_cpu, c_dtype, leading_dim=1, is_dynamic_layout=True
         )
@@ -170,13 +177,19 @@ class GemmAllReduceCtx:
             flag_cpu, cutlass.Int32, leading_dim=0, is_dynamic_layout=True
         )
 
-        # ── Step 2: 构造 A/B 的 CuTe tensor 模板（用于 compile）──────────────
-        # A: row-major [M, K]，B: row-major [N, K]（相当于 B.T 是 col-major [K, N]）
+        # ── Step 2: 构造 A/B 的 CuTe tensor 模板（用于 compile）─────────────
+        # A row-major [M, K]: a_major="k" → is_M_major=False
+        # B row-major [N, K]: b_major="k" → is_N_major=False
+        # A/B 用 BFloat16：保持 bf16 GEMM 吞吐
+        # C 用 Float32：fp32 AllReduce 精度，最后 cast 回 bf16
+        a_cpu_template = cutlass_torch.matrix(1, M, K, False, ab_dtype)  # [M, K, 1] bf16
+        b_cpu_template = cutlass_torch.matrix(1, N, K, False, ab_dtype)  # [N, K, 1] bf16
+
         a_cute, _ = cutlass_torch.cute_tensor_like(
-            a.cpu(), ab_dtype, is_dynamic_layout=True, assumed_align=16
+            a_cpu_template, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
         b_cute, _ = cutlass_torch.cute_tensor_like(
-            b.cpu(), ab_dtype, is_dynamic_layout=True, assumed_align=16
+            b_cpu_template, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
 
         # ── Step 3: 构造 kernel 实例 ────────────────────────────────────────
@@ -227,20 +240,28 @@ class GemmAllReduceCtx:
         if self._compiled is None:
             self._compile(a, b)
 
-        # 重置 barrier_flag 为 0（每次 forward 前必须清零）
-        self._flag_torch.zero_()
+        # kernel 内部 SM 级 final barrier 使用 relaxed CAS，
+        # 需要 Python 侧 dist.barrier() 确保上一次 kernel 在所有 rank 完全结束后再清零 flag
+        # TODO: 升级 kernel.py SM 级 barrier 为 acquire 语义可去掉此 barrier（参考 FlashInfer PR #2171）
+        #torch.cuda.synchronize()
+        #dist.barrier(group=self._tp_group)
 
-        # 把 a/b 的数据 copy 到 cute tensor（通过 from_dlpack 共享内存）
-        a_cute = from_dlpack(a, assumed_align=16)
-        a_cute.element_type = cutlass.BFloat16
+        # 清零 flag 和 C
+        self._flag_torch.zero_()
+        self._c_torch.zero_()
+
+        # A/B 保持 bf16，unsqueeze 加 L 维度后构造 cute tensor
+        ab_dtype = cutlass.BFloat16
+        a_3d = a.unsqueeze(-1).contiguous()   # bf16 [M, K, 1]
+        b_3d = b.unsqueeze(-1).contiguous()   # bf16 [N, K, 1]
+
+        a_cute = from_dlpack(a_3d, assumed_align=16)
+        a_cute.element_type = ab_dtype
         a_cute = a_cute.mark_layout_dynamic(leading_dim=1)
 
-        b_cute = from_dlpack(b, assumed_align=16)
-        b_cute.element_type = cutlass.BFloat16
+        b_cute = from_dlpack(b_3d, assumed_align=16)
+        b_cute.element_type = ab_dtype
         b_cute = b_cute.mark_layout_dynamic(leading_dim=1)
-
-        # 清零 C 输出（nvshmem 对称内存）
-        self._c_torch.zero_()
 
         torch_stream = torch.cuda.current_stream()
         current_stream = cuda_driver.CUstream(torch_stream.cuda_stream)
@@ -256,9 +277,10 @@ class GemmAllReduceCtx:
             current_stream,
         )
 
-        # 等待 kernel 完成，返回结果（nvshmem 对称内存里的 C tensor）
-        torch.cuda.synchronize()
-        return self._c_torch.clone()
+        # 等待 kernel 完成，返回结果
+        # _c_torch 是 fp32 [M, N, 1]，cast 回 bf16 并 squeeze L 维度
+        # torch.cuda.synchronize()
+        return self._c_torch.squeeze(-1).to(torch.bfloat16).clone()
 
     def free(self):
         """

@@ -37,4 +37,4 @@ python setup.py install
 
 ## 流程运行
 
-如果你想将miniTransformer用在训练上，你需要搭配Megatron和Slime一起使用
+如果你想将miniTransformer用在训练上，你需要搭配Megatron和一起使用。

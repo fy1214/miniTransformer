@@ -6,6 +6,7 @@ import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
 from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
+from miniTransformer.quantiztion.int4_quantize_op import Int4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
@@ -108,6 +109,26 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
     elif recipe == QuantizeRecipe.BF16_REF:
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
+    elif recipe == QuantizeRecipe.INT4_SUB_CHANNEL:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.INT4,
+            x_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.X
+            ),
+            w_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.WEIGHT
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                param_type=ParamType.Y
+            ),
+            quantize_op=Int4TiledQuantizeOp())
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
         return QLinearParams(
             quantize=True,

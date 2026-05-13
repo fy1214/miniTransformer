@@ -29,11 +29,11 @@ def cast_to_e8(decode_scale):
 
     The result is in FP32, not FP8 E8M0.
     """
-    max_exponent = torch.tensor(127, device=decode_scale.device, dtype=torch.float32)
+    max_exponent = 127
     exponent = torch.ceil(torch.log2(decode_scale))
     exponent = torch.clamp(exponent, min=-max_exponent, max=max_exponent)
 
-    return torch.tensor(2.0, device=decode_scale.device, dtype=torch.float32) ** exponent
+    return torch.exp2(exponent)
 
 
 def cast_to_e4m3(decode_scale, global_amax):
@@ -76,6 +76,34 @@ def cast_to_fp4x2(x):
 
 
 def cast_from_fp4x2(x, dq_dtype):
+    # 解包 fp4x2 -> 两个 fp4
+    second_bit = torch.div(x, 16, rounding_mode="floor").to(torch.long)
+    first_bit  = (x - second_bit * 16).to(torch.long)
+    def fp4_to_float(v):
+        # v: int tensor, value in [0, 15]
+        sign = (v >> 3) & 1          # 1 bit
+        exp  = (v >> 1) & 0x3        # 2 bits
+        mant = v & 1                 # 1 bit
+        # exp == 0: subnormal, value = (-1)^sign * 0.5 * (0 + mant*0.5) = mant * 0.25
+        # exp != 0: normal,    value = (-1)^sign * 2^(exp-1) * (1 + mant*0.5)
+        normal_val   = (1.0 + mant * 0.5) * (2.0 ** (exp.float() - 1))
+        subnormal_val = mant * 0.25
+        val = torch.where(exp == 0, subnormal_val.to(dq_dtype), normal_val.to(dq_dtype))
+        val = torch.where(sign == 1, -val, val)
+        return val
+    first_bit_values  = fp4_to_float(first_bit)
+    second_bit_values = fp4_to_float(second_bit)
+    result = torch.zeros(
+        (x.shape[0], x.shape[1] * 2),
+        device=x.device,
+        dtype=dq_dtype,
+    )
+    result[:, ::2]  = first_bit_values
+    result[:, 1::2] = second_bit_values
+    return result
+
+'''
+def cast_from_fp4x2(x, dq_dtype):
     """Dequantize FP4 E2M1 tensor that has been represented in a byte tensor"""
     fp4_values = torch.tensor(
         [
@@ -117,7 +145,7 @@ def cast_from_fp4x2(x, dq_dtype):
     result[:, 1::2] = second_bit_values
 
     return result
-
+'''
 
 def high_precision_gemm_ref(
     a: torch.Tensor,
@@ -175,6 +203,7 @@ def get_wgrad_sign_vector() -> torch.Tensor:
 class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
+        self.should_update_quantize_weights = True
 
     @property
     def supports_allgather(self) -> bool:
@@ -318,50 +347,45 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 torch.float32
             )  # (128, 8, 1)
         x = x.view(m, n // tile_len_x, tile_len_x)
-        FLOAT4_E2M1_MAX = torch.tensor(6.0, device=x.device, dtype=torch.float32)
-        FLOAT8_E4M3_MAX = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+        FLOAT4_E2M1_MAX = 6.0
+        FLOAT8_E4M3_MAX = 448.0
         decode_scale = torch.div(vec_max, FLOAT4_E2M1_MAX)
 
         if pow_2_scales:
             decode_scale = cast_to_e8(decode_scale)
-            encode_scale = torch.div(
-                torch.tensor(1.0, device=x.device, dtype=torch.float32),
-                decode_scale.to(torch.float32),
-            )
+            encode_scale = torch.reciprocal(decode_scale.to(torch.float32))
         else:
-            global_encode_scale = torch.div(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, global_amax)
-            global_encode_scale = torch.min(
+            # global_amax 可能是 [1]（per-tensor）或 [M, 1]（per-token）
+            # decode_scale 是 [M, num_tiles, 1]（3D）
+            # 需要把 global_amax 变为 [M, 1, 1] 才能正确广播
+            if global_amax.dim() == 2:
+                global_amax_bc = global_amax.unsqueeze(1)  # [M, 1] -> [M, 1, 1]
+            else:
+                global_amax_bc = global_amax               # [1]，直接广播
+            global_encode_scale = torch.div(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, global_amax_bc)
+            global_encode_scale = torch.clamp(
                 global_encode_scale,
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=global_encode_scale.device,
-                    dtype=torch.float32,
-                ),
+                max=torch.finfo(torch.float32).max,
             )
-            if global_encode_scale == torch.tensor(0.0, device=x.device, dtype=torch.float32):
-                global_encode_scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)
-            global_decode_scale = torch.div(1.0, global_encode_scale)
+            global_encode_scale = torch.where(
+                global_encode_scale == 0.0,
+                torch.ones_like(global_encode_scale),
+                global_encode_scale,
+            )
+            global_decode_scale = torch.div(1.0, global_encode_scale)   # global_encode_scale = 1/(global_amax/448*6)
 
-            decode_scale = decode_scale * global_encode_scale
-            decode_scale = torch.min(
+            decode_scale = decode_scale * global_encode_scale   # decode_scale= (vec_max/6) * (global_amax/448*6)
+            decode_scale = torch.clamp(
                 decode_scale,
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=decode_scale.device,
-                    dtype=torch.float32,
-                ),
+                max=torch.finfo(torch.float32).max,
             )
             decode_scale = torch.clamp(decode_scale, min=-FLOAT8_E4M3_MAX, max=FLOAT8_E4M3_MAX)
             decode_scale = decode_scale.to(torch.float8_e4m3fn)
 
-            encode_scale = torch.min(
+            encode_scale = torch.clamp(
                 torch.div(1.0, decode_scale.to(torch.float32) * global_decode_scale),
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=decode_scale.device,
-                    dtype=torch.float32,
-                ),
-            )
+                max=torch.finfo(torch.float32).max,
+            )   # encode_scale = (vec_max/6)
 
         scaled_x = x.to(torch.float32) * encode_scale
 
@@ -499,13 +523,24 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             if qparams.with_rht
             else x.t().contiguous()
         )
-        # Compute amax for rowwise and columnwise paths separately
-        global_amax_row = torch.max(torch.abs(row_input)).to(torch.float32).view(1)
-        global_amax_col = (
-            torch.max(torch.abs(col_input)).to(torch.float32).view(1)
-            if return_transpose
-            else global_amax_row
-        )
+        
+        # 兼容 qparams 中的 per_token_amax 设置
+        per_token_amax = getattr(qparams, 'per_token_amax', False)
+
+        if per_token_amax:
+            global_amax_row = torch.amax(torch.abs(row_input), dim=-1, keepdim=True).to(torch.float32)
+            global_amax_col = (
+                torch.amax(torch.abs(col_input), dim=-1, keepdim=True).to(torch.float32)
+                if return_transpose
+                else global_amax_row
+            )
+        else:
+            global_amax_row = torch.max(torch.abs(row_input)).to(torch.float32).view(1)
+            global_amax_col = (
+                torch.max(torch.abs(col_input)).to(torch.float32).view(1)
+                if return_transpose
+                else global_amax_row
+            )
 
         transpose_scales = False
 

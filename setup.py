@@ -75,7 +75,7 @@ def setup_extensions() -> setuptools.Extension:
         "-std=c++17",
         "-diag-suppress=3189",  # suppress warning from libtorch headers
     ]
-    extra_link_args = ["-lcuda", ]
+    extra_link_args = ["-lcuda", "-lnccl"]
 
     # debug mode flags
     if debug_mode:

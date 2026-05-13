@@ -81,7 +81,22 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         # Quantize w only for is_first_microbatch is True or None
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
-        if update_fp8_weights:
+
+        if quantize_op.should_update_quantize_weights:
+            w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
+            qresult_w_list = quantize_op.group_quantize(
+                w,
+                qlinear_params.w_params,
+                m_splits=m_splits,
+                return_transpose=(is_grad_enabled and not disable_backward_quant)
+            )
+            qw = qresult_w_list.data
+            sw = qresult_w_list.scale
+            qw_t = qresult_w_list.data_t
+            sw_t = qresult_w_list.scale_t
+            tw = qresult_w_list.tensor_scale
+            tw_t = qresult_w_list.tensor_scale_t
+        elif update_fp8_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
             qresult_w_list = quantize_op.group_quantize(
                 w,
@@ -331,7 +346,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 qparams_w=ctx.qlinear_params.x_params
             )
 
-        # TODO: Handle wgrad accumulation for mcore if needed
         def handle_custom_ddp_from_mcore(weight, wgrad):
             if ctx.weights_requires_grad:
                 # Handle custom DDP from mcore.

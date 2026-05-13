@@ -2,7 +2,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from miniTransformer.distributed.cutedsl.nvshmem_init import (
+from miniTransformer.distributed.cutedsl.nvshmem_communicator import (
     init_nvshmem_with_dist,
     finalize_nvshmem,
 )

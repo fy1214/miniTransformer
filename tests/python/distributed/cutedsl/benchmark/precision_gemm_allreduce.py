@@ -143,6 +143,7 @@ def precision_shape(
     with torch.no_grad():
         o_a = scheme_a(a_local, b_local, tp_group)
         o_b = scheme_b(a_local, b_local, tp_group)
+        ctx.barrier_before_reuse()
         o_c = scheme_c(a_local, b_local, ctx)
 
     # 计算指标（只在 rank 0 计算和打印）
@@ -219,6 +220,7 @@ def main():
         b_tmp = torch.randn(N, chunk, device="cuda", dtype=torch.bfloat16)
         _ = ctx.forward(a_tmp, b_tmp)
         torch.cuda.synchronize()
+        ctx.barrier_before_reuse()
 
         r = precision_shape(M, N, K, tp_group, ctx)
 

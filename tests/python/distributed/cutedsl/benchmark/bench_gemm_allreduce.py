@@ -89,15 +89,19 @@ class GPUTimer:
         return self.start_event.elapsed_time(self.end_event)
 
 
-def benchmark_fn(fn, warmup: int, iters: int) -> list:
+def benchmark_fn(fn, warmup: int, iters: int, pre_call=None) -> list:
     """运行 fn 若干次，返回每次的 GPU 时间（ms）列表。"""
     # warmup
     for _ in range(warmup):
+        if pre_call is not None:
+            pre_call()
         fn()
     torch.cuda.synchronize()
 
     times = []
     for _ in range(iters):
+        if pre_call is not None:
+            pre_call()
         with GPUTimer() as t:
             fn()
         times.append(t.elapsed_ms())
@@ -172,7 +176,8 @@ def bench_shape(
     # 方案 C（ctx 已在外部 compile 好）
     times_c = benchmark_fn(
         lambda: scheme_c(a_local, b_local, ctx),
-        WARMUP_ITERS, BENCH_ITERS
+        WARMUP_ITERS, BENCH_ITERS,
+        pre_call=ctx.barrier_before_reuse,
     )
     med_c = statistics.median(times_c)
 

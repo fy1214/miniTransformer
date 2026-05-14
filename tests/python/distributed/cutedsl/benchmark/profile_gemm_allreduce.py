@@ -120,12 +120,13 @@ def run_nsys_mode(args):
     ctx = GemmAllReduceCtx(tp_group=tp_group)
     _ = ctx.forward(a_local, b_local)   # compile
     torch.cuda.synchronize()
-    dist.barrier(group=tp_group)
+    ctx.barrier_before_reuse()
 
     # ── Warmup ────────────────────────────────────────────────────────────────
     for _ in range(args.warmup):
         scheme_a(a_local, b_local, tp_group)
         scheme_b(a_local, b_local, tp_group)
+        ctx.barrier_before_reuse()
         scheme_c(a_local, b_local, ctx)
     torch.cuda.synchronize()
     dist.barrier(group=tp_group)
@@ -147,6 +148,7 @@ def run_nsys_mode(args):
 
         # 方案 C：CuTeDSL tile-level fp32 AllReduce
         with NvtxRange(f"C_cutedsl_fp32_ar_iter{i}", color="green"):
+            ctx.barrier_before_reuse()
             scheme_c(a_local, b_local, ctx)
         torch.cuda.synchronize()
 

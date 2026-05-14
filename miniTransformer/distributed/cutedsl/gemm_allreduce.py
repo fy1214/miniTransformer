@@ -17,12 +17,15 @@ row parallel GEMM + tile-level fp32 AllReduce 融合（基于 CUTLASS CuTeDSL + 
     # 2. 每个层初始化一次 ctx
     ctx = GemmAllReduceCtx(tp_group=tp_group)
 
-    # 3. 每次 forward
+    # 3. 每次 forward（同步由外部控制）
     y = ctx.forward(a, b)
     # a: [M, K] bfloat16，row-major
     # b: [N, K] bfloat16，row-major（GEMM 计算 a @ b.T）
     # y: [M, N] bfloat16，已完成 AllReduce
 
+    # 若会继续复用同一个 ctx 做下一次 forward，建议在外层执行：
+    #   ctx.barrier_before_reuse()
+    #
     # 4. 进程退出前释放
     ctx.free()
     from miniTransformer.distributed.cutedsl.nvshmem_init import finalize_nvshmem
@@ -84,6 +87,11 @@ class GemmAllReduceCtx:
 
     Lazy compile：第一次 forward 时根据实际 tensor shape 和 dtype JIT 编译 kernel。
     nvshmem 对称内存在 _compile() 时分配，在 free() 时释放。
+
+    同步策略：
+      - forward() 内不做 torch/distributed 同步，保持 kernel 路径纯计算。
+      - 跨 rank 时序由外层控制；若会复用同一个 ctx 进入下一轮 forward，
+        建议在两轮之间调用 barrier_before_reuse()。
     """
 
     def __init__(
@@ -240,12 +248,6 @@ class GemmAllReduceCtx:
         if self._compiled is None:
             self._compile(a, b)
 
-        # kernel 内部 SM 级 final barrier 使用 relaxed CAS，
-        # 需要 Python 侧 dist.barrier() 确保上一次 kernel 在所有 rank 完全结束后再清零 flag
-        # TODO: 升级 kernel.py SM 级 barrier 为 acquire 语义可去掉此 barrier（参考 FlashInfer PR #2171）
-        #torch.cuda.synchronize()
-        #dist.barrier(group=self._tp_group)
-
         # 清零 flag 和 C
         self._flag_torch.zero_()
         self._c_torch.zero_()
@@ -281,6 +283,15 @@ class GemmAllReduceCtx:
         # _c_torch 是 fp32 [M, N, 1]，cast 回 bf16 并 squeeze L 维度
         # torch.cuda.synchronize()
         return self._c_torch.squeeze(-1).to(torch.bfloat16).clone()
+
+    def barrier_before_reuse(self):
+        """
+        在复用同一个 ctx 发起下一次 forward 前做跨 rank 同步。
+
+        该同步是“外层显式控制”接口，forward() 本身不会触发同步。
+        """
+        if dist.is_initialized() and self._world_size > 1:
+            dist.barrier(group=self._tp_group)
 
     def free(self):
         """

@@ -22,6 +22,7 @@ nvshmem_communicator.py
 
 import os
 import logging
+from typing import Union
 
 import numpy as np
 import torch

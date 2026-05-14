@@ -1183,7 +1183,7 @@ void launch_quantize_transpose_nvfp4_tuned_1d(
     at::Tensor &output_transpose,
     at::Tensor &output_scale_transpose,
     bool return_transpose) {
-  using namespace transformer_engine::dispatch::nvfp4::quantize_transpose_tuned_kernel;
+  namespace tk = transformer_engine::dispatch::nvfp4::quantize_transpose_tuned_kernel;
 
   constexpr bool use_stochastic_rounding = false;
   constexpr bool use_fast_math = false;
@@ -1192,10 +1192,12 @@ void launch_quantize_transpose_nvfp4_tuned_1d(
   const size_t cols = input.size(-1);
   const size_t rows = total_elements / cols;
 
-  const int blocks_Y = static_cast<int>(DIVUP(rows, static_cast<size_t>(TunableConfig::CHUNK_DIM_Y)));
-  const int blocks_X = static_cast<int>(DIVUP(cols, static_cast<size_t>(TunableConfig::CHUNK_DIM_X)));
+  const int blocks_Y =
+      static_cast<int>(DIVUP(rows, static_cast<size_t>(tk::TunableConfig::CHUNK_DIM_Y)));
+  const int blocks_X =
+      static_cast<int>(DIVUP(cols, static_cast<size_t>(tk::TunableConfig::CHUNK_DIM_X)));
   const dim3 grid(blocks_X, blocks_Y);
-  const int block_size = THREADS_NUM;
+  const int block_size = tk::THREADS_NUM;
 
   const size_t scale_stride = output_scale.stride(0);
   const size_t scale_stride_transpose =
@@ -1212,28 +1214,30 @@ void launch_quantize_transpose_nvfp4_tuned_1d(
   alignas(64) CUtensorMap tensor_map_output{};
   alignas(64) CUtensorMap tensor_map_transpose{};
 
-  create_2D_tensor_map(tensor_map_input, input, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0,
+  create_2D_tensor_map(tensor_map_input, input, rows, cols, tk::BUFF_DIM_Y, tk::BUFF_DIM_X, cols, 0,
                        sizeof(bf16) * 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-  create_2D_tensor_map(tensor_map_output, output, rows, cols, BUFF_DIM_Y, BUFF_DIM_X, cols, 0, 4,
-                       CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+  create_2D_tensor_map(tensor_map_output, output, rows, cols, tk::BUFF_DIM_Y, tk::BUFF_DIM_X, cols, 0,
+                       4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   if (return_transpose) {
-    create_2D_tensor_map(tensor_map_transpose, output_transpose, cols, rows, BUFF_DIM_X, BUFF_DIM_Y,
-                         rows, 0, 4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+    create_2D_tensor_map(tensor_map_transpose, output_transpose, cols, rows, tk::BUFF_DIM_X,
+                         tk::BUFF_DIM_Y, rows, 0, 4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
   }
 
-  constexpr int buff_elems = BUFF_DIM_Y * BUFF_IN_DIM_X;
-  constexpr int buff_elems_total_in = BUFFS_NUM_IN * buff_elems;
+  constexpr int buff_elems = tk::BUFF_DIM_Y * tk::BUFF_IN_DIM_X;
+  constexpr int buff_elems_total_in = tk::BUFFS_NUM_IN * buff_elems;
   constexpr int buff_size_aligned_in =
       static_cast<int>(DIVUP_TO_MULTIPLE(buff_elems_total_in * sizeof(bf16), TMA_SHMEM_ALIGNMENT));
   constexpr int buff_size_aligned_out =
-      static_cast<int>(DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT * BUFF_OUT_SIZE, TMA_SHMEM_ALIGNMENT));
-  constexpr int buff_size_aligned_out_t =
-      static_cast<int>(DIVUP_TO_MULTIPLE(BUFFS_NUM_OUT_TR * BUFF_OUT_TR_SIZE, TMA_SHMEM_ALIGNMENT));
+      static_cast<int>(DIVUP_TO_MULTIPLE(tk::BUFFS_NUM_OUT * tk::BUFF_OUT_SIZE, TMA_SHMEM_ALIGNMENT));
+  constexpr int buff_size_aligned_out_t = static_cast<int>(
+      DIVUP_TO_MULTIPLE(tk::BUFFS_NUM_OUT_TR * tk::BUFF_OUT_TR_SIZE, TMA_SHMEM_ALIGNMENT));
 
   constexpr int buff_size_scales = static_cast<int>(DIVUP_TO_MULTIPLE(
-      TunableConfig::CHUNK_DIM_Y * SCALES_PER_CHUNK_X * sizeof(nvfp4_scale_t), TMA_SHMEM_ALIGNMENT));
+      tk::TunableConfig::CHUNK_DIM_Y * tk::SCALES_PER_CHUNK_X * sizeof(nvfp4_scale_t),
+      TMA_SHMEM_ALIGNMENT));
   constexpr int buff_size_scales_transpose = static_cast<int>(DIVUP_TO_MULTIPLE(
-      TunableConfig::CHUNK_DIM_X * SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t), TMA_SHMEM_ALIGNMENT));
+      tk::TunableConfig::CHUNK_DIM_X * tk::SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t),
+      TMA_SHMEM_ALIGNMENT));
 
   const int in_mem = buff_size_aligned_in;
   const int out_data_mem = buff_size_aligned_out;
@@ -1254,8 +1258,8 @@ void launch_quantize_transpose_nvfp4_tuned_1d(
       TRANSFORMER_ENGINE_SWITCH_CONDITION(
           use_fast_math, USE_FAST_MATH,
           TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
-            auto kernel = quantize_transpose_nvfp4_tuned_1D_kernel<USE_STOCHASTIC_ROUNDING,
-                                                                    USE_FAST_MATH, RETURN_TRANSPOSE>;
+            auto kernel = tk::quantize_transpose_nvfp4_tuned_1D_kernel<USE_STOCHASTIC_ROUNDING,
+                                                                       USE_FAST_MATH, RETURN_TRANSPOSE>;
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
             kernel<<<grid, block_size, dshmem_size, stream>>>(
                 tensor_map_input, tensor_map_output, tensor_map_transpose, scales_ptr,

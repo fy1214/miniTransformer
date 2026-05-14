@@ -11,11 +11,7 @@ The custom CUDA kernel targets Blackwell (sm_100+); TE-vs-CUDA checks are skippe
 
 from __future__ import annotations
 
-import os
 import pytest
-import subprocess
-import sys
-import textwrap
 import torch
 
 try:
@@ -224,30 +220,33 @@ def check_quantization_cuda_versus_te(
         colwise_scale_ok = torch.equal(out_st.view(torch.uint8), st_te.view(torch.uint8))
 
     if not (rowwise_data_ok and rowwise_scale_ok and colwise_data_ok and colwise_scale_ok):
-        # Keep debug dumps explicit to avoid mixing up data-vs-scale buffers.
-        print("==== CUDA vs TE NVFP4 debug dump ====")
-        print(
+        # Build debug text into the exception message so parent subprocess caller
+        # can always see it even when stdout is buffered/dropped.
+        debug = []
+        debug.append("==== CUDA vs TE NVFP4 debug dump ====")
+        debug.append(
             f"rowwise_data_ok={rowwise_data_ok}, rowwise_scale_ok={rowwise_scale_ok}, "
             f"colwise_data_ok={colwise_data_ok}, colwise_scale_ok={colwise_scale_ok}"
         )
-        print(f"q_te_data_uint8: shape={tuple(q_te.shape)} dtype={q_te.dtype}")
-        print(q_te)
-        print(f"out_data_uint8: shape={tuple(out.shape)} dtype={out.dtype}")
-        print(out)
-        print(f"s_te_scale_u8view: shape={tuple(s_te.shape)} dtype={s_te.dtype}")
-        print(s_te.view(torch.uint8))
-        print(f"out_s_scale_u8view: shape={tuple(out_s.shape)} dtype={out_s.dtype}")
-        print(out_s.view(torch.uint8))
+        debug.append(f"q_te_data_uint8: shape={tuple(q_te.shape)} dtype={q_te.dtype}")
+        debug.append(str(q_te))
+        debug.append(f"out_data_uint8: shape={tuple(out.shape)} dtype={out.dtype}")
+        debug.append(str(out))
+        debug.append(f"s_te_scale_u8view: shape={tuple(s_te.shape)} dtype={s_te.dtype}")
+        debug.append(str(s_te.view(torch.uint8)))
+        debug.append(f"out_s_scale_u8view: shape={tuple(out_s.shape)} dtype={out_s.dtype}")
+        debug.append(str(out_s.view(torch.uint8)))
         if return_transpose:
             assert qt_te is not None and st_te is not None
-            print(f"qt_te_data_uint8: shape={tuple(qt_te.shape)} dtype={qt_te.dtype}")
-            print(qt_te)
-            print(f"out_t_data_uint8: shape={tuple(out_t.shape)} dtype={out_t.dtype}")
-            print(out_t)
-            print(f"st_te_scale_u8view: shape={tuple(st_te.shape)} dtype={st_te.dtype}")
-            print(st_te.view(torch.uint8))
-            print(f"out_st_scale_u8view: shape={tuple(out_st.shape)} dtype={out_st.dtype}")
-            print(out_st.view(torch.uint8))
+            debug.append(f"qt_te_data_uint8: shape={tuple(qt_te.shape)} dtype={qt_te.dtype}")
+            debug.append(str(qt_te))
+            debug.append(f"out_t_data_uint8: shape={tuple(out_t.shape)} dtype={out_t.dtype}")
+            debug.append(str(out_t))
+            debug.append(f"st_te_scale_u8view: shape={tuple(st_te.shape)} dtype={st_te.dtype}")
+            debug.append(str(st_te.view(torch.uint8)))
+            debug.append(f"out_st_scale_u8view: shape={tuple(out_st.shape)} dtype={out_st.dtype}")
+            debug.append(str(out_st.view(torch.uint8)))
+        raise AssertionError("\n".join(debug))
 
     torch.testing.assert_close(out, q_te, atol=0.0, rtol=0.0)
     torch.testing.assert_close(out_s.view(torch.uint8), s_te.view(torch.uint8), atol=0.0, rtol=0.0)
@@ -272,38 +271,15 @@ def test_te_vs_reference_bf16():
 @pytest.mark.parametrize("return_transpose", [False, True])
 @pytest.mark.parametrize("with_2d_quantization", [False, True])
 def test_cuda_quantize_transpose_vs_te(return_transpose: bool, with_2d_quantization: bool):
-    # Run each CUDA combo in a fresh process so one illegal-access case does not
-    # poison the CUDA context for later parameterized cases.
     # Keep 1D parity restoration as a separate follow-up task; 2D remains bit-exact.
     bit_exact = with_2d_quantization
-    child_code = textwrap.dedent(
-        f"""
-        from tests.python.nvfp4.test_nvfp4_quantize_exact import check_quantization_cuda_versus_te
-        check_quantization_cuda_versus_te(
-            M=1024,
-            N=4096,
-            return_transpose={return_transpose},
-            with_2d_quantization={with_2d_quantization},
-                bit_exact={bit_exact},
-        )
-        """
+    check_quantization_cuda_versus_te(
+        M=1024,
+        N=4096,
+        return_transpose=return_transpose,
+        with_2d_quantization=with_2d_quantization,
+        bit_exact=bit_exact,
     )
-    env = dict(os.environ)
-    env.setdefault("CUDA_LAUNCH_BLOCKING", "1")
-    proc = subprocess.run(
-        [sys.executable, "-c", child_code],
-        cwd=os.getcwd(),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        pytest.fail(
-            "CUDA-vs-TE case failed in subprocess "
-            f"(return_transpose={return_transpose}, with_2d_quantization={with_2d_quantization}).\n"
-            f"stdout:\n{proc.stdout}\n"
-            f"stderr:\n{proc.stderr}"
-        )
 
 
 if __name__ == "__main__":

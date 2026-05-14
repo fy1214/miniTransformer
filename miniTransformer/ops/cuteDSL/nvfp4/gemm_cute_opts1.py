@@ -1,14 +1,4 @@
-import argparse
-import fcntl
-import hashlib
 import os
-import pickle
-import sys
-import tempfile
-from dataclasses import dataclass
-from getpass import getuser
-from itertools import product
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import cuda.bindings.driver as cuda
 
@@ -23,128 +13,53 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack, make_ptr
+from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import (
+    Nvfp4KernelVariant,
+    GemmTuneConfig,
+    build_default_tune_search_space,
+    get_device_arch_from_torch_device,
+    try_load_compiled_from_disk,
+    try_export_compiled_to_disk,
+    DEFAULT_MMA_TILER_MN,
+    DEFAULT_CLUSTER_SHAPE_MNK,
+    DEFAULT_NUM_AB_STAGE,
+    DEFAULT_NUM_ACC_STAGE,
+)
 
-if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    examples_dir = os.path.join(current_dir, "..", "..")
-    if examples_dir not in sys.path:
-        sys.path.insert(0, examples_dir)
-
-mma_tiler_mn = (256, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
 
 sf_vec_size = 16
-cluster_shape_mnk = (2, 1, 1)
-
-DEFAULT_MMA_TILER_MN = mma_tiler_mn
-DEFAULT_CLUSTER_SHAPE_MNK = cluster_shape_mnk
-DEFAULT_NUM_AB_STAGE = 5
-DEFAULT_NUM_ACC_STAGE = 1
-
-
-@dataclass(frozen=True)
-class GemmTuneConfig:
-    mma_tiler_mn: Tuple[int, int]
-    cluster_shape_mnk: Tuple[int, int, int]
-    use_2cta_instrs: bool
-    num_ab_stage: int
-    num_acc_stage: int
-
-
-DEFAULT_TUNE_SEARCH_SPACE: List[GemmTuneConfig] = []
-for _mma_tiler_mn, _cluster_shape_mnk, _use_2cta_instrs, _num_ab_stage in product(
-    [(128, 128), (128, 256), (256, 128), (256, 256)],
-    [(1, 1, 1), (2, 1, 1)],
-    [False, True],
-    [4, 5],
-):
-    if _mma_tiler_mn[0] == 128 and _use_2cta_instrs:
-        continue
-    DEFAULT_TUNE_SEARCH_SPACE.append(
-        GemmTuneConfig(
-            mma_tiler_mn=_mma_tiler_mn,
-            cluster_shape_mnk=_cluster_shape_mnk,
-            use_2cta_instrs=_use_2cta_instrs,
-            num_ab_stage=_num_ab_stage,
-            num_acc_stage=1,
-        )
-    )
+DEFAULT_TUNE_SEARCH_SPACE: List[GemmTuneConfig] = build_default_tune_search_space()
 
 _CONFIG_KERNEL_CACHE: Dict[Tuple[Any, ...], Any] = {}
 _INPUT_BEST_CONFIG_CACHE: Dict[Tuple[Any, ...], GemmTuneConfig] = {}
-_PERSISTENT_CACHE_VERSION = "v1"
+_INPUT_BEST_VARIANT_CACHE: Dict[Tuple[Any, ...], Tuple[Nvfp4KernelVariant, Any, Any]] = {}
+_MULTI_VARIANT_CACHE_HITS = 0
+
+
 _PERSISTENT_CACHE_ENABLED = os.getenv("NVFP4_CUTE_PERSISTENT_CACHE", "0") == "1"
 _PERSISTENT_CACHE_FUNC_NAME = "func"
 
 
-def _get_persistent_cache_dir() -> Path:
-    cache_dir = os.getenv("NVFP4_CUTE_CACHE_DIR")
-    if cache_dir:
-        path = Path(cache_dir)
-    else:
-        path = Path(tempfile.gettempdir()) / getuser() / "minitransformer_cute_cache"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _persistent_cache_hash(config_key: Tuple[Any, ...]) -> str:
-    payload = (_PERSISTENT_CACHE_VERSION, config_key)
-    return hashlib.sha256(pickle.dumps(payload)).hexdigest()
-
-
-class _FileLock:
-    def __init__(self, lock_path: Path, exclusive: bool):
-        self.lock_path = lock_path
-        self.exclusive = exclusive
-        self._fd = None
-
-    def __enter__(self):
-        self._fd = os.open(
-            str(self.lock_path),
-            os.O_CREAT | (os.O_WRONLY if self.exclusive else os.O_RDONLY),
-        )
-        mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-        fcntl.flock(self._fd, mode)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            os.close(self._fd)
-            self._fd = None
-
-
 def _try_load_compiled_from_disk(config_key: Tuple[Any, ...]):
-    if not _PERSISTENT_CACHE_ENABLED:
-        return None
-    cache_dir = _get_persistent_cache_dir()
-    key_hash = _persistent_cache_hash(config_key)
-    obj_path = cache_dir / f"{key_hash}.o"
-    lock_path = cache_dir / f"{key_hash}.lock"
-    with _FileLock(lock_path, exclusive=False):
-        if not obj_path.exists():
-            return None
-        module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
-        return getattr(module, _PERSISTENT_CACHE_FUNC_NAME)
+    return try_load_compiled_from_disk(
+        config_key,
+        persistent_cache_enabled=_PERSISTENT_CACHE_ENABLED,
+        function_name=_PERSISTENT_CACHE_FUNC_NAME,
+    )
 
 
 def _try_export_compiled_to_disk(config_key: Tuple[Any, ...], compiled) -> None:
-    if not _PERSISTENT_CACHE_ENABLED:
-        return
-    cache_dir = _get_persistent_cache_dir()
-    key_hash = _persistent_cache_hash(config_key)
-    obj_path = cache_dir / f"{key_hash}.o"
-    lock_path = cache_dir / f"{key_hash}.lock"
-    with _FileLock(lock_path, exclusive=True):
-        if obj_path.exists():
-            return
-        compiled.export_to_c(
-            object_file_path=str(obj_path),
-            function_name=_PERSISTENT_CACHE_FUNC_NAME,
-        )
+    try_export_compiled_to_disk(
+        config_key,
+        compiled,
+        persistent_cache_enabled=_PERSISTENT_CACHE_ENABLED,
+        function_name=_PERSISTENT_CACHE_FUNC_NAME,
+    )
 
+# 2CTA MMA & TMA multicast
 class OptimizedBlockScaledDenseGemmKernel:
     def __init__(
         self,
@@ -939,9 +854,57 @@ class OptimizedBlockScaledDenseGemmKernel:
         return
 
 
-def _get_device_arch_from_torch_device(device: torch.device) -> str:
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"sm_{major}{minor}"
+def _make_kernel_instance(
+    config: GemmTuneConfig,
+    kernel_variant: Nvfp4KernelVariant,
+    use_clc_dynamic_scheduler: bool,
+):
+    if kernel_variant == Nvfp4KernelVariant.OPTS1:
+        return OptimizedBlockScaledDenseGemmKernel(
+            mma_tiler_mn=config.mma_tiler_mn,
+            cluster_shape_mnk=config.cluster_shape_mnk,
+            use_2cta_instrs=config.use_2cta_instrs,
+            num_ab_stage=config.num_ab_stage,
+            num_acc_stage=config.num_acc_stage,
+        )
+    if kernel_variant == Nvfp4KernelVariant.OPTS0:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts0 import (
+            NormalBlockScaledDenseGemmKernel,
+        )
+
+        return NormalBlockScaledDenseGemmKernel()
+
+    if kernel_variant == Nvfp4KernelVariant.OPTS2:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts2 import (
+            Sm100BlockScaledDenseGemmKernel,
+        )
+
+        return Sm100BlockScaledDenseGemmKernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS3:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts3 import (
+            Sm100BlockScaledDenseGemm3Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm3Kernel()
+    if kernel_variant == Nvfp4KernelVariant.OPTS4:
+        from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts4 import (
+            Sm100BlockScaledDenseGemm4Kernel,
+        )
+
+        return Sm100BlockScaledDenseGemm4Kernel()
+    raise ValueError(f"Unsupported kernel_variant: {kernel_variant}")
+
+
+def _extra_compile_args_for_variant(
+    kernel_variant: Nvfp4KernelVariant, config: GemmTuneConfig
+) -> List[Any]:
+    if kernel_variant == Nvfp4KernelVariant.OPTS4:
+        hw_info = utils.HardwareInfo()
+        max_active_clusters = hw_info.get_max_active_clusters(
+            config.cluster_shape_mnk[0] * config.cluster_shape_mnk[1]
+        )
+        return [max_active_clusters]
+    return []
 
 
 def _compile_kernel_with_config(
@@ -959,7 +922,9 @@ def _compile_kernel_with_config(
     out_dtype,
     accumulate: bool,
     has_swizzle: bool,
+    use_clc_dynamic_scheduler: bool,
     arch: str,
+    kernel_variant: Nvfp4KernelVariant,
 ):
     config_key = (
         arch,
@@ -968,6 +933,8 @@ def _compile_kernel_with_config(
         out_dtype,
         bool(accumulate),
         bool(has_swizzle),
+        bool(use_clc_dynamic_scheduler),
+        kernel_variant.value,
         epilogue_cache_tag,
         config.mma_tiler_mn,
         config.cluster_shape_mnk,
@@ -983,13 +950,21 @@ def _compile_kernel_with_config(
         _CONFIG_KERNEL_CACHE[config_key] = compiled
         return compiled
 
-    gemm = OptimizedBlockScaledDenseGemmKernel(
-        mma_tiler_mn=config.mma_tiler_mn,
-        cluster_shape_mnk=config.cluster_shape_mnk,
-        use_2cta_instrs=config.use_2cta_instrs,
-        num_ab_stage=config.num_ab_stage,
-        num_acc_stage=config.num_acc_stage,
+    gemm = _make_kernel_instance(
+        config,
+        kernel_variant,
+        use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
     )
+    extra_compile_args = _extra_compile_args_for_variant(kernel_variant, config)
+    compile_kwargs = {"epilogue_op": epilogue_op}
+    if kernel_variant in (
+        Nvfp4KernelVariant.OPTS0,
+        Nvfp4KernelVariant.OPTS1,
+        Nvfp4KernelVariant.OPTS2,
+        Nvfp4KernelVariant.OPTS3,
+        Nvfp4KernelVariant.OPTS4,
+    ):
+        compile_kwargs["accumulate"] = accumulate
     compiled = cute.compile(
         gemm,
         a_ptr,
@@ -999,8 +974,8 @@ def _compile_kernel_with_config(
         c_ptr,
         problem_size,
         stream,
-        epilogue_op=epilogue_op,
-        accumulate=accumulate,
+        *extra_compile_args,
+        **compile_kwargs,
     )
     _try_export_compiled_to_disk(config_key, compiled)
     _CONFIG_KERNEL_CACHE[config_key] = compiled
@@ -1019,8 +994,10 @@ def get_compiled_nvfp4_gemm(
     epilogue_op,
     epilogue_cache_tag: Any = None,
     out_dtype=torch.float16,
+    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.OPTS1,
     accumulate: bool = False,
     has_swizzle: bool = True,
+    use_clc_dynamic_scheduler: bool = False,
     do_autotune: bool = False,
     warmup_iterations: int = 10,
     iterations: int = 100,
@@ -1036,7 +1013,7 @@ def get_compiled_nvfp4_gemm(
     if not isinstance(c_ptr, cute.Pointer):
         raise TypeError("c_ptr must be a cute.Pointer")
     torch_device = torch.device("cuda", torch.cuda.current_device())
-    arch = _get_device_arch_from_torch_device(torch_device)
+    arch = get_device_arch_from_torch_device(torch_device)
     m, n, k, l = problem_size
 
     input_key = (
@@ -1045,9 +1022,11 @@ def get_compiled_nvfp4_gemm(
         m,
         n,
         k,
+        kernel_variant.value,
         out_dtype,
         bool(accumulate),
         bool(has_swizzle),
+        bool(use_clc_dynamic_scheduler),
         epilogue_cache_tag,
     )
 
@@ -1093,8 +1072,10 @@ def get_compiled_nvfp4_gemm(
                 epilogue_op=epilogue_op,
                 epilogue_cache_tag=epilogue_cache_tag,
                 out_dtype=out_dtype,
+                kernel_variant=kernel_variant,
                 accumulate=accumulate,
                 has_swizzle=has_swizzle,
+                use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
                 arch=arch,
             )
             return compiled, best_config, None
@@ -1102,6 +1083,7 @@ def get_compiled_nvfp4_gemm(
         best_time = float("inf")
         best_config = None
         best_compiled = None
+        fail_count = 0
 
         for config in tune_search_space:
             if config.use_2cta_instrs and config.mma_tiler_mn[0] == 128:
@@ -1119,12 +1101,15 @@ def get_compiled_nvfp4_gemm(
                     epilogue_op=epilogue_op,
                     epilogue_cache_tag=epilogue_cache_tag,
                     out_dtype=out_dtype,
+                    kernel_variant=kernel_variant,
                     accumulate=accumulate,
                     has_swizzle=has_swizzle,
+                    use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
                     arch=arch,
                 )
                 elapsed_us = _benchmark(compiled, benchmark_scope_tensors)
             except Exception:
+                fail_count += 1
                 continue
             if elapsed_us < best_time:
                 best_time = elapsed_us
@@ -1156,8 +1141,152 @@ def get_compiled_nvfp4_gemm(
         epilogue_op=epilogue_op,
         epilogue_cache_tag=epilogue_cache_tag,
         out_dtype=out_dtype,
+        kernel_variant=kernel_variant,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
+        use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
         arch=arch,
     )
     return compiled, default_config, None
+
+
+def reset_multi_variant_cache_stats() -> None:
+    global _MULTI_VARIANT_CACHE_HITS
+    _MULTI_VARIANT_CACHE_HITS = 0
+
+
+def get_multi_variant_cache_stats() -> Dict[str, int]:
+    return {
+        "entries": len(_INPUT_BEST_VARIANT_CACHE),
+        "hits": _MULTI_VARIANT_CACHE_HITS,
+    }
+
+
+def get_compiled_nvfp4_gemm_multi_variant(
+    *,
+    a_ptr,
+    b_ptr,
+    sfa_ptr,
+    sfb_ptr,
+    c_ptr,
+    problem_size: Tuple[int, int, int, int],
+    stream,
+    epilogue_op,
+    epilogue_cache_tag: Any = None,
+    out_dtype=torch.float16,
+    accumulate: bool = False,
+    has_swizzle: bool = True,
+    use_clc_dynamic_scheduler: bool = False,
+    benchmark_scope_tensors: Optional[List[torch.Tensor]] = None,
+    warmup_iterations: int = 3,
+    iterations: int = 20,
+    use_cold_l2: bool = False,
+):
+    if benchmark_scope_tensors is None or len(benchmark_scope_tensors) == 0:
+        raise ValueError(
+            "benchmark_scope_tensors is required for multi-variant online dispatch"
+        )
+    if not isinstance(c_ptr, cute.Pointer):
+        raise TypeError("c_ptr must be a cute.Pointer")
+
+    torch_device = torch.device("cuda", torch.cuda.current_device())
+    arch = get_device_arch_from_torch_device(torch_device)
+    m, n, k, _ = problem_size
+    input_key = (
+        torch_device.index,
+        arch,
+        m,
+        n,
+        k,
+        out_dtype,
+        bool(accumulate),
+        bool(has_swizzle),
+        bool(use_clc_dynamic_scheduler),
+        epilogue_cache_tag,
+    )
+
+    global _MULTI_VARIANT_CACHE_HITS
+    if input_key in _INPUT_BEST_VARIANT_CACHE:
+        _MULTI_VARIANT_CACHE_HITS += 1
+        cached_variant, cached_compiled, cached_cfg = _INPUT_BEST_VARIANT_CACHE[input_key]
+        return cached_compiled, cached_cfg, None, cached_variant, True
+
+    def _benchmark(compiled):
+        def workspace_generator():
+            args = cute.testing.JitArguments(
+                a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, problem_size, stream
+            )
+            args.add_to_scope(benchmark_scope_tensors)
+            return args
+
+        workspace_count = 1
+        if use_cold_l2:
+            one_workspace_bytes = sum(
+                int(t.numel() * t.element_size()) for t in benchmark_scope_tensors
+            )
+            workspace_count = cute.testing.get_workspace_count(
+                one_workspace_bytes, warmup_iterations, iterations
+            )
+        return cute.testing.benchmark(
+            compiled,
+            workspace_generator=workspace_generator,
+            workspace_count=workspace_count,
+            stream=stream,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+        )
+
+    candidate_variants = (
+        Nvfp4KernelVariant.OPTS0,
+        Nvfp4KernelVariant.OPTS1,
+        Nvfp4KernelVariant.OPTS2,
+        Nvfp4KernelVariant.OPTS3,
+        Nvfp4KernelVariant.OPTS4,
+    )
+    best_time = float("inf")
+    best_variant = None
+    best_compiled = None
+    best_cfg = None
+    error_count = 0
+
+    for variant in candidate_variants:
+        try:
+            compiled, selected_cfg, _ = get_compiled_nvfp4_gemm(
+                a_ptr=a_ptr,
+                b_ptr=b_ptr,
+                sfa_ptr=sfa_ptr,
+                sfb_ptr=sfb_ptr,
+                c_ptr=c_ptr,
+                problem_size=problem_size,
+                stream=stream,
+                epilogue_op=epilogue_op,
+                epilogue_cache_tag=epilogue_cache_tag,
+                out_dtype=out_dtype,
+                kernel_variant=variant,
+                accumulate=accumulate,
+                has_swizzle=has_swizzle,
+                use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+                do_autotune=False,
+                benchmark_scope_tensors=benchmark_scope_tensors,
+                warmup_iterations=warmup_iterations,
+                iterations=iterations,
+                use_cold_l2=use_cold_l2,
+            )
+            elapsed_us = _benchmark(compiled)
+        except Exception:
+            error_count += 1
+            continue
+
+        if elapsed_us < best_time:
+            best_time = elapsed_us
+            best_variant = variant
+            best_compiled = compiled
+            best_cfg = selected_cfg
+
+    if best_compiled is None:
+        raise RuntimeError(
+            f"multi-variant dispatch failed: no valid kernel among OPTS0~OPTS4 (errors={error_count})"
+        )
+
+    _INPUT_BEST_VARIANT_CACHE[input_key] = (best_variant, best_compiled, best_cfg)
+    return best_compiled, best_cfg, best_time, best_variant, False

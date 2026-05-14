@@ -19,6 +19,23 @@ nvfp4_scale_t = torch.float8_e4m3fn
 
 use_cpp_allocator = False
 
+def _is_sm100() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+
+
+def _grouped_gemm_cutedsl(
+    A: list,
+    B: list,
+    m_splits: list,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    # Kept for backward compatibility with existing imports/tests.
+    # Actual implementation is hosted in nvfp4_quartet_op and gated there.
+    from miniTransformer.quantiztion.nvfp4_quartet_op import grouped_gemm_cutedsl
+
+    return grouped_gemm_cutedsl(A, B, m_splits, out_dtype)
+
+
 class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
@@ -220,6 +237,25 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         a0 = A[0]
         is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
 
+        # Optional env-gated bridge for grouped cuteDSL path.
+        # Default remains TE grouped_gemm for compatibility on environments
+        # without newer cuteDSL.
+        from miniTransformer.quantiztion.nvfp4_quartet_op import is_grouped_gemm_cutedsl_enabled
+
+        if (
+            is_grouped_gemm_cutedsl_enabled()
+            and is_quantized
+            and not grad
+            and not gelu
+            and not accumulate
+            and layout == "TN"
+            and _is_sm100()
+        ):
+            try:
+                return _grouped_gemm_cutedsl(A, B, m_splits, activation_dtype)
+            except (TypeError, NotImplementedError):
+                pass
+
         if grad:
             if layout == "NN":
                 if is_quantized:
@@ -250,6 +286,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             A=B,
             B=A,
             out=out,
+            quantization_params=[None] * len(B),
             out_dtype=activation_dtype,
             layout=layout,
             m_splits=m_splits,

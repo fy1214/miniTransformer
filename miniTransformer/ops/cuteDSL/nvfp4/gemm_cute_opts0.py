@@ -26,10 +26,10 @@ mma_tiler_mn = (128, 256)
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
-c_dtype = cutlass.BFloat16
 sf_vec_size = 16
 
 
+# simple kernel implementation
 class NormalBlockScaledDenseGemmKernel:
     def __init__(self):
         self.threads_per_cta = 128
@@ -51,6 +51,7 @@ class NormalBlockScaledDenseGemmKernel:
         problem_size: tuple,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        accumulate: cutlass.Constexpr = False,
     ):
         # setup static attributes before smem/grid/tma computation
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -228,6 +229,7 @@ class NormalBlockScaledDenseGemmKernel:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             epilogue_op,
+            accumulate,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -255,6 +257,7 @@ class NormalBlockScaledDenseGemmKernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         epilogue_op: cutlass.Constexpr,
+        accumulate: cutlass.Constexpr,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -642,16 +645,17 @@ class NormalBlockScaledDenseGemmKernel:
         tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc)
         # (T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(tCgC)
+        c_elem_dtype = mC_mnl.element_type
         # (T2R_M, T2R_N, EPI_M, EPI_N）
         tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[None, None, None, None, 0, 0, 0].shape, cutlass.Float32
         )
         # (T2R_M, T2R_N, EPI_M, EPI_N）
         tTR_rC = cute.make_rmem_tensor(
-            tTR_gC[None, None, None, None, 0, 0, 0].shape, c_dtype
+            tTR_gC[None, None, None, None, 0, 0, 0].shape, c_elem_dtype
         )
         # STG Atom
-        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_elem_dtype)
         tTR_gC = tTR_gC[(None, None, None, None, *mma_tile_coord_mnl)]
 
         # Release TMEM allocation lock
@@ -662,8 +666,12 @@ class NormalBlockScaledDenseGemmKernel:
 
         # Copy accumulator to register
         cute.copy(tiled_copy_t2r, tTR_tAcc, tTR_rAcc)
-        acc_vec = epilogue_op(tTR_rAcc.load()).to(c_dtype)
-        tTR_rC.store(acc_vec)
+        acc_vec = epilogue_op(tTR_rAcc.load())
+        if cutlass.const_expr(accumulate):
+            cute.copy(simt_atom, tTR_gC, tTR_rC)
+            c_global = tTR_rC.load()
+            acc_vec = acc_vec + c_global
+        tTR_rC.store(acc_vec.to(c_elem_dtype))
         # Store C to global memory
         cute.copy(simt_atom, tTR_rC, tTR_gC)
 

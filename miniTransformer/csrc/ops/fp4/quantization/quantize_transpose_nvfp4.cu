@@ -224,7 +224,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
   constexpr size_t in_mem = buff_size_aligned_in;
 
   constexpr size_t out_mem_rowwise_data = buff_size_aligned_out;
-  constexpr size_t out_mem_colwise_data = buff_size_aligned_out;
+  // Keep SHMEM layout consistent with host-side dshmem sizing:
+  // when RETURN_TRANSPOSE=false, no transpose data buffer is reserved.
+  constexpr size_t out_mem_colwise_data = RETURN_TRANSPOSE ? buff_size_aligned_out : 0;
   constexpr size_t out_mem_rowwise_scales = 0;
 
   extern __shared__ char dynamic_shmem[];
@@ -727,7 +729,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
   constexpr size_t in_mem = buff_size_aligned_in;
 
   constexpr size_t out_mem_rowwise_data = buff_size_aligned_out;
-  constexpr size_t out_mem_colwise_data = buff_size_aligned_out;
+  // Keep SHMEM layout consistent with host-side dshmem sizing:
+  // when RETURN_TRANSPOSE=false, no transpose data buffer is reserved.
+  constexpr size_t out_mem_colwise_data = RETURN_TRANSPOSE ? buff_size_aligned_out : 0;
   constexpr size_t out_mem_rowwise_scales = 0;
 
   extern __shared__ char dynamic_shmem[];
@@ -1298,7 +1302,9 @@ void quantize_transpose_nvfp4(
              "Number of tensor cols must be a multiple of 32");  // 16B alignment for TMA
 
 #if FP4_TYPE_SUPPORTED
-  if (!use_2d_quantization && input.scalar_type() == at::kBFloat16) {
+  // NOTE: tuned_1D kernel wiring is currently disabled due runtime stability issues.
+  // Re-enable after tuned path is validated across return_transpose modes.
+  if (false && !use_2d_quantization && input.scalar_type() == at::kBFloat16) {
     launch_quantize_transpose_nvfp4_tuned_1d(input, amax_rowwise, amax_colwise, output,
                                              output_scale, output_transpose, output_scale_transpose,
                                              return_transpose);

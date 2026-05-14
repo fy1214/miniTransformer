@@ -11,7 +11,11 @@ The custom CUDA kernel targets Blackwell (sm_100+); TE-vs-CUDA checks are skippe
 
 from __future__ import annotations
 
+import os
 import pytest
+import subprocess
+import sys
+import textwrap
 import torch
 
 try:
@@ -20,7 +24,6 @@ except ImportError:
     fp4_gemm = None
 
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import QParams
 
 try:
@@ -70,12 +73,10 @@ def _alloc_cuda_quant_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     out = torch.empty((rows, cols // 2), dtype=torch.uint8, device="cuda")
     out_s = torch.empty((rows, cols // 16), dtype=torch.float8_e4m3fn, device="cuda")
-    if return_transpose:
-        out_t = torch.empty((cols, rows // 2), dtype=torch.uint8, device="cuda")
-        out_st = torch.empty((cols, rows // 16), dtype=torch.float8_e4m3fn, device="cuda")
-    else:
-        out_t = torch.empty((1, 1), dtype=torch.uint8, device="cuda")
-        out_st = torch.empty((1, 1), dtype=torch.float8_e4m3fn, device="cuda")
+    # Always allocate full transpose buffers. Some CUDA paths may still touch
+    # transpose pointers internally even when return_transpose=False.
+    out_t = torch.empty((cols, rows // 2), dtype=torch.uint8, device="cuda")
+    out_st = torch.empty((cols, rows // 16), dtype=torch.float8_e4m3fn, device="cuda")
     return out, out_s, out_t, out_st
 
 
@@ -229,12 +230,35 @@ def test_te_vs_reference_bf16():
 @pytest.mark.parametrize("return_transpose", [False, True])
 @pytest.mark.parametrize("with_2d_quantization", [False, True])
 def test_cuda_quantize_transpose_vs_te(return_transpose: bool, with_2d_quantization: bool):
-    check_quantization_cuda_versus_te(
-        M=1024,
-        N=4096,
-        return_transpose=return_transpose,
-        with_2d_quantization=with_2d_quantization,
+    # Run each CUDA combo in a fresh process so one illegal-access case does not
+    # poison the CUDA context for later parameterized cases.
+    child_code = textwrap.dedent(
+        f"""
+        from tests.python.nvfp4.test_nvfp4_quantize_exact import check_quantization_cuda_versus_te
+        check_quantization_cuda_versus_te(
+            M=1024,
+            N=4096,
+            return_transpose={return_transpose},
+            with_2d_quantization={with_2d_quantization},
+        )
+        """
     )
+    env = dict(os.environ)
+    env.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+    proc = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=os.getcwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            "CUDA-vs-TE case failed in subprocess "
+            f"(return_transpose={return_transpose}, with_2d_quantization={with_2d_quantization}).\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
 
 
 if __name__ == "__main__":

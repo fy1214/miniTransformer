@@ -8,6 +8,7 @@ device capability is below 10.0.
 
 import pytest
 import torch
+from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
 
 try:
     import fp4_gemm
@@ -105,3 +106,27 @@ def test_quantize_transpose_nvfp4_zeros_deterministic():
 
     assert torch.isfinite(out_s.to(torch.float32)).all()
     assert torch.isfinite(out_st.to(torch.float32)).all()
+
+
+@pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON)
+@pytest.mark.parametrize("return_transpose", [False, True])
+def test_quantize_nvfp4_cuda_wrapper_shapes(return_transpose: bool):
+    rows, cols = 128, 128
+    inp = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+    result = quantize_nvfp4_cuda(
+        inp,
+        with_2d_quantization=True,
+        return_transpose=return_transpose,
+    )
+
+    assert result.data.shape == (rows, cols // 2)
+    assert result.scale.shape == (rows, cols // 16)
+    assert result.tensor_scale is not None and result.tensor_scale.shape == (1,)
+
+    if return_transpose:
+        assert result.data_t is not None and result.data_t.shape == (cols, rows // 2)
+        assert result.scale_t is not None and result.scale_t.shape == (cols, rows // 16)
+        assert result.tensor_scale_t is not None and result.tensor_scale_t.shape == (1,)
+    else:
+        assert result.data_t is None
+        assert result.scale_t is None

@@ -20,8 +20,8 @@ except ImportError:
     fp4_gemm = None
 
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import QParams
+from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
 
 try:
     from transformer_engine.pytorch import NVFP4Quantizer
@@ -280,6 +280,24 @@ def test_cuda_quantize_transpose_vs_te(return_transpose: bool, with_2d_quantizat
         with_2d_quantization=with_2d_quantization,
         bit_exact=bit_exact,
     )
+
+
+@pytest.mark.skipif(_SKIP_CUDA_TE is not None, reason=_SKIP_CUDA_TE or "")
+@pytest.mark.parametrize("return_transpose", [False, True])
+def test_quantize_nvfp4_cuda_wrapper_global_amax(return_transpose: bool):
+    M, N = 1024, 4096
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    result = quantize_nvfp4_cuda(
+        x,
+        with_2d_quantization=True,
+        return_transpose=return_transpose,
+    )
+    expected = torch.max(torch.abs(x)).to(torch.float32).view(1)
+
+    assert result.tensor_scale is not None
+    torch.testing.assert_close(result.tensor_scale, expected, atol=0.0, rtol=0.0)
+    if return_transpose:
+        assert result.tensor_scale_t is not None
 
 
 if __name__ == "__main__":

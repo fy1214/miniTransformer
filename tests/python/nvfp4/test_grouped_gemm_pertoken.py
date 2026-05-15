@@ -3,10 +3,8 @@
 import pytest
 import torch
 
-from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute import (
+from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
     apply_grouped_gemm_alphas,
-)
-from miniTransformer.quantiztion.nvfp4_quartet_op import (
     block_scale_to_sf_fp8,
     build_group_alpha_pertoken,
     dequant_pertoken_nvfp4,

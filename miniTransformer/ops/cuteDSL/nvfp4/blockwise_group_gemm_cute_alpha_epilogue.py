@@ -3221,15 +3221,13 @@ def pertoken_scales_to_sfa_2d(
     """
     Merge per-token global decode scale into per-block SFA [M, K//block_size] FP8.
 
-    Implemented in ``nvfp4_quartet_op``; re-exported here for CuTeDSL call sites.
+    Prefer ``block_scale_to_sf_fp8`` + per-group ``alphas`` in epilogue instead.
     """
-    from miniTransformer.quantiztion.nvfp4_quartet_op import (
-        pertoken_scales_to_sfa_2d as _pertoken_scales_to_sfa_2d,
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        pertoken_scales_to_sfa_2d as _impl,
     )
 
-    return _pertoken_scales_to_sfa_2d(
-        block_scale, global_scale, m, k, block_size=block_size
-    )
+    return _impl(block_scale, global_scale, m, k, block_size=block_size)
 
 
 def grouped_blockscaled_reference(

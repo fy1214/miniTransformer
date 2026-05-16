@@ -2,6 +2,10 @@
 NVFP4 grouped GEMM helpers (quantization + host alpha preparation).
 
 Kernel execution lives in ``blockwise_group_gemm_cute_alpha_epilogue``.
+
+Quantization sources:
+  - Per-token (rowwise) amax: ``miniTransformer.ops.triton.nvfp4_quantization``.
+  - Tensor-global amax (e.g. weights): ``miniTransformer.ops.nvfp4_quantization``.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ class PertokenNvfp4Tensor:
 
 @dataclass
 class TensorGlobalNvfp4Tensor:
-    """Tensor-global NVFP4 weight (ref blockwise quant, quant_tile (1,16))."""
+    """Tensor-global NVFP4 weight from ``quantize_nvfp4_cuda`` (fp4_gemm)."""
 
     data_uint8: torch.Tensor
     block_scale_fp8: torch.Tensor
@@ -108,6 +112,7 @@ def quantize_activation_nvfp4_pertoken(
     x: torch.Tensor,
     block_size: int = _NVFP4_SF_VEC_SIZE,
 ) -> PertokenNvfp4Tensor:
+    # Token-wise amax: Triton path (aligned with quant_nvfp4_pertoken_golden).
     from miniTransformer.ops.triton.nvfp4_quantization import quant_nvfp4_pertoken_triton
 
     assert x.ndim == 2
@@ -122,28 +127,38 @@ def quantize_activation_nvfp4_pertoken(
     )
 
 
+def _pad_2d_to_multiples_of_32(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """``quantize_nvfp4_cuda`` requires both dimensions divisible by 32."""
+    n, k = x.shape
+    n_pad = ((n + 31) // 32) * 32
+    k_pad = ((k + 31) // 32) * 32
+    if n_pad == n and k_pad == k:
+        return x, (n, k)
+    out = torch.zeros(n_pad, k_pad, dtype=x.dtype, device=x.device)
+    out[:n, :k] = x
+    return out, (n, k)
+
+
 def quantize_weight_nvfp4_tensor_global(x: torch.Tensor) -> TensorGlobalNvfp4Tensor:
-    from miniTransformer.quantiztion.nvfp4_ref_standalone import (
-        _pad_tensor,
-        _quantize_blockwise_reference,
-        _rm_pad_tensor,
-    )
+    # Tensor-global amax: CUDA fp4_gemm path.
+    from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
 
     assert x.ndim == 2
-    m, k = x.shape
-    x_pad = _pad_tensor(x, row_divisor=32, col_divisor=32)
-    amax = torch.amax(torch.abs(x)).to(torch.float32).reshape(1, 1)
-    qx, sx = _quantize_blockwise_reference(
-        x_pad.float(),
-        amax,
-        tile_len_x=16,
-        tile_len_y=1,
-        pow_2_scales=False,
-        with_2d_quantization=False,
+    assert x.is_cuda, "quantize_weight_nvfp4_tensor_global requires a CUDA tensor."
+    n, k = x.shape
+    assert k % _NVFP4_SF_VEC_SIZE == 0
+
+    x_pad, (n0, k0) = _pad_2d_to_multiples_of_32(x)
+    qr = quantize_nvfp4_cuda(x_pad, with_2d_quantization=False, return_transpose=False)
+    data_uint8 = qr.data[:n0, : k0 // 2].contiguous()
+    block_scale_fp8 = qr.scale[:n0, : k0 // _NVFP4_SF_VEC_SIZE].contiguous()
+    assert qr.tensor_scale is not None
+    amax = qr.tensor_scale.reshape(())
+    return TensorGlobalNvfp4Tensor(
+        data_uint8=data_uint8,
+        block_scale_fp8=block_scale_fp8,
+        amax=amax,
     )
-    qx = _rm_pad_tensor(qx, (m, k // 2))
-    sx = sx[:m, : k // 16].contiguous()
-    return TensorGlobalNvfp4Tensor(data_uint8=qx, block_scale_fp8=sx, amax=amax.reshape(()))
 
 
 def build_group_alpha_pertoken(

@@ -51,6 +51,7 @@ def build_te_grouped_linear(
     out_features: int,
     bias: bool = False,
     seed: int = 42,
+    fuse_wgrad_accumulation: bool = False,
 ) -> te.GroupedLinear:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -61,6 +62,7 @@ def build_te_grouped_linear(
         bias=bias,
         params_dtype=torch.bfloat16,
         device="cuda",
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation
     )
 
 
@@ -289,7 +291,7 @@ def test_backward_wgrad(
     total_m  = sum(m_splits)
     nvfp4_recipe = make_nvfp4_recipe()
 
-    te_model   = build_te_grouped_linear(num_gemms, in_features, out_features, bias, seed)
+    te_model   = build_te_grouped_linear(num_gemms, in_features, out_features, bias, seed, fuse_wgrad_accumulation=True)
     mini_model = build_mini_grouped_linear(
         num_gemms, in_features, out_features, bias, seed, qparam,
         fuse_wgrad_accumulation=True,   # wgrad 测试需要 main_grad
@@ -301,6 +303,8 @@ def test_backward_wgrad(
     for i in range(num_gemms):
         w_mini = getattr(mini_model, f"weight{i}")
         w_mini.main_grad = torch.zeros_like(w_mini.data, dtype=torch.float32)
+        w_te = getattr(te_model, f"weight{i}")
+        w_te.main_grad = torch.zeros_like(w_te.data, dtype=torch.float32)
 
     torch.manual_seed(seed + 100)
     inp = torch.randn(total_m, in_features, device="cuda", dtype=torch.bfloat16)
@@ -321,7 +325,7 @@ def test_backward_wgrad(
     # 对比每个 expert 的 wgrad
     all_passed = True
     for i in range(num_gemms):
-        wgrad_te   = getattr(te_model, f"weight{i}").grad
+        wgrad_te   = getattr(te_model, f"weight{i}").main_grad
         wgrad_mini = getattr(mini_model, f"weight{i}").main_grad
 
         if wgrad_te is None:
@@ -428,6 +432,7 @@ QPARAM_MAP = {
     "fp4_ref":  QuantizeRecipe.FP4_SUB_CHANNEL_REF,
     "fp4":      QuantizeRecipe.FP4_SUB_CHANNEL,
     "fp4_q":    QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET,
+    "fp4_cursor": QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2
 }
 
 if __name__ == "__main__":

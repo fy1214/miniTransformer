@@ -2135,10 +2135,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                         #
-                        # Convert to C type
+                        # Convert to C type and apply global alpha in epilogue
                         #
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cur_alpha_mode == ALPHA_MODE_SCALAR:
-                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                             acc_vec = acc_vec * cur_group_alpha
                         else:
                             tTR_cC_sub = tTR_cC_tile[(None, None, None, subtile_idx)]

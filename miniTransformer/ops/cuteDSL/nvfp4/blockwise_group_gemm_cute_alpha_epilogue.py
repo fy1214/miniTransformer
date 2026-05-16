@@ -2147,22 +2147,27 @@ class Sm100GroupedBlockScaledGemmKernel:
                         # Convert to C type
                         #
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        tTR_gC_sub = tTR_gC_tile[(None, None, None, subtile_idx)]
-                        m_tile_origin = mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
-                        n_tile_origin = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        acc_vec = self._multiply_acc_vec_by_group_alpha(
-                            acc_vec,
-                            tiled_copy_r2s,
-                            tTR_rAcc,
-                            tTR_gC_sub,
-                            cur_alpha_mode,
-                            cur_group_alpha,
-                            cur_alpha_ptr,
-                            cur_alpha_m,
-                            cur_alpha_n,
-                            m_tile_origin,
-                            n_tile_origin,
-                        )
+                        if cur_alpha_mode == ALPHA_MODE_SCALAR:
+                            acc_vec = acc_vec * cur_group_alpha
+                        else:
+                            tTR_gC_sub = tTR_gC_tile[(None, None, None, subtile_idx)]
+                            m_tile_origin = (
+                                mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
+                            )
+                            n_tile_origin = (
+                                mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+                            )
+                            acc_vec = self._multiply_acc_vec_by_group_alpha(
+                                acc_vec,
+                                tiled_copy_r2s,
+                                tTR_gC_sub,
+                                cur_alpha_mode,
+                                cur_alpha_ptr,
+                                cur_alpha_m,
+                                cur_alpha_n,
+                                m_tile_origin,
+                                n_tile_origin,
+                            )
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                     else:
                         if cutlass.const_expr(self.is_nvfp4_output):
@@ -2582,20 +2587,15 @@ class Sm100GroupedBlockScaledGemmKernel:
         self,
         acc_vec,
         tiled_copy_r2s: cute.TiledCopy,
-        tTR_rAcc: cute.Tensor,
         tTR_gC_sub: cute.Tensor,
         alpha_mode: cutlass.Int32,
-        scalar_alpha: cutlass.Float32,
         alpha_ptr: cutlass.Int64,
         alpha_m: cutlass.Int32,
         alpha_n: cutlass.Int32,
         m_tile_origin: cutlass.Int32,
         n_tile_origin: cutlass.Int32,
     ):
-        """Apply per-output global alpha to the epilogue register tile."""
-        if alpha_mode == ALPHA_MODE_SCALAR:
-            return acc_vec * scalar_alpha
-
+        """Apply non-scalar per-output global alpha (row/col/matrix)."""
         alpha_gmem_ptr = cute.make_ptr(
             cutlass.Float32, alpha_ptr, cute.AddressSpace.gmem
         )

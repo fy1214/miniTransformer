@@ -95,17 +95,20 @@ def pertoken_scales_to_sfa_2d(
     k: int,
     block_size: int = _NVFP4_SF_VEC_SIZE,
 ) -> torch.Tensor:
-    """Legacy helper: merge global into block SFA (can overflow FP8 if misused)."""
+    """Merge per-token global scale into block SFA, matching block-FP8 then multiply semantics."""
     sf_k = k // block_size
-    bs = block_scale[:m, :sf_k].reshape(m, sf_k).float()
+    block_fp8 = block_scale_to_sf_fp8(block_scale, m, k)
+    bs_dec = block_fp8[:m, :sf_k].reshape(m, sf_k).float()
     gs = global_scale[:m].reshape(m, 1).float()
-    merged = (bs * gs).clamp(min=1e-38, max=_NVFP4_FP8_MAX)
+    merged = (bs_dec * gs).clamp(min=1e-38, max=_NVFP4_FP8_MAX)
     return merged.to(torch.float8_e4m3fn)
 
 
 def pack_fp4_grid_to_uint8(x_q: torch.Tensor) -> torch.Tensor:
+    # Align discrete levels with Triton pertoken kernel / golden (mx E2M1 table).
+    from miniTransformer.ops.triton.nvfp4_quantization import mx_e2m1_quantize
 
-    return cast_to_fp4x2(x_q.float())
+    return cast_to_fp4x2(mx_e2m1_quantize(x_q.float()))
 
 
 def quantize_activation_nvfp4_pertoken(
@@ -337,9 +340,9 @@ def dequant_pertoken_nvfp4(
     m, k_half = tensor.data_uint8.shape
     k = k_half * 2
     x = cast_from_fp4x2(tensor.data_uint8, torch.float32)
-    bs = tensor.block_scale[:, : k // _NVFP4_SF_VEC_SIZE].float().repeat_interleave(
-        _NVFP4_SF_VEC_SIZE, dim=1
-    )
+    # Match kernel path: activation block scale is consumed as FP8 E4M3 in SFA.
+    bs_fp8 = block_scale_to_sf_fp8(tensor.block_scale, m, k)
+    bs = bs_fp8[:, : k // _NVFP4_SF_VEC_SIZE].float().repeat_interleave(_NVFP4_SF_VEC_SIZE, dim=1)
     gs = tensor.global_scale.reshape(m, 1).float()
     return (x * bs * gs).to(out_dtype)
 

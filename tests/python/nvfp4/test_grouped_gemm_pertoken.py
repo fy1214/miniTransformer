@@ -42,6 +42,22 @@ PERTOKEN_CASES = [
 
 
 class TestPertokenGroupedGemmHelpers:
+    def test_pack_depack_matches_triton_grid(self):
+        _require_cuda()
+        from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2
+        from miniTransformer.ops.triton.nvfp4_quantization import (
+            mx_e2m1_quantize,
+            quant_nvfp4_pertoken_triton,
+        )
+
+        torch.manual_seed(17)
+        m, k = 32, 128
+        x = torch.randn(m, k, device="cuda", dtype=torch.float32)
+        x_q, _, _ = quant_nvfp4_pertoken_triton(x)
+        pt = quantize_activation_nvfp4_pertoken(x)
+        unpacked = cast_from_fp4x2(pt.data_uint8, torch.float32)
+        torch.testing.assert_close(unpacked, mx_e2m1_quantize(x_q), rtol=1e-6, atol=1e-6)
+
     def test_block_sfa_plus_alpha_list_matches_merged_sfa(self):
         _require_cuda()
         torch.manual_seed(11)
@@ -57,12 +73,11 @@ class TestPertokenGroupedGemmHelpers:
         x_fp4 = cast_from_fp4x2(pt.data_uint8, torch.float32)
         sf_merged = merged_sfa[:m, : k // 16].float().repeat_interleave(16, dim=1)
         sf_block = block_sfa[:m, : k // 16].float().repeat_interleave(16, dim=1)
-        # Merged block scale is rounded into FP8; exact equality with float bs*gs is unrealistic.
         torch.testing.assert_close(
             x_fp4 * sf_merged,
             x_fp4 * sf_block * pt.global_scale.view(m, 1).float(),
-            rtol=0.08,
-            atol=0.02,
+            rtol=2e-3,
+            atol=2e-3,
         )
 
         kernel_out = torch.ones(m, n, device="cuda", dtype=torch.bfloat16)
@@ -83,10 +98,11 @@ class TestPertokenGroupedGemmHelpers:
         m, k = 32, 64
         x = torch.randn(m, k, device="cuda", dtype=torch.float32)
         x_q, gs, bs = quant_nvfp4_pertoken_triton(x)
-        triton_dq = dequant_nvfp4_pertoken(x_q, gs, bs, block_size=16)
+        bs_fp8 = block_scale_to_sf_fp8(bs.reshape(m, k // 16), m, k).float().reshape(-1)
+        triton_dq = dequant_nvfp4_pertoken(x_q, gs, bs_fp8, block_size=16)
         pt = quantize_activation_nvfp4_pertoken(x)
         helper_dq = dequant_pertoken_nvfp4(pt, torch.float32)
-        torch.testing.assert_close(triton_dq, helper_dq, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(triton_dq, helper_dq, rtol=5e-4, atol=5e-4)
 
 
 class TestPertokenGroupedGemmCorrectness:
@@ -147,8 +163,8 @@ class TestPertokenGroupedGemmCorrectness:
         torch.testing.assert_close(
             got.to(torch.float32),
             ref.to(torch.float32),
-            rtol=0.12,
-            atol=0.05,
+            rtol=0.06,
+            atol=0.02,
         )
 
     @pytest.mark.parametrize("case", PERTOKEN_CASES)
@@ -182,6 +198,6 @@ class TestPertokenGroupedGemmCorrectness:
         torch.testing.assert_close(
             got.to(torch.float32),
             ref.to(torch.float32),
-            rtol=0.12,
-            atol=0.05,
+            rtol=0.06,
+            atol=0.02,
         )

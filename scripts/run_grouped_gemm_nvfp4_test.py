@@ -2,16 +2,22 @@
 """
 End-to-end NVFP4 grouped GEMM smoke / diff test.
 
-Usage (from repo root, with CUDA + SM100 + deps installed):
+Usage (from repo root):
 
   python scripts/run_grouped_gemm_nvfp4_test.py
   python scripts/run_grouped_gemm_nvfp4_test.py --large
   python scripts/run_grouped_gemm_nvfp4_test.py --m-splits 128,128 --n 256 --k 1024
 
+Behavior:
+  - Any CUDA GPU: runs BF16 reference vs pertoken quant + ``reference_grouped_gemm_pertoken``
+    (no SM100 required).
+  - SM100 only: additionally runs CuTeDSL grouped kernels and (unless ``--skip-te``) the TE path.
+
+  Use ``--require-sm100`` if the script must exercise kernels (CI on Blackwell); exits 1 when not SM100.
+
 Requires:
-  - CUDA, SM100 (compute capability 10.0)
-  - transformer_engine (for TE NVFP4 path)
-  - cutlass / cuteDSL (for CuTeDSL kernels)
+  - CUDA for meaningful output (CPU-only exits early).
+  - SM100 + cutlass/cuteDSL + transformer_engine for full kernel / TE paths.
 """
 
 from __future__ import annotations
@@ -75,6 +81,7 @@ def run_case(
     seed: int = 1234,
     skip_te: bool = False,
     skip_kernel: bool = False,
+    require_sm100: bool = False,
 ) -> int:
     from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
         grouped_gemm_cutedsl,
@@ -87,17 +94,19 @@ def run_case(
 
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available.")
-        return 0
+        return 1 if require_sm100 else 0
 
-    if not is_sm100():
-        print("SKIP: device is not SM100 (need compute capability 10.0).")
-        return 0
+    major, minor = torch.cuda.get_device_capability()
+    name = torch.cuda.get_device_name(torch.cuda.current_device())
+    sm100 = is_sm100()
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     device = "cuda"
 
     print(f"\n=== shape: m_splits={m_splits}, n={n}, k={k} ===")
+    print(f"  GPU: {name}  compute capability {major}.{minor}  SM100={sm100}")
+
     x_groups = [
         0.1 * torch.randn(m, k, dtype=torch.bfloat16, device=device) for m in m_splits
     ]
@@ -117,7 +126,21 @@ def run_case(
     m_ref = _error_metrics(ref_pt, ref)
     _print_metrics("pertoken reference vs BF16", m_ref)
 
-    if skip_kernel:
+    if require_sm100 and not sm100:
+        print(
+            "  FAIL (--require-sm100): need SM100 (cc 10.0) for CuTeDSL grouped kernels."
+        )
+        return 1
+
+    if skip_kernel or not sm100:
+        if not sm100 and not skip_kernel:
+            print(
+                "  SKIP CuTeDSL kernels: SM100 (Blackwell, cc 10.0) required for grouped blockscaled GEMM."
+            )
+        if not sm100 and not skip_te:
+            print(
+                "  SKIP TE NVFP4 CuTeDSL path: same SM100 kernel requirement."
+            )
         return failures
 
     # --- pertoken + CuTeDSL kernel ---
@@ -179,6 +202,11 @@ def main() -> int:
         action="store_true",
         help="Only run reference / quant checks, no CuTeDSL kernel.",
     )
+    parser.add_argument(
+        "--require-sm100",
+        action="store_true",
+        help="Exit with status 1 if CUDA device is not SM100 (for CI that must run kernels).",
+    )
     args = parser.parse_args()
 
     cases: List[Tuple[List[int], int, int]] = [
@@ -196,12 +224,17 @@ def main() -> int:
             seed=args.seed,
             skip_te=args.skip_te,
             skip_kernel=args.skip_kernel,
+            require_sm100=args.require_sm100,
         )
 
     if total_fail:
         print(f"\nFinished with {total_fail} failure(s).")
         return 1
-    print("\nAll checks passed (or skipped where runtime unavailable).")
+    print(
+        "\nSummary: pertoken quant + reference grouped matmul vs BF16 ran on CUDA above. "
+        "CuTeDSL grouped NVFP4 GEMM runs only on SM100; "
+        "pass --require-sm100 to exit non-zero without Blackwell."
+    )
     return 0
 
 

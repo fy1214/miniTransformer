@@ -111,12 +111,10 @@ GroupedGemmAlpha = Union[float, int, torch.Tensor]
 
 # Per-group alpha layout in ``tensor_of_alpha_desc`` (int64, shape [G, 4]):
 #   [0] device pointer to float32 alpha buffer (0 for scalar mode)
-#   [1] mode: 0=scalar, 1=row [M], 2=col [N], 3=matrix [M,N]
-#   [2] M, [3] N for the group output
+#   [1] mode: 0=scalar (TE / global×global), 1=row [M] (pertoken A × global B)
+#   [2] M, [3] N (N unused for row mode; kept for descriptor shape)
 ALPHA_MODE_SCALAR = 0
 ALPHA_MODE_ROW = 1
-ALPHA_MODE_COL = 2
-ALPHA_MODE_MATRIX = 3
 
 
 def apply_grouped_gemm_alphas(
@@ -343,25 +341,14 @@ class Sm100GroupedBlockScaledGemmKernel:
                 raise TypeError(f"Unsupported alpha type: {type(alpha)}")
 
             a = alpha.to(device=device, dtype=torch.float32).contiguous()
+            if a.ndim != 1 or a.numel() != m:
+                raise ValueError(
+                    f"Pertoken epilogue alpha must be 1D [M]; got shape {tuple(a.shape)} "
+                    f"for group output M={m}, N={n}."
+                )
             keepalive.append(a)
             desc[i, 0] = int(a.data_ptr())
-            if a.ndim == 1:
-                if a.numel() == m:
-                    desc[i, 1] = ALPHA_MODE_ROW
-                elif a.numel() == n:
-                    desc[i, 1] = ALPHA_MODE_COL
-                else:
-                    raise ValueError(
-                        f"1D alpha length {a.numel()} must match M={m} or N={n}."
-                    )
-            elif a.ndim == 2:
-                if tuple(a.shape) != (m, n):
-                    raise ValueError(
-                        f"2D alpha shape {tuple(a.shape)} must match output {(m, n)}."
-                    )
-                desc[i, 1] = ALPHA_MODE_MATRIX
-            else:
-                raise ValueError(f"alpha must be scalar, 1D, or 2D; got ndim={a.ndim}.")
+            desc[i, 1] = ALPHA_MODE_ROW
 
         return scalar_alphas, desc, keepalive
 
@@ -2158,19 +2145,13 @@ class Sm100GroupedBlockScaledGemmKernel:
                             m_tile_origin = (
                                 mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
                             )
-                            n_tile_origin = (
-                                mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                            )
-                            acc_vec = self._multiply_acc_vec_by_group_alpha(
+                            acc_vec = self._multiply_acc_vec_by_group_alpha_row(
                                 tTR_rAcc,
                                 tiled_copy_r2s,
                                 tTR_cC_sub,
-                                cur_alpha_mode,
                                 cur_alpha_ptr,
                                 cur_alpha_m,
-                                cur_alpha_n,
                                 m_tile_origin,
-                                n_tile_origin,
                             )
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                     else:
@@ -2587,35 +2568,22 @@ class Sm100GroupedBlockScaledGemmKernel:
         return tma_atom_c, bSG_sC, bSG_gC
 
     @cute.jit
-    def _multiply_acc_vec_by_group_alpha(
+    def _multiply_acc_vec_by_group_alpha_row(
         self,
         tTR_rAcc: cute.Tensor,
         tiled_copy_r2s: cute.TiledCopy,
         tTR_cC_sub: cute.Tensor,
-        alpha_mode: cutlass.Int32,
         alpha_ptr: cutlass.Int64,
         alpha_m: cutlass.Int32,
-        alpha_n: cutlass.Int32,
         m_tile_origin: cutlass.Int32,
-        n_tile_origin: cutlass.Int32,
     ):
-        """Apply non-scalar per-output global alpha (row/col/matrix)."""
+        """Apply 1D row global alpha ``alpha[M]`` (pertoken A amax × global B amax)."""
         alpha_gmem_ptr = cute.make_ptr(
             cutlass.Float32, alpha_ptr, cute.AddressSpace.gmem
         )
-        # CuTe DSL: bind g_alpha before dynamic if/elif (no defs only inside branches).
         g_alpha = cute.make_tensor(
-            alpha_gmem_ptr,
-            cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
+            alpha_gmem_ptr, cute.make_layout((alpha_m,), stride=(1,))
         )
-        if alpha_mode == ALPHA_MODE_ROW:
-            g_alpha = cute.make_tensor(
-                alpha_gmem_ptr, cute.make_layout((alpha_m,), stride=(1,))
-            )
-        elif alpha_mode == ALPHA_MODE_COL:
-            g_alpha = cute.make_tensor(
-                alpha_gmem_ptr, cute.make_layout((alpha_n,), stride=(1,))
-            )
 
         tRS_acc = tiled_copy_r2s.retile(tTR_rAcc)
         tRS_crd = tiled_copy_r2s.retile(tTR_cC_sub)
@@ -2623,15 +2591,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         for i in cutlass.range_constexpr(cute.size(tRS_acc)):
             crd = tRS_crd[i]
             m_g = crd[0] + m_tile_origin
-            n_g = crd[1] + n_tile_origin
-            scale = cutlass.Float32(1.0)
-            if alpha_mode == ALPHA_MODE_ROW:
-                scale = g_alpha[m_g]
-            elif alpha_mode == ALPHA_MODE_COL:
-                scale = g_alpha[n_g]
-            else:
-                scale = g_alpha[m_g, n_g]
-            acc[i] = acc[i] * scale
+            acc[i] = acc[i] * g_alpha[m_g]
         return acc
 
     @staticmethod

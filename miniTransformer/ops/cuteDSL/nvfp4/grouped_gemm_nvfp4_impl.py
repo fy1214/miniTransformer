@@ -169,18 +169,14 @@ def build_group_alpha_pertoken(
     b: Union[TensorGlobalNvfp4Tensor, PertokenNvfp4Tensor, object],
     alpha_b: float,
     n: int,
-) -> Union[float, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Per-group alpha applied in kernel epilogue (float32), not on FP8 block scales.
+    Per-group 1D alpha ``[M]`` for kernel epilogue: pertoken activation amax × global weight scale.
 
-    - A pertoken + B tensor-global: ``global_a[M] * alpha_b`` (1D broadcast)
-    - A pertoken + B pertoken: ``global_a[:, None] * global_b[None, :]`` (2D)
+    ``global_a[M] * alpha_b`` with ``alpha_b = amax_b / denom`` (tensor-global B only).
     """
-    ga = act.global_scale.float()
-    if isinstance(b, PertokenNvfp4Tensor):
-        gb = b.global_scale[:n].float()
-        return ga.unsqueeze(1) * gb.unsqueeze(0)
-    return ga * alpha_b
+    del b, n  # B type checked at call site; only tensor-global B is supported here.
+    return (act.global_scale.float() * alpha_b).contiguous()
 
 
 def _resolve_pertoken_activation(a: Union[PertokenNvfp4Tensor, torch.Tensor]) -> PertokenNvfp4Tensor:
@@ -283,9 +279,9 @@ def grouped_gemm_cutedsl_pertoken(
     """
     Pertoken activation quant + block scales in SFA/SFB; global scales via ``alphas``.
 
-    All global alpha factors (scalar, 1D ``[M]``, 2D ``[M, N]``) are applied inside the
-    blockscaled GEMM kernel epilogue in ``blockwise_group_gemm_cute_alpha_epilogue`` —
-    do not call ``apply_grouped_gemm_alphas`` on the result.
+    Global alpha is applied in the kernel epilogue: 1D ``[M]`` from pertoken A amax × global B
+    scale. Do not call ``apply_grouped_gemm_alphas`` on the result. Bilateral pertoken B is
+    not supported on this path.
     """
     from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
         GroupedBlockScaledProfile,
@@ -308,7 +304,12 @@ def grouped_gemm_cutedsl_pertoken(
         else:
             n_i = B[i]._rowwise_data.shape[0]
 
-        b_data, sfb_2d, alpha_b, b_for_alpha = _resolve_group_weight(B[i], n_i, k)
+        if isinstance(B[i], PertokenNvfp4Tensor):
+            raise NotImplementedError(
+                "grouped_gemm_cutedsl_pertoken supports tensor-global B only; "
+                "epilogue alpha is 1D [M] (pertoken A amax × global B amax)."
+            )
+        b_data, sfb_2d, alpha_b, _b_for_alpha = _resolve_group_weight(B[i], n_i, k)
         a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
         b_fp4 = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
         c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
@@ -317,7 +318,7 @@ def grouped_gemm_cutedsl_pertoken(
         abc_torch.append([a_fp4, b_fp4, c_out])
         sfasfb_torch.append([sfa, sfb])
         problem_sizes.append((m_i, n_i, k, 1))
-        alphas.append(build_group_alpha_pertoken(act, b_for_alpha, alpha_b, n_i))
+        alphas.append(build_group_alpha_pertoken(act, B[i], alpha_b, n_i))
 
     kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
     outputs = kernel.run_from_grouped_inputs(

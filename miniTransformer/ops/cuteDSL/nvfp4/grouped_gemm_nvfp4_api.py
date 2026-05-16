@@ -9,6 +9,10 @@ from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue 
     Sm100GroupedBlockScaledGemmKernel,
     apply_grouped_gemm_alphas,
 )
+from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_compile_cache import (
+    clear_grouped_gemm_compile_cache,
+    grouped_gemm_cache_stats,
+)
 from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
     PertokenNvfp4Tensor,
     TensorGlobalNvfp4Tensor,
@@ -24,6 +28,8 @@ from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
     quantize_activation_nvfp4_pertoken,
     quantize_weight_nvfp4_tensor_global,
     reference_grouped_gemm_pertoken,
+    warmup_grouped_gemm_cutedsl_pertoken,
+    warmup_grouped_gemm_cutedsl_te,
 )
 
 # Backward-compatible alias: TE tensor-global path
@@ -48,4 +54,8 @@ __all__ = [
     "quantize_activation_nvfp4_pertoken",
     "quantize_weight_nvfp4_tensor_global",
     "reference_grouped_gemm_pertoken",
+    "warmup_grouped_gemm_cutedsl_pertoken",
+    "warmup_grouped_gemm_cutedsl_te",
+    "grouped_gemm_cache_stats",
+    "clear_grouped_gemm_compile_cache",
 ]

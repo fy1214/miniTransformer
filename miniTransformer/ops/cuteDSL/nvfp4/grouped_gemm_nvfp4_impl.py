@@ -11,7 +11,7 @@ Quantization sources:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 import torch
 
@@ -23,6 +23,8 @@ _NVFP4_FP4_MAX = 6.0
 _NVFP4_FP8_MAX = 448.0
 _NVFP4_GLOBAL_SCALE_DENOM = _NVFP4_FP8_MAX * _NVFP4_FP4_MAX
 _NVFP4_ALPHA_DENOM = _NVFP4_GLOBAL_SCALE_DENOM * _NVFP4_GLOBAL_SCALE_DENOM
+
+_NVFP4_GROUPED_KERNEL = None
 
 
 @dataclass
@@ -53,6 +55,40 @@ class TensorGlobalNvfp4Tensor:
 
 def is_sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
+
+
+def _get_nvfp4_grouped_kernel():
+    """Reuse one profile-bound kernel instance; compilation is cached separately."""
+    global _NVFP4_GROUPED_KERNEL
+    if _NVFP4_GROUPED_KERNEL is None:
+        from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
+            GroupedBlockScaledProfile,
+            Sm100GroupedBlockScaledGemmKernel,
+        )
+
+        _NVFP4_GROUPED_KERNEL = Sm100GroupedBlockScaledGemmKernel(
+            profile=GroupedBlockScaledProfile.NVFP4
+        )
+    return _NVFP4_GROUPED_KERNEL
+
+
+def _run_grouped_gemm_cached(
+    abc_torch,
+    sfasfb_torch,
+    problem_sizes,
+    out_dtype: torch.dtype,
+    alphas,
+) -> list:
+    kernel = _get_nvfp4_grouped_kernel()
+    return kernel.run_from_grouped_inputs(
+        abc_tensors={"torch": abc_torch},
+        sfasfb_tensors={"torch": sfasfb_torch},
+        problem_sizes=problem_sizes,
+        out_dtype=out_dtype,
+        accumulate=False,
+        alphas=alphas,
+        iterations=0,
+    )
 
 
 def _make_fp4_tensor_for_cutedsl(
@@ -232,11 +268,6 @@ def grouped_gemm_cutedsl_te(
     Expects ``A[i]``/``B[i]`` to be Transformer Engine NVFP4 quantized tensors
     (``_rowwise_data``, ``_rowwise_scale_inv``, ``_amax_rowwise``).
     """
-    from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
-        GroupedBlockScaledProfile,
-        Sm100GroupedBlockScaledGemmKernel,
-    )
-
     device = A[0]._rowwise_data.device
     k = A[0]._rowwise_data.shape[1] * 2
     sf_k = k // _NVFP4_SF_VEC_SIZE
@@ -256,15 +287,9 @@ def grouped_gemm_cutedsl_te(
         amax_b = B[i]._amax_rowwise.float().item()
         alphas.append(amax_a * amax_b / _NVFP4_ALPHA_DENOM)
 
-    kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
     return torch.cat(
-        kernel.run_from_grouped_inputs(
-            abc_tensors={"torch": abc_torch},
-            sfasfb_tensors={"torch": sfasfb_torch},
-            problem_sizes=problem_sizes,
-            out_dtype=out_dtype,
-            accumulate=False,
-            alphas=alphas,
+        _run_grouped_gemm_cached(
+            abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
         ),
         dim=0,
     )
@@ -283,11 +308,6 @@ def grouped_gemm_cutedsl_pertoken(
     scale. Do not call ``apply_grouped_gemm_alphas`` on the result. Bilateral pertoken B is
     not supported on this path.
     """
-    from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
-        GroupedBlockScaledProfile,
-        Sm100GroupedBlockScaledGemmKernel,
-    )
-
     if len(A) != len(B) or len(A) != len(m_splits):
         raise ValueError("A, B, and m_splits must have the same length.")
 
@@ -320,17 +340,78 @@ def grouped_gemm_cutedsl_pertoken(
         problem_sizes.append((m_i, n_i, k, 1))
         alphas.append(build_group_alpha_pertoken(act, B[i], alpha_b, n_i))
 
-    kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
-    outputs = kernel.run_from_grouped_inputs(
-        abc_tensors={"torch": abc_torch},
-        sfasfb_tensors={"torch": sfasfb_torch},
-        problem_sizes=problem_sizes,
-        out_dtype=out_dtype,
-        accumulate=False,
-        alphas=alphas,
+    return torch.cat(
+        _run_grouped_gemm_cached(
+            abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
+        ),
+        dim=0,
     )
 
-    return torch.cat(outputs, dim=0)
+
+def warmup_grouped_gemm_cutedsl_pertoken(
+    m_splits: Sequence[int],
+    n: int,
+    k: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    device: Union[str, torch.device] = "cuda",
+) -> None:
+    """
+    Pre-compile CuTeDSL grouped GEMM for a fixed (m_splits, n, k) signature.
+
+    Call once per layer shape before training/inference to avoid compile latency
+    on the first forward pass.
+    """
+    if not is_sm100():
+        return
+    dev = torch.device(device)
+    a_list = [
+        quantize_activation_nvfp4_pertoken(
+            torch.zeros(m, k, device=dev, dtype=torch.bfloat16)
+        )
+        for m in m_splits
+    ]
+    b_list = [
+        quantize_weight_nvfp4_tensor_global(
+            torch.zeros(n, k, device=dev, dtype=torch.bfloat16)
+        )
+        for _ in m_splits
+    ]
+    grouped_gemm_cutedsl_pertoken(a_list, b_list, list(m_splits), out_dtype)
+
+
+def warmup_grouped_gemm_cutedsl_te(
+    m_splits: Sequence[int],
+    n: int,
+    k: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    device: Union[str, torch.device] = "cuda",
+) -> None:
+    """Pre-compile grouped GEMM for TE NVFP4 tensor layout (same cache as pertoken path)."""
+    if not is_sm100():
+        return
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch import NVFP4Quantizer
+
+    dev = torch.device(device)
+    quantizer = NVFP4Quantizer(
+        rowwise=True,
+        columnwise=False,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        stochastic_rounding=False,
+    )
+    a_list = [
+        quantizer.quantize(torch.zeros(m, k, device=dev, dtype=torch.bfloat16))
+        for m in m_splits
+    ]
+    b_list = [
+        quantizer.quantize(torch.zeros(n, k, device=dev, dtype=torch.bfloat16))
+        for _ in m_splits
+    ]
+    grouped_gemm_cutedsl_te(a_list, b_list, list(m_splits), out_dtype)
 
 
 def dequant_pertoken_nvfp4(

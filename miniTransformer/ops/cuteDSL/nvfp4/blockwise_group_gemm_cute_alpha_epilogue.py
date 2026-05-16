@@ -2117,11 +2117,13 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                # Group epilogue modes the same way as tTR_tAcc (mode 3 = subtile),
+                # not like bSG_gC (mode 1) — otherwise subtile_idx slice is ill-formed.
                 tTR_gC_tile = tTR_gC[
                     (None, None, None, None, None, *mma_tile_coord_mnl)
                 ]
                 tTR_gC_tile = cute.group_modes(
-                    tTR_gC_tile, 1, cute.rank(tTR_gC_tile)
+                    tTR_gC_tile, 3, cute.rank(tTR_gC_tile)
                 )
 
                 if is_group_changed:
@@ -2595,7 +2597,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             return acc_vec * scalar_alpha
 
         alpha_gmem_ptr = cute.make_ptr(
-            cutlass.Float32, alpha_ptr, cute.AddressSpace.global
+            cutlass.Float32, alpha_ptr, cute.AddressSpace.gmem
         )
         if alpha_mode == ALPHA_MODE_ROW:
             g_alpha = cute.make_tensor(

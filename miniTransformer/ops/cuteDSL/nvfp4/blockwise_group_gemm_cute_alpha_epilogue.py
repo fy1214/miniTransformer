@@ -2603,6 +2603,11 @@ class Sm100GroupedBlockScaledGemmKernel:
         alpha_gmem_ptr = cute.make_ptr(
             cutlass.Float32, alpha_ptr, cute.AddressSpace.gmem
         )
+        # CuTe DSL: bind g_alpha before dynamic if/elif (no defs only inside branches).
+        g_alpha = cute.make_tensor(
+            alpha_gmem_ptr,
+            cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
+        )
         if alpha_mode == ALPHA_MODE_ROW:
             g_alpha = cute.make_tensor(
                 alpha_gmem_ptr, cute.make_layout((alpha_m,), stride=(1,))
@@ -2610,11 +2615,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         elif alpha_mode == ALPHA_MODE_COL:
             g_alpha = cute.make_tensor(
                 alpha_gmem_ptr, cute.make_layout((alpha_n,), stride=(1,))
-            )
-        else:
-            g_alpha = cute.make_tensor(
-                alpha_gmem_ptr,
-                cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
             )
 
         tRS_acc = tiled_copy_r2s.retile(tTR_rAcc)
@@ -2624,6 +2624,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             crd = tRS_crd[i]
             m_g = crd[0] + m_tile_origin
             n_g = crd[1] + n_tile_origin
+            scale = cutlass.Float32(1.0)
             if alpha_mode == ALPHA_MODE_ROW:
                 scale = g_alpha[m_g]
             elif alpha_mode == ALPHA_MODE_COL:

@@ -2021,6 +2021,12 @@ class Sm100GroupedBlockScaledGemmKernel:
                     epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                 )
             )
+            # Per-thread (m, n) coords within the CTA tile for epilogue alpha indexing.
+            gC_epi_for_coord = cute.flat_divide(
+                tCgC[((None, None), 0, 0, None, None, None)], epi_tile
+            )
+            cC_epi = cute.make_identity_tensor(gC_epi_for_coord.shape)
+            tTR_cC = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cC_epi)
 
             #
             # Persistent tile scheduling loop
@@ -2117,13 +2123,11 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
-                # Group epilogue modes the same way as tTR_tAcc (mode 3 = subtile),
-                # not like bSG_gC (mode 1) — otherwise subtile_idx slice is ill-formed.
-                tTR_gC_tile = tTR_gC[
+                tTR_cC_tile = tTR_cC[
                     (None, None, None, None, None, *mma_tile_coord_mnl)
                 ]
-                tTR_gC_tile = cute.group_modes(
-                    tTR_gC_tile, 3, cute.rank(tTR_gC_tile)
+                tTR_cC_tile = cute.group_modes(
+                    tTR_cC_tile, 3, cute.rank(tTR_cC_tile)
                 )
 
                 if is_group_changed:
@@ -2150,7 +2154,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                         if cur_alpha_mode == ALPHA_MODE_SCALAR:
                             acc_vec = acc_vec * cur_group_alpha
                         else:
-                            tTR_gC_sub = tTR_gC_tile[(None, None, None, subtile_idx)]
+                            tTR_cC_sub = tTR_cC_tile[(None, None, None, subtile_idx)]
                             m_tile_origin = (
                                 mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
                             )
@@ -2160,7 +2164,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             acc_vec = self._multiply_acc_vec_by_group_alpha(
                                 acc_vec,
                                 tiled_copy_r2s,
-                                tTR_gC_sub,
+                                tTR_cC_sub,
                                 cur_alpha_mode,
                                 cur_alpha_ptr,
                                 cur_alpha_m,
@@ -2587,7 +2591,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         self,
         acc_vec,
         tiled_copy_r2s: cute.TiledCopy,
-        tTR_gC_sub: cute.Tensor,
+        tTR_cC_sub: cute.Tensor,
         alpha_mode: cutlass.Int32,
         alpha_ptr: cutlass.Int64,
         alpha_m: cutlass.Int32,
@@ -2613,7 +2617,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
             )
 
-        tRS_crd = tiled_copy_r2s.retile(tTR_gC_sub)
+        tRS_crd = tiled_copy_r2s.retile(tTR_cC_sub)
         acc = acc_vec
         for i in cutlass.range(cute.size(acc)):
             crd = tRS_crd[i]

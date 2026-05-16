@@ -278,13 +278,15 @@ def grouped_gemm_cutedsl_pertoken(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Pertoken activation quant + block scales in SFA/SFB; global scales via ``alphas`` list
-    (applied in kernel epilogue as float32).
+    Pertoken activation quant + block scales in SFA/SFB; global scales via ``alphas``.
+
+    Scalar alphas are fused in the kernel epilogue. Non-scalar alphas (1D ``[M]``, 2D
+    ``[M, N]``, etc.) are applied once on the host inside
+    ``Sm100GroupedBlockScaledGemmKernel.run_from_grouped_inputs`` — do not multiply again.
     """
     from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
         GroupedBlockScaledProfile,
         Sm100GroupedBlockScaledGemmKernel,
-        apply_grouped_gemm_alphas,
     )
 
     if len(A) != len(B) or len(A) != len(m_splits):
@@ -323,10 +325,6 @@ def grouped_gemm_cutedsl_pertoken(
         accumulate=False,
         alphas=alphas,
     )
-
-    # 2D per-token alpha must be applied outside kernel (epilogue only supports scalar list)
-    if any(isinstance(a, torch.Tensor) and a.ndim > 0 for a in alphas):
-        outputs = apply_grouped_gemm_alphas(outputs, alphas)
 
     return torch.cat(outputs, dim=0)
 

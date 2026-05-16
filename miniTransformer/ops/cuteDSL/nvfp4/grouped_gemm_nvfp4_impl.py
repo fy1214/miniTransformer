@@ -51,7 +51,7 @@ class TensorGlobalNvfp4Tensor:
 
 
 def is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() > (10, 0)
 
 
 def _make_fp4_tensor_for_cutedsl(

@@ -2587,12 +2587,11 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         tRS_acc = tiled_copy_r2s.retile(tTR_rAcc)
         tRS_crd = tiled_copy_r2s.retile(tTR_cC_sub)
-        acc = tRS_acc.load()
         for i in cutlass.range_constexpr(cute.size(tRS_acc)):
             crd = tRS_crd[i]
             m_g = crd[0] + m_tile_origin
-            acc[i] = acc[i] * g_alpha[m_g]
-        return acc
+            tRS_acc[i] = tRS_acc[i] * g_alpha[m_g]
+        return tRS_acc.load()
 
     @staticmethod
     def _compute_stages(

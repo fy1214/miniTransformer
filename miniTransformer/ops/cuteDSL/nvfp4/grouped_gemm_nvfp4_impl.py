@@ -283,9 +283,9 @@ def grouped_gemm_cutedsl_pertoken(
     """
     Pertoken activation quant + block scales in SFA/SFB; global scales via ``alphas``.
 
-    Scalar alphas are fused in the kernel epilogue. Non-scalar alphas (1D ``[M]``, 2D
-    ``[M, N]``, etc.) are applied once on the host inside
-    ``Sm100GroupedBlockScaledGemmKernel.run_from_grouped_inputs`` — do not multiply again.
+    All global alpha factors (scalar, 1D ``[M]``, 2D ``[M, N]``) are applied inside the
+    blockscaled GEMM kernel epilogue in ``blockwise_group_gemm_cute_alpha_epilogue`` —
+    do not call ``apply_grouped_gemm_alphas`` on the result.
     """
     from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
         GroupedBlockScaledProfile,

@@ -109,6 +109,15 @@ def _resolve_profile(profile: Union[GroupedBlockScaledProfile, str]) -> GroupedB
 
 GroupedGemmAlpha = Union[float, int, torch.Tensor]
 
+# Per-group alpha layout in ``tensor_of_alpha_desc`` (int64, shape [G, 4]):
+#   [0] device pointer to float32 alpha buffer (0 for scalar mode)
+#   [1] mode: 0=scalar, 1=row [M], 2=col [N], 3=matrix [M,N]
+#   [2] M, [3] N for the group output
+ALPHA_MODE_SCALAR = 0
+ALPHA_MODE_ROW = 1
+ALPHA_MODE_COL = 2
+ALPHA_MODE_MATRIX = 3
+
 
 def apply_grouped_gemm_alphas(
     outputs: List[torch.Tensor],
@@ -297,6 +306,66 @@ class Sm100GroupedBlockScaledGemmKernel:
         ]
 
     @staticmethod
+    def _pack_alpha_descriptors(
+        alphas: Optional[List[GroupedGemmAlpha]],
+        problem_sizes: List[Tuple[int, int, int, int]],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Pack per-group alpha into scalar tensor + device descriptor table.
+
+        Returns ``(group_alphas, alpha_desc, keepalive_tensors)``.
+        """
+        num_groups = len(problem_sizes)
+        scalar_alphas = torch.ones(num_groups, dtype=torch.float32, device=device)
+        desc = torch.zeros((num_groups, 4), dtype=torch.int64, device=device)
+        keepalive: List[torch.Tensor] = []
+
+        if alphas is None:
+            for i, (m, n, _, _) in enumerate(problem_sizes):
+                desc[i, 1] = ALPHA_MODE_SCALAR
+                desc[i, 2] = m
+                desc[i, 3] = n
+            return scalar_alphas, desc, keepalive
+
+        for i, (alpha, (m, n, _, _)) in enumerate(zip(alphas, problem_sizes)):
+            desc[i, 2] = m
+            desc[i, 3] = n
+            if isinstance(alpha, (float, int)):
+                scalar_alphas[i] = float(alpha)
+                desc[i, 1] = ALPHA_MODE_SCALAR
+                continue
+            if isinstance(alpha, torch.Tensor) and alpha.ndim == 0:
+                scalar_alphas[i] = float(alpha.item())
+                desc[i, 1] = ALPHA_MODE_SCALAR
+                continue
+            if not isinstance(alpha, torch.Tensor):
+                raise TypeError(f"Unsupported alpha type: {type(alpha)}")
+
+            a = alpha.to(device=device, dtype=torch.float32).contiguous()
+            keepalive.append(a)
+            desc[i, 0] = int(a.data_ptr())
+            if a.ndim == 1:
+                if a.numel() == m:
+                    desc[i, 1] = ALPHA_MODE_ROW
+                elif a.numel() == n:
+                    desc[i, 1] = ALPHA_MODE_COL
+                else:
+                    raise ValueError(
+                        f"1D alpha length {a.numel()} must match M={m} or N={n}."
+                    )
+            elif a.ndim == 2:
+                if tuple(a.shape) != (m, n):
+                    raise ValueError(
+                        f"2D alpha shape {tuple(a.shape)} must match output {(m, n)}."
+                    )
+                desc[i, 1] = ALPHA_MODE_MATRIX
+            else:
+                raise ValueError(f"alpha must be scalar, 1D, or 2D; got ndim={a.ndim}.")
+
+        return scalar_alphas, desc, keepalive
+
+    @staticmethod
     def _infer_strides_from_abc_tensors(
         abc_tensors: List[List[torch.Tensor]], a_major: str, b_major: str, c_major: str
     ) -> List[List[Tuple[int, int]]]:
@@ -339,20 +408,12 @@ class Sm100GroupedBlockScaledGemmKernel:
             raise ValueError(
                 f"alphas length ({len(alphas)}) must match problem_sizes ({len(problem_sizes)})."
             )
-        alpha_values = torch.ones(len(problem_sizes), dtype=torch.float32, device="cuda")
-        apply_external_alpha = False
-        if alphas is not None:
-            scalar_alphas: List[float] = []
-            for alpha in alphas:
-                if isinstance(alpha, (float, int)):
-                    scalar_alphas.append(float(alpha))
-                elif isinstance(alpha, torch.Tensor) and alpha.ndim == 0:
-                    scalar_alphas.append(float(alpha.item()))
-                else:
-                    apply_external_alpha = True
-                    break
-            if not apply_external_alpha:
-                alpha_values = torch.tensor(scalar_alphas, dtype=torch.float32, device="cuda")
+        device = abc_tensors["torch"][0][0].device
+        alpha_values, alpha_desc, alpha_keepalive = (
+            Sm100GroupedBlockScaledGemmKernel._pack_alpha_descriptors(
+                alphas, problem_sizes, device
+            )
+        )
         if self.profile_cfg is None:
             raise ValueError("run_from_grouped_inputs requires kernel initialized with `profile`.")
 
@@ -462,6 +523,12 @@ class Sm100GroupedBlockScaledGemmKernel:
             is_dynamic_layout=False,
             assumed_align=16,
         )
+        tensor_of_alpha_desc, _ = cutlass_torch.cute_tensor_like(
+            alpha_desc,
+            cutlass.Int64,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
 
         def compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn) -> int:
             total = 0
@@ -494,6 +561,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensor_of_ptrs_abc,
             tensor_of_ptrs_sfasfb,
             tensor_of_group_alphas,
+            tensor_of_alpha_desc,
             total_num_clusters,
             tensor_of_tensormap,
             max_active_clusters,
@@ -511,6 +579,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensor_of_ptrs_abc,
             tensor_of_ptrs_sfasfb,
             tensor_of_group_alphas,
+            tensor_of_alpha_desc,
             tensor_of_tensormap,
             current_stream,
         )
@@ -618,6 +687,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     workspace_ptrs_abc[ws_idx],
                     workspace_ptrs_sfasfb[ws_idx],
                     tensor_of_group_alphas,
+                    tensor_of_alpha_desc,
                     workspace_tensormap[ws_idx],
                     current_stream,
                 )
@@ -648,10 +718,8 @@ class Sm100GroupedBlockScaledGemmKernel:
                     "problem_sizes": problem_sizes,
                 }
             )
-        outputs = [group_tensors[2] for group_tensors in abc_tensors["torch"]]
-        if alphas is not None and apply_external_alpha:
-            outputs = apply_grouped_gemm_alphas(outputs, alphas)
-        return outputs
+        _ = alpha_keepalive  # keep non-scalar alpha buffers alive through launch
+        return [group_tensors[2] for group_tensors in abc_tensors["torch"]]
 
     # Set up configurations that dependent on gemm inputs.
     def _setup_attributes(self):
@@ -831,6 +899,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         tensor_address_abc: cute.Tensor,
         tensor_address_sfasfb: cute.Tensor,
         tensor_group_alphas: cute.Tensor,
+        tensor_alpha_desc: cute.Tensor,
         total_num_clusters: cutlass.Constexpr[int],
         tensormap_cute_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr[int],
@@ -1096,6 +1165,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensor_address_abc,
             tensor_address_sfasfb,
             tensor_group_alphas,
+            tensor_alpha_desc,
             tensormap_cute_tensor,
         ).launch(
             grid=grid,
@@ -1137,6 +1207,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
         group_alphas: cute.Tensor,
+        alpha_desc: cute.Tensor,
         tensormaps: cute.Tensor,
     ):
         """
@@ -1935,7 +2006,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             # Partition for epilogue
             #
             epi_tidx = tidx
-            tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
+            tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc, tTR_gC = (
                 self.epilog_tmem_copy_and_partition(
                     epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
                 )
@@ -1972,6 +2043,10 @@ class Sm100GroupedBlockScaledGemmKernel:
             # group index to start searching
             last_group_idx = cutlass.Int32(-1)
             cur_group_alpha = cutlass.Float32(1.0)
+            cur_alpha_mode = cutlass.Int32(ALPHA_MODE_SCALAR)
+            cur_alpha_ptr = cutlass.Int64(0)
+            cur_alpha_m = cutlass.Int32(0)
+            cur_alpha_n = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
                 grouped_gemm_cta_tile_info = work_tile.group_search_result
@@ -1983,6 +2058,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                 # We still need to store 0s when k_tile_cnt is 0
                 if is_group_changed:
                     cur_group_alpha = group_alphas[(cur_group_idx,)]
+                    cur_alpha_mode = cutlass.Int32(alpha_desc[cur_group_idx, 1])
+                    cur_alpha_ptr = alpha_desc[cur_group_idx, 0]
+                    cur_alpha_m = cutlass.Int32(alpha_desc[cur_group_idx, 2])
+                    cur_alpha_n = cutlass.Int32(alpha_desc[cur_group_idx, 3])
                     # construct tensor c based on real shape, stride information
                     real_tensor_c = self.make_tensor_abc_for_tensormap_update(
                         cur_group_idx,
@@ -2038,6 +2117,12 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                tTR_gC_tile = tTR_gC[
+                    (None, None, None, None, None, *mma_tile_coord_mnl)
+                ]
+                tTR_gC_tile = cute.group_modes(
+                    tTR_gC_tile, 1, cute.rank(tTR_gC_tile)
+                )
 
                 if is_group_changed:
                     if warp_idx == self.epilog_warp_id[0]:
@@ -2060,7 +2145,22 @@ class Sm100GroupedBlockScaledGemmKernel:
                         # Convert to C type
                         #
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        acc_vec = acc_vec * cur_group_alpha
+                        tTR_gC_sub = tTR_gC_tile[(None, None, None, subtile_idx)]
+                        m_tile_origin = mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
+                        n_tile_origin = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+                        acc_vec = self._multiply_acc_vec_by_group_alpha(
+                            acc_vec,
+                            tiled_copy_r2s,
+                            tTR_rAcc,
+                            tTR_gC_sub,
+                            cur_alpha_mode,
+                            cur_group_alpha,
+                            cur_alpha_ptr,
+                            cur_alpha_m,
+                            cur_alpha_n,
+                            m_tile_origin,
+                            n_tile_origin,
+                        )
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                     else:
                         if cutlass.const_expr(self.is_nvfp4_output):
@@ -2389,7 +2489,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
+        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc, tTR_gC
 
     def epilog_smem_copy_and_partition(
         self,
@@ -2474,6 +2574,57 @@ class Sm100GroupedBlockScaledGemmKernel:
             gC_for_tma_partition,
         )
         return tma_atom_c, bSG_sC, bSG_gC
+
+    @cute.jit
+    def _multiply_acc_vec_by_group_alpha(
+        self,
+        acc_vec,
+        tiled_copy_r2s: cute.TiledCopy,
+        tTR_rAcc: cute.Tensor,
+        tTR_gC_sub: cute.Tensor,
+        alpha_mode: cutlass.Int32,
+        scalar_alpha: cutlass.Float32,
+        alpha_ptr: cutlass.Int64,
+        alpha_m: cutlass.Int32,
+        alpha_n: cutlass.Int32,
+        m_tile_origin: cutlass.Int32,
+        n_tile_origin: cutlass.Int32,
+    ):
+        """Apply per-output global alpha to the epilogue register tile."""
+        if alpha_mode == ALPHA_MODE_SCALAR:
+            return acc_vec * scalar_alpha
+
+        alpha_gmem_ptr = cute.make_ptr(
+            cutlass.Float32, alpha_ptr, cute.AddressSpace.global
+        )
+        if alpha_mode == ALPHA_MODE_ROW:
+            g_alpha = cute.make_tensor(
+                alpha_gmem_ptr, cute.make_layout((alpha_m,), stride=(1,))
+            )
+        elif alpha_mode == ALPHA_MODE_COL:
+            g_alpha = cute.make_tensor(
+                alpha_gmem_ptr, cute.make_layout((alpha_n,), stride=(1,))
+            )
+        else:
+            g_alpha = cute.make_tensor(
+                alpha_gmem_ptr,
+                cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
+            )
+
+        tRS_crd = tiled_copy_r2s.retile(tTR_gC_sub)
+        acc = acc_vec
+        for i in cutlass.range(cute.size(acc)):
+            crd = tRS_crd[i]
+            m_g = crd[0] + m_tile_origin
+            n_g = crd[1] + n_tile_origin
+            if alpha_mode == ALPHA_MODE_ROW:
+                scale = g_alpha[m_g]
+            elif alpha_mode == ALPHA_MODE_COL:
+                scale = g_alpha[n_g]
+            else:
+                scale = g_alpha[m_g, n_g]
+            acc[i] = acc[i] * scale
+        return acc
 
     @staticmethod
     def _compute_stages(

@@ -2150,8 +2150,8 @@ class Sm100GroupedBlockScaledGemmKernel:
                         #
                         # Convert to C type
                         #
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cur_alpha_mode == ALPHA_MODE_SCALAR:
+                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                             acc_vec = acc_vec * cur_group_alpha
                         else:
                             tTR_cC_sub = tTR_cC_tile[(None, None, None, subtile_idx)]
@@ -2162,7 +2162,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                                 mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
                             )
                             acc_vec = self._multiply_acc_vec_by_group_alpha(
-                                acc_vec,
+                                tTR_rAcc,
                                 tiled_copy_r2s,
                                 tTR_cC_sub,
                                 cur_alpha_mode,
@@ -2589,7 +2589,7 @@ class Sm100GroupedBlockScaledGemmKernel:
     @cute.jit
     def _multiply_acc_vec_by_group_alpha(
         self,
-        acc_vec,
+        tTR_rAcc: cute.Tensor,
         tiled_copy_r2s: cute.TiledCopy,
         tTR_cC_sub: cute.Tensor,
         alpha_mode: cutlass.Int32,
@@ -2617,9 +2617,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cute.make_layout((alpha_m, alpha_n), stride=(alpha_n, 1)),
             )
 
+        tRS_acc = tiled_copy_r2s.retile(tTR_rAcc)
         tRS_crd = tiled_copy_r2s.retile(tTR_cC_sub)
-        acc = acc_vec
-        for i in cutlass.range(cute.size(acc)):
+        acc = tRS_acc.load()
+        for i in cutlass.range_constexpr(cute.size(tRS_acc)):
             crd = tRS_crd[i]
             m_g = crd[0] + m_tile_origin
             n_g = crd[1] + n_tile_origin

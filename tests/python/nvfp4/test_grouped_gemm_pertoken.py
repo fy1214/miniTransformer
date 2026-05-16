@@ -52,7 +52,7 @@ class TestPertokenGroupedGemmHelpers:
         merged_sfa = pertoken_scales_to_sfa_2d(pt.block_scale, pt.global_scale, m, k)
         block_sfa = block_scale_to_sf_fp8(pt.block_scale, m, k)
 
-        from miniTransformer.quantiztion.nvfp4_ref_standalone import cast_from_fp4x2
+        from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2
 
         x_fp4 = cast_from_fp4x2(pt.data_uint8, torch.float32)
         sf_merged = merged_sfa[:m, : k // 16].float().repeat_interleave(16, dim=1)

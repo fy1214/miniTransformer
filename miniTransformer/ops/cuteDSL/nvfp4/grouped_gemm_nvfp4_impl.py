@@ -16,6 +16,7 @@ from typing import List, Tuple, Union
 import torch
 
 from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
+from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2, cast_to_fp4x2
 
 _NVFP4_SF_VEC_SIZE = 16
 _NVFP4_FP4_MAX = 6.0
@@ -103,7 +104,6 @@ def pertoken_scales_to_sfa_2d(
 
 
 def pack_fp4_grid_to_uint8(x_q: torch.Tensor) -> torch.Tensor:
-    from miniTransformer.quantiztion.nvfp4_ref_standalone import cast_to_fp4x2
 
     return cast_to_fp4x2(x_q.float())
 
@@ -335,7 +335,6 @@ def dequant_pertoken_nvfp4(
     tensor: PertokenNvfp4Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    from miniTransformer.quantiztion.nvfp4_ref_standalone import cast_from_fp4x2
 
     m, k_half = tensor.data_uint8.shape
     k = k_half * 2
@@ -351,7 +350,6 @@ def dequant_tensor_global_nvfp4(
     tensor: TensorGlobalNvfp4Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    from miniTransformer.quantiztion.nvfp4_ref_standalone import cast_from_fp4x2
 
     n, k_half = tensor.data_uint8.shape
     k = k_half * 2

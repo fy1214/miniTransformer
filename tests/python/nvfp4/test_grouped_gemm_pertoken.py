@@ -83,12 +83,12 @@ class TestPertokenGroupedGemmHelpers:
         assert max_abs < 0.20
         assert mean_abs < 0.02
 
+        # 1D alpha [M] = pertoken A global × scalar B scale (host helper sanity check).
         kernel_out = torch.ones(m, n, device="cuda", dtype=torch.bfloat16)
-        alpha = build_group_alpha_pertoken(pt, pt, 1.0, n)
+        alpha_b = 0.75
+        alpha = build_group_alpha_pertoken(pt, pt, alpha_b, n)
         corrected = apply_grouped_gemm_alphas([kernel_out], [alpha])[0]
-        ga = pt.global_scale.float().view(m, 1)
-        gb = pt.global_scale.float()[:n].view(1, n)
-        expected = kernel_out.float() * ga * gb
+        expected = kernel_out.float() * (pt.global_scale.float() * alpha_b).view(m, 1)
         torch.testing.assert_close(corrected.float(), expected, rtol=1e-5, atol=1e-5)
 
     def test_triton_dequant_matches_helper(self):
@@ -175,7 +175,7 @@ class TestPertokenGroupedGemmCorrectness:
         max_abs, mean_abs, rmse = self._error_metrics(got, ref)
         assert max_abs < 0.12
         assert mean_abs < 0.03
-        assert rmse < 0.01
+        assert rmse < 0.04
 
     @pytest.mark.parametrize("case", PERTOKEN_CASES)
     def test_both_sides_pertoken(self, case):

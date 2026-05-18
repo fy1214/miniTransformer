@@ -321,7 +321,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if grad:
             if layout == "NN":
                 if is_te_quantized:
-                    n_cols = B[0]._rowwise_data.size(1) * 2
+                    n_cols = B[0]._rowwise_data.size(1)
                 else:
                     n_cols = B[0].size(1)
                 out = torch.empty(

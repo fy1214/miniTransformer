@@ -189,9 +189,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         """
         from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
             PertokenNvfp4Tensor,
-            TensorGlobalNvfp4Tensor,
-            quantize_activation_nvfp4_pertoken,
-            quantize_weight_nvfp4_tensor_global,
+            quantize_activation_nvfp4_pertoken
         )
 
         num_gemms = len(m_splits)
@@ -225,10 +223,21 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         if qparams.param_type == qparams.param_type.X:
-            # Activation: per-token quant per group slice
-            act_chunks = torch.split(x, m_splits, dim=0)
+            # Per-token quant is row-independent: quantize the full tensor once,
+            # then split the result by m_splits.  This avoids num_gemms kernel
+            # launches and sidesteps zero-chunk issues from empty experts.
+            qresult_full = quantize_activation_nvfp4_pertoken(x)
             act_list: List[PertokenNvfp4Tensor] = [
-                quantize_activation_nvfp4_pertoken(chunk) for chunk in act_chunks
+                PertokenNvfp4Tensor(
+                    data_uint8=d,
+                    block_scale=bs,
+                    global_scale=gs,
+                )
+                for d, bs, gs in zip(
+                    torch.split(qresult_full.data_uint8, m_splits, dim=0),
+                    torch.split(qresult_full.block_scale, m_splits, dim=0),
+                    torch.split(qresult_full.global_scale, m_splits, dim=0),
+                )
             ]
 
             # Activation: MXFP8 quant for backward
@@ -362,4 +371,3 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             return out
         else:
             return out[0]
-

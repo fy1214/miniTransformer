@@ -243,7 +243,7 @@ def main():
         a_tmp = torch.randn(M, chunk, device="cuda", dtype=torch.bfloat16)
         b_tmp = torch.randn(N, chunk, device="cuda", dtype=torch.bfloat16)
         _ = ctx.forward(a_tmp, b_tmp)   # 触发 compile
-        torch.cuda.synchronize()
+        ctx.barrier_before_reuse()
         if rank == 0:
             print(f"  [{M},{N},{K}] compiled, benchmarking...")
 
@@ -257,6 +257,7 @@ def main():
                   f"{r['C_ms']:>8.2f} {r['C_tflops']:>10.2f} {r['C_mfu']:>6.1f}% | "
                   f"{r['C_vs_A_speedup']:>5.2f}x")
 
+        ctx.barrier_before_reuse()
         ctx.free()
         dist.barrier(group=tp_group)
 

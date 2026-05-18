@@ -301,6 +301,10 @@ class Sm100GroupedBlockScaledGemmKernel:
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         self.last_benchmark_metrics = []
+        # Per-call setup caches to eliminate repeated expensive operations
+        self._hw_cache: dict = {}   # cluster_n -> max_active_clusters; 1 -> sm_count
+        self._stub_cache: dict = {} # out_dtype -> ([abc_stubs], [sfasfb_stubs])
+        self._run_cache: dict = {}  # 'tmap': {sm_count->t}, 'shapes': {key->(t_mnkl,t_strides)}
 
     @staticmethod
     def _extract_ptrs_from_groups(grouped_tensors: List[List[torch.Tensor]]) -> List[List[int]]:
@@ -453,59 +457,79 @@ class Sm100GroupedBlockScaledGemmKernel:
         min_sf_size = alignment * 8 // profile_cfg.sf_dtype.width
         min_sf_size *= (divisibility_sf + min_sf_size - 1) // min_sf_size
 
-        initial_cute_tensors_abc = [
-            create_tensor_and_stride(
-                1, min_ab_size, min_ab_size, profile_cfg.a_major == "m", profile_cfg.ab_dtype
-            )[2],
-            create_tensor_and_stride(
-                1, min_ab_size, min_ab_size, profile_cfg.b_major == "n", profile_cfg.ab_dtype
-            )[2],
-            create_tensor_and_stride(1, min_c_size, min_c_size, profile_cfg.c_major == "m", c_dtype)[2],
-        ]
-        initial_cute_tensors_sfasfb = [
-            create_tensor_and_stride(
-                1, min_sf_size, min_sf_size, profile_cfg.a_major == "m", profile_cfg.sf_dtype
-            )[2],
-            create_tensor_and_stride(
-                1, min_sf_size, min_sf_size, profile_cfg.b_major == "n", profile_cfg.sf_dtype
-            )[2],
-        ]
+        _stub_key = out_dtype
+        if _stub_key not in self._stub_cache:
+            self._stub_cache[_stub_key] = (
+                [
+                    create_tensor_and_stride(
+                        1, min_ab_size, min_ab_size, profile_cfg.a_major == "m", profile_cfg.ab_dtype
+                    )[2],
+                    create_tensor_and_stride(
+                        1, min_ab_size, min_ab_size, profile_cfg.b_major == "n", profile_cfg.ab_dtype
+                    )[2],
+                    create_tensor_and_stride(1, min_c_size, min_c_size, profile_cfg.c_major == "m", c_dtype)[2],
+                ],
+                [
+                    create_tensor_and_stride(
+                        1, min_sf_size, min_sf_size, profile_cfg.a_major == "m", profile_cfg.sf_dtype
+                    )[2],
+                    create_tensor_and_stride(
+                        1, min_sf_size, min_sf_size, profile_cfg.b_major == "n", profile_cfg.sf_dtype
+                    )[2],
+                ],
+            )
+        initial_cute_tensors_abc, initial_cute_tensors_sfasfb = self._stub_cache[_stub_key]
 
-        hardware_info = cutlass.utils.HardwareInfo()
-        sm_count = hardware_info.get_max_active_clusters(1)
-        max_active_clusters = hardware_info.get_max_active_clusters(
-            profile_cfg.cluster_shape_mn[0] * profile_cfg.cluster_shape_mn[1]
-        )
+        cluster_n = profile_cfg.cluster_shape_mn[0] * profile_cfg.cluster_shape_mn[1]
+        if 1 not in self._hw_cache or cluster_n not in self._hw_cache:
+            _hw = cutlass.utils.HardwareInfo()
+            self._hw_cache[1] = _hw.get_max_active_clusters(1)
+            self._hw_cache[cluster_n] = (
+                _hw.get_max_active_clusters(cluster_n) if cluster_n != 1 else self._hw_cache[1]
+            )
+        sm_count = self._hw_cache[1]
+        max_active_clusters = self._hw_cache[cluster_n]
         tensormap_shape = (
             sm_count,
             Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
             Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8,
         )
-        tensor_of_tensormap, _ = cutlass_torch.cute_tensor_like(
-            torch.empty(tensormap_shape, dtype=torch.int64),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-        )
-        tensor_of_dim_size_mnkl, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(problem_sizes, dtype=torch.int32),
-            cutlass.Int32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_strides_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(strides_abc, dtype=torch.int32),
-            cutlass.Int32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
+        _tmap_key = sm_count
+        _tmaps = self._run_cache.setdefault("tmap", {})
+        if _tmap_key not in _tmaps:
+            _tmaps[_tmap_key], _ = cutlass_torch.cute_tensor_like(
+                torch.empty(tensormap_shape, dtype=torch.int64, device=device),
+                cutlass.Int64,
+                is_dynamic_layout=False,
+            )
+        tensor_of_tensormap = _tmaps[_tmap_key]
+
+        _shape_key = (tuple(tuple(ps) for ps in problem_sizes), str(out_dtype))
+        _shapes = self._run_cache.setdefault("shapes", {})
+        if _shape_key not in _shapes:
+            _t_mnkl, _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(problem_sizes, dtype=torch.int32, device=device),
+                cutlass.Int32,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+            _t_strides, _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(strides_abc, dtype=torch.int32, device=device),
+                cutlass.Int32,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+            _shapes[_shape_key] = (_t_mnkl, _t_strides)
+        tensor_of_dim_size_mnkl, tensor_of_strides_abc = _shapes[_shape_key]
+
         tensor_of_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_abc, dtype=torch.int64),
+            torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
             cutlass.Int64,
             is_dynamic_layout=False,
             assumed_align=16,
         )
         tensor_of_ptrs_sfasfb, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_sfasfb, dtype=torch.int64),
+            torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
             cutlass.Int64,
             is_dynamic_layout=False,
             assumed_align=16,

@@ -156,9 +156,16 @@ def quantize_activation_nvfp4_pertoken(
 
     assert x.ndim == 2
     m, k = x.shape
+    sf_k = k // block_size
+    if m == 0:
+        return PertokenNvfp4Tensor(
+            data_uint8=torch.empty((0, k // 2), dtype=torch.uint8, device=x.device),
+            block_scale=torch.empty((0, sf_k), dtype=torch.float32, device=x.device),
+            global_scale=torch.empty((0,), dtype=torch.float32, device=x.device),
+        )
     assert k % block_size == 0
     x_q, global_scale, block_scale = quant_nvfp4_pertoken_triton(x, block_size=block_size)
-    bs = block_scale.reshape(m, k // block_size) if block_scale.ndim == 1 else block_scale
+    bs = block_scale.reshape(m, sf_k) if block_scale.ndim == 1 else block_scale
     return PertokenNvfp4Tensor(
         data_uint8=pack_fp4_grid_to_uint8(x_q),
         block_scale=bs,
@@ -273,8 +280,16 @@ def grouped_gemm_cutedsl_te(
     sf_k = k // _NVFP4_SF_VEC_SIZE
 
     abc_torch, sfasfb_torch, problem_sizes, alphas = [], [], [], []
+    outputs: list = []
+    kernel_output_indices: list = []
+
     for i, m_i in enumerate(m_splits):
         n_i = B[i]._rowwise_data.shape[0]
+
+        if m_i == 0:
+            outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+            continue
+
         a_fp4 = _make_fp4_tensor_for_cutedsl(A[i]._rowwise_data, m_i, k, device)
         b_fp4 = _make_fp4_tensor_for_cutedsl(B[i]._rowwise_data, n_i, k, device)
         c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
@@ -286,6 +301,17 @@ def grouped_gemm_cutedsl_te(
         amax_a = A[i]._amax_rowwise.float().item()
         amax_b = B[i]._amax_rowwise.float().item()
         alphas.append(amax_a * amax_b / _NVFP4_ALPHA_DENOM)
+        kernel_output_indices.append(len(outputs))
+        outputs.append(None)
+
+    if abc_torch:
+        kernel_results = _run_grouped_gemm_cached(
+            abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
+        )
+        for idx, result in zip(kernel_output_indices, kernel_results):
+            outputs[idx] = result
+
+    return torch.cat(outputs, dim=0)
 
     return torch.cat(
         _run_grouped_gemm_cached(
@@ -317,6 +343,10 @@ def grouped_gemm_cutedsl_pertoken(
     sf_k = k // _NVFP4_SF_VEC_SIZE
 
     abc_torch, sfasfb_torch, problem_sizes, alphas = [], [], [], []
+    # Track output tensors in original order; empty groups bypass the kernel.
+    outputs: list = []
+    kernel_output_indices: list = []  # positions in `outputs` that the kernel fills
+
     for i, m_i in enumerate(m_splits):
         act = _resolve_pertoken_activation(A[i])
         if isinstance(B[i], (PertokenNvfp4Tensor, TensorGlobalNvfp4Tensor)):
@@ -329,6 +359,12 @@ def grouped_gemm_cutedsl_pertoken(
                 "grouped_gemm_cutedsl_pertoken supports tensor-global B only; "
                 "epilogue alpha is 1D [M] (pertoken A amax × global B amax)."
             )
+
+        if m_i == 0:
+            # No tokens for this expert: skip kernel, contribute empty output directly.
+            outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+            continue
+
         b_data, sfb_2d, alpha_b, _b_for_alpha = _resolve_group_weight(B[i], n_i, k)
         a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
         b_fp4 = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
@@ -339,13 +375,17 @@ def grouped_gemm_cutedsl_pertoken(
         sfasfb_torch.append([sfa, sfb])
         problem_sizes.append((m_i, n_i, k, 1))
         alphas.append(build_group_alpha_pertoken(act, B[i], alpha_b, n_i))
+        kernel_output_indices.append(len(outputs))
+        outputs.append(None)  # placeholder, filled below
 
-    return torch.cat(
-        _run_grouped_gemm_cached(
+    if abc_torch:
+        kernel_results = _run_grouped_gemm_cached(
             abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
-        ),
-        dim=0,
-    )
+        )
+        for idx, result in zip(kernel_output_indices, kernel_results):
+            outputs[idx] = result
+
+    return torch.cat(outputs, dim=0)
 
 
 def warmup_grouped_gemm_cutedsl_pertoken(

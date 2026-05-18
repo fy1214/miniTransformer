@@ -147,8 +147,8 @@ def run_nsys_mode(args):
         torch.cuda.synchronize()
 
         # 方案 C：CuTeDSL tile-level fp32 AllReduce
+        ctx.barrier_before_reuse()
         with NvtxRange(f"C_cutedsl_fp32_ar_iter{i}", color="green"):
-            ctx.barrier_before_reuse()
             scheme_c(a_local, b_local, ctx)
         torch.cuda.synchronize()
 

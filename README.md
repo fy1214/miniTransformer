@@ -6,9 +6,27 @@ A esay transformer_engine linear framework to use quantization in model training
 
 How to use:
 
-1、build the kernel lib: `python setup.py install`
+1、clone the repo with submodules:
 
-2、replace Megatron Te linear in transformer_engine.py:
+```bash
+git clone --recurse-submodules https://github.com/fy1214/miniTransformer.git
+```
+
+Or, if already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+2、install the package and all dependencies:
+
+```bash
+pip install -e .
+```
+
+This automatically installs all required dependencies and registers the `miniTransformer` package — no manual `export PYTHONPATH` needed.
+
+3、replace Megatron Te linear in transformer_engine.py:
 
 ```python
 from miniTransformer.module.linear import Linear

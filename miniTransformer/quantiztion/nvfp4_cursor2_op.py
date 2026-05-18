@@ -237,6 +237,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 x_quantizer = MXFP8Quantizer(
                     rowwise=True,
                     columnwise=return_transpose,
+                    fp8_dtype=tex.DType.kFloat8E4M3
                 )
                 quantizers.append(x_quantizer)
             quantize_tensor_list = tex.split_quantize(
@@ -259,6 +260,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             x_quantizer = MXFP8Quantizer(
                 rowwise=True,
                 columnwise=True,
+                fp8_dtype=tex.DType.kFloat8E4M3
             )
             quantizers.append(x_quantizer)
         quantize_tensor_list = tex.split_quantize(

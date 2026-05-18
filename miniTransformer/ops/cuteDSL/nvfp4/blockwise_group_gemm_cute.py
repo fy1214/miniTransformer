@@ -47,6 +47,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack
 
+from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_compile_cache import (
+    build_grouped_compile_cache_key,
+    get_or_compile_grouped_gemm,
+)
+
 
 @dataclass(frozen=True)
 class GroupedBlockScaledConfig:
@@ -402,23 +407,42 @@ class Sm100GroupedBlockScaledGemmKernel:
             total_num_clusters = max_active_clusters
 
         current_stream = cutlass_torch.default_stream()
-        compiled_grouped_gemm = cute.compile(
-            self,
-            initial_cute_tensors_abc[0],
-            initial_cute_tensors_abc[1],
-            initial_cute_tensors_abc[2],
-            initial_cute_tensors_sfasfb[0],
-            initial_cute_tensors_sfasfb[1],
-            num_groups,
-            tensor_of_dim_size_mnkl,
-            tensor_of_strides_abc,
-            tensor_of_ptrs_abc,
-            tensor_of_ptrs_sfasfb,
-            total_num_clusters,
-            tensor_of_tensormap,
-            max_active_clusters,
-            current_stream,
-            options="--opt-level 2",
+        profile_name = (
+            self.profile.value if self.profile is not None else "custom"
+        )
+        compile_cache_key = build_grouped_compile_cache_key(
+            variant="legacy_no_alpha",
+            device=abc_tensors["torch"][0][0].device,
+            profile_name=profile_name,
+            profile_cfg=profile_cfg,
+            num_groups=num_groups,
+            problem_sizes=problem_sizes,
+            out_dtype=out_dtype,
+            host_problem_shape_available=host_problem_shape_available,
+        )
+
+        def _compile_grouped_gemm():
+            return cute.compile(
+                self,
+                initial_cute_tensors_abc[0],
+                initial_cute_tensors_abc[1],
+                initial_cute_tensors_abc[2],
+                initial_cute_tensors_sfasfb[0],
+                initial_cute_tensors_sfasfb[1],
+                num_groups,
+                tensor_of_dim_size_mnkl,
+                tensor_of_strides_abc,
+                tensor_of_ptrs_abc,
+                tensor_of_ptrs_sfasfb,
+                total_num_clusters,
+                tensor_of_tensormap,
+                max_active_clusters,
+                current_stream,
+                options="--opt-level 2",
+            )
+
+        compiled_grouped_gemm = get_or_compile_grouped_gemm(
+            compile_cache_key, _compile_grouped_gemm
         )
         compiled_grouped_gemm(
             initial_cute_tensors_abc[0],

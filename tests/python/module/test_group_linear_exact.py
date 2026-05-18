@@ -47,6 +47,7 @@ AVAILABLE_QPARAMS = {
     3: ("FP4_SUB_CHANNEL_REF", QuantizeRecipe.FP4_SUB_CHANNEL_REF, "FP4 reference implementation"),
     4: ("FP4_SUB_CHANNEL", QuantizeRecipe.FP4_SUB_CHANNEL, "FP4 tiled quantization"),
     5: ("FP4_SUB_CHANNEL_QUARTET", QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET, "FP4 quartet quantization"),
+    6: ("FP4_SUB_CHANNEL_CURSOR2", QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2, "FP4 cursor2 recipe")
 }
 
 
@@ -376,9 +377,9 @@ Examples:
     parser.add_argument(
         "--qparam",
         type=int,
-        choices=[1, 2, 3, 4, 5],
+        choices=[1, 2, 3, 4, 5, 6],
         default=4,
-        help="Quantization recipe to use: 1=NON_QUANTIZE, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET (default: 5)"
+        help="Quantization recipe to use: 1=NON_QUANTIZE, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=Cursor2 (default: 4)"
     )
     
     parser.add_argument(

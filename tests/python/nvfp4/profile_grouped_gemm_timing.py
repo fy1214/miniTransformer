@@ -238,8 +238,8 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"  Compilation (pertoken alpha) : ~{t_pt_first - t_second:.0f} ms  (incremental)")
     print(f"  GPU kernel  (scalar alpha)   : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
     print(f"  GPU kernel  (pertoken alpha) : {t_pt_exec*1e3:.1f} µs")
-    print(f"  Python dispatch per call     : ~{t_single:.0f} ms  (= the '240ms' you measured before)")
-    print(f"  => Actual bottleneck: PYTHON DISPATCH OVERHEAD, not the kernel")
+    print(f"  Python dispatch per call     : ~{t_single:.0f} ms")
+    print(f"  => GPU kernel is the bottleneck at steady state")
     sep()
 
 

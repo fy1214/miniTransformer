@@ -51,6 +51,20 @@ class TensorGlobalNvfp4Tensor:
     data_uint8: torch.Tensor
     block_scale_fp8: torch.Tensor
     amax: torch.Tensor
+    # Pre-computed CUTE-format tensors for grouped GEMM (avoid D2H+permute+H2D on every forward).
+    # Set by precompute_cute_tensors(); None until called.
+    _cute_fp4: torch.Tensor | None = None   # shape (N, K, 1), int8
+    _cute_sfb: torch.Tensor | None = None   # CUTE MMA-permuted scale factor, float8_e4m3fn
+
+    def precompute_cute_tensors(self, device: torch.device | None = None) -> "TensorGlobalNvfp4Tensor":
+        """Pre-convert weight to CUTE layout so forward passes skip D2H+permute+H2D."""
+        dev = device or self.data_uint8.device
+        n, k_half = self.data_uint8.shape
+        k = k_half * 2
+        sf_k = k // _NVFP4_SF_VEC_SIZE
+        self._cute_fp4 = _make_fp4_tensor_for_cutedsl(self.data_uint8, n, k, dev)
+        self._cute_sfb = _make_cute_sf(self.block_scale_fp8, n, sf_k)
+        return self
 
 
 def is_sm100() -> bool:
@@ -365,12 +379,30 @@ def grouped_gemm_cutedsl_pertoken(
             outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
             continue
 
-        b_data, sfb_2d, alpha_b, _b_for_alpha = _resolve_group_weight(B[i], n_i, k)
+        b_data, sfb_2d, alpha_b, b_obj = _resolve_group_weight(B[i], n_i, k)
         a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
-        b_fp4 = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
+
+        # Lazy CUTE-format weight cache: weights are fixed between forward passes.
+        # First call: convert and store on the weight object (D2H+permute+H2D, once).
+        # Subsequent calls: reuse cached tensors directly (zero overhead).
+        if isinstance(b_obj, TensorGlobalNvfp4Tensor):
+            if b_obj._cute_fp4 is None:
+                b_obj._cute_fp4 = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
+                b_obj._cute_sfb = _make_cute_sf(sfb_2d, n_i, sf_k)
+            b_fp4 = b_obj._cute_fp4
+            sfb = b_obj._cute_sfb
+        elif not hasattr(b_obj, "_cute_fp4_cached"):
+            # TE NVFP4 tensor (from NVFP4Quantizer): set attr lazily, freed with the tensor
+            b_obj._cute_fp4_cached = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
+            b_obj._cute_sfb_cached = _make_cute_sf(sfb_2d, n_i, sf_k)
+            b_fp4 = b_obj._cute_fp4_cached
+            sfb = b_obj._cute_sfb_cached
+        else:
+            b_fp4 = b_obj._cute_fp4_cached
+            sfb = b_obj._cute_sfb_cached
+
         c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
         sfa = _make_cute_sf(block_scale_to_sf_fp8(act.block_scale, m_i, k), m_i, sf_k)
-        sfb = _make_cute_sf(sfb_2d, n_i, sf_k)
         abc_torch.append([a_fp4, b_fp4, c_out])
         sfasfb_torch.append([sfa, sfb])
         problem_sizes.append((m_i, n_i, k, 1))

@@ -76,7 +76,11 @@ def _try_load_grouped_compiled_from_disk(
         if not obj_path.exists():
             return None
         try:
-            module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+            # Use enable_tvm_ffi=False: the fallback export_to_c path writes CuTeDSL
+            # metadata symbols (func_args_spec, func_version, etc.), not TVM FFI symbols
+            # (__tvm_ffi_func). enable_tvm_ffi=False reads metadata and finds the
+            # _mlir_func__mlir_ciface_... callable, which matches the fallback export format.
+            module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=False)
         except Exception as exc:
             _DISK_LOAD_FAILURES += 1
             logger.warning(

@@ -285,12 +285,13 @@ class GemmAllReduceCtx:
         return self._c_torch.squeeze(-1).to(torch.bfloat16).clone()
 
     def barrier_before_reuse(self):
-        """
+        “””
         在复用同一个 ctx 发起下一次 forward 前做跨 rank 同步。
 
-        该同步是“外层显式控制”接口，forward() 本身不会触发同步。
-        """
+        该同步是”外层显式控制”接口，forward() 本身不会触发同步。
+        “””
         if dist.is_initialized() and self._world_size > 1:
+            torch.cuda.synchronize()
             dist.barrier(group=self._tp_group)
 
     def free(self):

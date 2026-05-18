@@ -219,7 +219,6 @@ def main():
         a_tmp = torch.randn(M, chunk, device="cuda", dtype=torch.bfloat16)
         b_tmp = torch.randn(N, chunk, device="cuda", dtype=torch.bfloat16)
         _ = ctx.forward(a_tmp, b_tmp)
-        torch.cuda.synchronize()
         ctx.barrier_before_reuse()
 
         r = precision_shape(M, N, K, tp_group, ctx)
@@ -227,6 +226,7 @@ def main():
         if rank == 0 and r is not None:
             print_row(r)
 
+        ctx.barrier_before_reuse()
         ctx.free()
         dist.barrier(group=tp_group)
 

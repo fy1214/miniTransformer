@@ -1228,11 +1228,10 @@ class PersistentDenseGemmKernel:
                     if warp_idx == self.all_reduce_warp_id[0]:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
-                            utils.distributed.spin_lock_atom_cas_relaxed_wait(
+                            _spin_lock_atom_cas_acquire_wait_sys(
                                 lock_ptr=flag,
                                 expected_val=num_ranks,
                                 reset_val=0,
-                                scope="gpu",
                             )
 
                     self.all_reduce_sync_barrier.arrive_and_wait()

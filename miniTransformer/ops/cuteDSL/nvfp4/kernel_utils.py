@@ -4,7 +4,6 @@ import os
 import pickle
 import tempfile
 from dataclasses import dataclass
-from enum import Enum
 from getpass import getuser
 from itertools import product
 from pathlib import Path
@@ -27,14 +26,6 @@ def validate_group_shapes_basic(
     for idx, (m, n, k) in enumerate(zip(m_list, n_list, k_list)):
         if m <= 0 or n <= 0 or k <= 0:
             raise ValueError(f"group {idx}: non-positive shape ({m}, {n}, {k})")
-
-
-class Nvfp4KernelVariant(str, Enum):
-    OPTS0 = "opts0"
-    OPTS1 = "opts1"
-    OPTS2 = "opts2"
-    OPTS3 = "opts3"
-    OPTS4 = "opts4"
 
 
 DEFAULT_MMA_TILER_MN = (256, 256)

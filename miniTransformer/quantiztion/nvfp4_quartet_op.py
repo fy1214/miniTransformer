@@ -86,7 +86,7 @@ def grouped_gemm_cutedsl(
     m_splits: list,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute import (
+    from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockscaled_nvfp4_mxfp_cute import (
         Sm100GroupedBlockScaledGemmKernel,
         GroupedBlockScaledProfile,
     )

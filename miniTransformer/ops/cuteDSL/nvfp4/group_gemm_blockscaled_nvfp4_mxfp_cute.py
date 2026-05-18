@@ -123,6 +123,33 @@ def _torch_dtype_to_cutlass(torch_dtype: torch.dtype) -> Type[cutlass.Numeric]:
     return mapping[torch_dtype]
 
 
+def _apply_grouped_alpha(
+    outputs: List[torch.Tensor],
+    alpha_list: Union[List[torch.Tensor], None],
+) -> List[torch.Tensor]:
+    """Apply scalar/per-row alpha to grouped outputs in-place."""
+    if alpha_list is None:
+        return outputs
+    if len(alpha_list) != len(outputs):
+        raise ValueError(
+            f"alpha_list length ({len(alpha_list)}) must match number of groups ({len(outputs)})"
+        )
+
+    for group_idx, (out, alpha) in enumerate(zip(outputs, alpha_list)):
+        alpha_fp32 = alpha.to(device=out.device, dtype=torch.float32).reshape(-1)
+        m = out.shape[0]
+        if alpha_fp32.numel() == 1:
+            scaled = out.to(torch.float32) * alpha_fp32.reshape(1, 1)
+        elif alpha_fp32.numel() == m:
+            scaled = out.to(torch.float32) * alpha_fp32.view(m, 1)
+        else:
+            raise ValueError(
+                f"alpha_list[{group_idx}] must be shape (1,) or (M={m},), got {tuple(alpha.shape)}"
+            )
+        out.copy_(scaled.to(out.dtype))
+    return outputs
+
+
 class Sm100GroupedBlockScaledGemmKernel:
     """This example demonstrates an implementation of grouped blockscaled GEMM using a TMA plus Blackwell SM100 TensorCore
     warp-specialized persistent kernel.
@@ -276,6 +303,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         abc_tensors,
         sfasfb_tensors,
         problem_sizes,
+        alpha_list=None,
         out_dtype: torch.dtype = torch.bfloat16,
         accumulate: bool = False,
         host_problem_shape_available: bool = True,
@@ -589,7 +617,8 @@ class Sm100GroupedBlockScaledGemmKernel:
                     "problem_sizes": problem_sizes,
                 }
             )
-        return [group_tensors[2] for group_tensors in abc_tensors["torch"]]
+        outputs = [group_tensors[2] for group_tensors in abc_tensors["torch"]]
+        return _apply_grouped_alpha(outputs, alpha_list)
 
     # Set up configurations that dependent on gemm inputs.
     def _setup_attributes(self):

@@ -3,7 +3,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_cute import (
+from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_fp16_bf16_cute import (
     GroupedGemmProfile,
     GroupedGemmKernel,
     generate_grouped_inputs,

@@ -136,6 +136,35 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"    TFLOPS          : {tflops_val:.2f}")
 
     # ------------------------------------------------------------------
+    # 4a. GPU-only timing via built-in iterations loop
+    #     run_from_grouped_inputs(iterations=N) runs the kernel N times
+    #     inside one Python call, timing via CUDA events at the C++/CUDA
+    #     layer — no Python dispatch overhead between iterations.
+    # ------------------------------------------------------------------
+    print("\n[3a] GPU-only timing (built-in iterations, no Python overhead)")
+    kernel.run_from_grouped_inputs(
+        abc_tensors=abc, sfasfb_tensors=sfasfb,
+        problem_sizes=problem_sizes,
+        out_dtype=torch.bfloat16,
+        warmup_iterations=WARMUP_ITERS,
+        iterations=BENCH_ITERS,
+    )
+    builtin_metrics = kernel.last_benchmark_metrics
+    if builtin_metrics:
+        avg_us = sum(m["avg_runtime_us"] for m in builtin_metrics) / len(builtin_metrics)
+        t_gpu_ms = avg_us / 1e3
+        # Report total across all groups (each entry is one group)
+        total_us = sum(m["avg_runtime_us"] for m in builtin_metrics)
+        t_gpu_total_ms = total_us / 1e3
+        tf_gpu = tflops(problem_sizes, t_gpu_total_ms)
+        print(f"    Per-group avg  : {avg_us:.1f} us")
+        print(f"    All-groups sum : {t_gpu_total_ms:.3f} ms  (serial sum, not wall time)")
+        print(f"    TFLOPS (sum)   : {tf_gpu:.2f}")
+        print(f"    Python overhead per outer call: ~{t_exec - t_gpu_total_ms:.1f} ms")
+    else:
+        print("    (no metrics returned — check iterations parameter)")
+
+    # ------------------------------------------------------------------
     # 5. Per-token alpha path (different epilogue => separate compilation)
     # ------------------------------------------------------------------
     print("\n[4] Per-token alpha path (separate compilation)")
@@ -196,10 +225,13 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     sep()
     print("Summary")
     sep("-")
-    print(f"  Compilation time (scalar alpha)     : ~{t_first - t_second:.0f} ms")
+    print(f"  Compilation time (scalar alpha)     : ~{t_first - t_second:.0f} ms  (one-time per shape)")
     print(f"  Compilation time (pertoken alpha)   : ~{t_pt_first - t_second:.0f} ms  (incremental)")
-    print(f"  Kernel execution (scalar alpha)     : {t_exec:.3f} ms  @ {tflops_val:.2f} TFLOPS")
-    print(f"  Kernel execution (pertoken alpha)   : {t_pt_exec:.3f} ms")
+    print(f"  Python dispatch overhead per call   : ~{t_exec:.0f} ms  (CUDA event, includes host work)")
+    if builtin_metrics:
+        print(f"  GPU kernel time  (all groups sum)   : {t_gpu_total_ms:.3f} ms  @ {tf_gpu:.2f} TFLOPS")
+        print(f"  => Bottleneck is {'COMPILATION' if (t_first - t_second) > 500 else 'PYTHON DISPATCH'}"
+              f" ({t_exec:.0f}ms overhead vs {t_gpu_total_ms:.2f}ms GPU work)")
     sep()
 
 

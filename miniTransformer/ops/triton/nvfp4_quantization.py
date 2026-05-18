@@ -211,7 +211,12 @@ def quant_nvfp4_pertoken_triton(x, block_size=16):
     M, K = x.shape
 
     if x.numel() == 0:
-        return x, None, None
+        B = K // block_size
+        return (
+            torch.empty_like(x),
+            torch.empty(M, dtype=torch.float32, device=x.device),
+            torch.empty(M * B, dtype=torch.float32, device=x.device),
+        )
 
     assert K % block_size == 0, f"K={K} 必须整除 block_size={block_size}"
 

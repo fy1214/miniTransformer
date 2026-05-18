@@ -305,6 +305,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         self._hw_cache: dict = {}   # cluster_n -> max_active_clusters; 1 -> sm_count
         self._stub_cache: dict = {} # out_dtype -> ([abc_stubs], [sfasfb_stubs])
         self._run_cache: dict = {}  # 'tmap': {sm_count->t}, 'shapes': {key->(t_mnkl,t_strides)}
+        # _SHAPES_CACHE_MAX: caps _run_cache['shapes'] to avoid unbounded growth in dynamic-M MoE
+        # (each distinct problem_sizes tuple creates a new entry; in practice <= 32 distinct configs)
+        self._SHAPES_CACHE_MAX = 128
 
     @staticmethod
     def _extract_ptrs_from_groups(grouped_tensors: List[List[torch.Tensor]]) -> List[List[int]]:
@@ -507,6 +510,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         _shape_key = (tuple(tuple(ps) for ps in problem_sizes), str(out_dtype))
         _shapes = self._run_cache.setdefault("shapes", {})
         if _shape_key not in _shapes:
+            if len(_shapes) >= self._SHAPES_CACHE_MAX:
+                # FIFO eviction: drop oldest entry to bound memory growth in dynamic-M MoE workloads
+                _shapes.pop(next(iter(_shapes)))
             _t_mnkl, _ = cutlass_torch.cute_tensor_like(
                 torch.tensor(problem_sizes, dtype=torch.int32, device=device),
                 cutlass.Int32,

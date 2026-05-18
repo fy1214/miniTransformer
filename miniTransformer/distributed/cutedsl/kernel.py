@@ -1512,6 +1512,11 @@ class PersistentDenseGemmKernel:
                         scope=flag_mem_scope,
                         order="release",
                     )
+                    # fence_proxy(alias): commit NVLS proxy write to DRAM so the
+                    # AllReduce warp's CAS spin-wait can observe the flag increment
+                    # via normal GPU memory path (required for multimem.red.add).
+                    # Reference: FlashInfer gemm_allreduce_two_shot.py
+                    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
             #
             # Advance to next tile
@@ -1641,6 +1646,7 @@ class PersistentDenseGemmKernel:
                         scope=flag_mem_scope,
                         order="release",
                     )
+                    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
             # Advance to next tile
             tile_sched.advance_to_next_work()

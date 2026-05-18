@@ -189,9 +189,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         """
         from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
             PertokenNvfp4Tensor,
-            TensorGlobalNvfp4Tensor,
-            quantize_activation_nvfp4_pertoken,
-            quantize_weight_nvfp4_tensor_global,
+            quantize_activation_nvfp4_pertoken
         )
 
         num_gemms = len(m_splits)
@@ -362,4 +360,3 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             return out
         else:
             return out[0]
-

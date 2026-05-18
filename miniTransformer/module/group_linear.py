@@ -534,8 +534,22 @@ class GroupedLinear(LayerLinearBaseModule):
         # 当 DISABLE_BACKWARD_QUANT=1 时，backward 不量化 dy/x，直接用 BF16 GEMM
         self.disable_backward_quant = should_keep_backward_in_bf16()
 
+        # Megatron's _split_extra_state (sharded_state_dict path) accesses these
+        # attributes that are normally provided by TE's TransformerEngineBaseModule.
+        # Since miniTransformer does not use TE's FP8 pipeline, set them to safe
+        # defaults so the checkpoint save/load path does not raise AttributeError.
+        self.fp8 = False
+        self.fp8_calibration = False
+        self.fp8_meta: dict = {"fp8_checkpoint": False}
+
         # JQ: DeepGEMM Grouped GEMM not support bias yet, thus apply bias at the end.
         self.gemm_bias_unfused_add = (self.use_bias and not return_bias)
+
+    def init_fp8_metadata(self, num_gemms: int = 1) -> None:
+        """Stub for Megatron compatibility (merge_extra_states pre-hook calls this on load).
+        miniTransformer uses its own quantization pipeline, not TE's FP8 metadata.
+        """
+        self.fp8_meta["num_gemms"] = num_gemms
 
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)

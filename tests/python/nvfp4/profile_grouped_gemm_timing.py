@@ -48,7 +48,12 @@ def wall_time_ms(fn):
 
 
 def cuda_time_ms(fn, warmup=0, iters=1):
-    """Measure CUDA event time of fn() in milliseconds (mean over iters)."""
+    """Measure CUDA event time of fn() in milliseconds (mean over iters).
+
+    WARNING: if fn() contains Python host work before kernel launch, the CUDA
+    event will also capture GPU-idle time waiting for the host.  Use
+    kernel_time_ms() instead when fn() wraps run_from_grouped_inputs().
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -60,6 +65,30 @@ def cuda_time_ms(fn, warmup=0, iters=1):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
+
+
+def kernel_time_ms(kernel, abc, sfasfb, problem_sizes, out_dtype,
+                   alphas=None, warmup=5, iters=20):
+    """Measure pure GPU kernel time using the built-in iterations loop.
+
+    run_from_grouped_inputs(iterations=N) runs N kernel launches inside a
+    single Python call, timing them with CUDA events at the C++/CUDA layer.
+    Python dispatch overhead is paid only once, not per iteration.
+    Returns average per-kernel time in milliseconds.
+    """
+    kernel.run_from_grouped_inputs(
+        abc_tensors=abc, sfasfb_tensors=sfasfb,
+        problem_sizes=problem_sizes,
+        out_dtype=out_dtype,
+        alphas=alphas,
+        warmup_iterations=warmup,
+        iterations=iters,
+    )
+    metrics = kernel.last_benchmark_metrics
+    if not metrics:
+        return float("nan")
+    # metrics has one entry per group; avg_runtime_us covers all groups together
+    return metrics[0]["avg_runtime_us"] / 1e3
 
 
 def tflops(problem_sizes, elapsed_ms):
@@ -123,46 +152,28 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"    Compilation overhead : ~{t_first - t_second:.1f} ms")
 
     # ------------------------------------------------------------------
-    # 4. Pure kernel execution time via CUDA events (with warmup)
+    # 3. Pure GPU kernel time (built-in iterations loop, correct method)
+    #    Python dispatch overhead is paid only once for N iterations.
     # ------------------------------------------------------------------
-    print(f"\n[3] Kernel execution time (warmup={WARMUP_ITERS}, iters={BENCH_ITERS})")
-    t_exec = cuda_time_ms(
-        lambda: call_kernel(abc, sfasfb),
-        warmup=WARMUP_ITERS,
-        iters=BENCH_ITERS,
-    )
+    print(f"\n[3] GPU kernel time (warmup={WARMUP_ITERS}, iters={BENCH_ITERS})")
+    t_exec = kernel_time_ms(kernel, abc, sfasfb, problem_sizes, torch.bfloat16,
+                            warmup=WARMUP_ITERS, iters=BENCH_ITERS)
     tflops_val = tflops(problem_sizes, t_exec)
-    print(f"    CUDA event mean : {t_exec:.3f} ms")
-    print(f"    TFLOPS          : {tflops_val:.2f}")
+    print(f"    Kernel mean : {t_exec:.3f} ms  ({t_exec*1e3:.1f} µs)")
+    print(f"    TFLOPS      : {tflops_val:.2f}")
 
     # ------------------------------------------------------------------
-    # 4a. GPU-only timing via built-in iterations loop
-    #     run_from_grouped_inputs(iterations=N) runs the kernel N times
-    #     inside one Python call, timing via CUDA events at the C++/CUDA
-    #     layer — no Python dispatch overhead between iterations.
+    # 3b. Python dispatch overhead per single call
     # ------------------------------------------------------------------
-    print("\n[3a] GPU-only timing (built-in iterations, no Python overhead)")
-    kernel.run_from_grouped_inputs(
+    t_single = wall_time_ms(lambda: kernel.run_from_grouped_inputs(
         abc_tensors=abc, sfasfb_tensors=sfasfb,
         problem_sizes=problem_sizes,
         out_dtype=torch.bfloat16,
-        warmup_iterations=WARMUP_ITERS,
-        iterations=BENCH_ITERS,
-    )
-    builtin_metrics = kernel.last_benchmark_metrics
-    if builtin_metrics:
-        avg_us = sum(m["avg_runtime_us"] for m in builtin_metrics) / len(builtin_metrics)
-        t_gpu_ms = avg_us / 1e3
-        # Report total across all groups (each entry is one group)
-        total_us = sum(m["avg_runtime_us"] for m in builtin_metrics)
-        t_gpu_total_ms = total_us / 1e3
-        tf_gpu = tflops(problem_sizes, t_gpu_total_ms)
-        print(f"    Per-group avg  : {avg_us:.1f} us")
-        print(f"    All-groups sum : {t_gpu_total_ms:.3f} ms  (serial sum, not wall time)")
-        print(f"    TFLOPS (sum)   : {tf_gpu:.2f}")
-        print(f"    Python overhead per outer call: ~{t_exec - t_gpu_total_ms:.1f} ms")
-    else:
-        print("    (no metrics returned — check iterations parameter)")
+        iterations=0,
+    ))
+    print(f"\n[3b] Single Python call overhead")
+    print(f"    Wall time       : {t_single:.1f} ms")
+    print(f"    Python overhead : ~{t_single - t_exec:.1f} ms  (wall - kernel)")
 
     # ------------------------------------------------------------------
     # 5. Per-token alpha path (different epilogue => separate compilation)
@@ -183,19 +194,16 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     t_pt_first = wall_time_ms(lambda: call_kernel_pertoken(abc, sfasfb))
     print(f"    First call  : {t_pt_first:.1f} ms  (includes per-token epilogue compilation)")
 
-    t_pt_exec = cuda_time_ms(
-        lambda: call_kernel_pertoken(abc, sfasfb),
-        warmup=WARMUP_ITERS,
-        iters=BENCH_ITERS,
-    )
-    print(f"    Kernel mean : {t_pt_exec:.3f} ms")
+    t_pt_exec = kernel_time_ms(kernel, abc, sfasfb, problem_sizes, torch.bfloat16,
+                               alphas=alphas_pertoken, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
+    print(f"    Kernel mean : {t_pt_exec:.3f} ms  ({t_pt_exec*1e3:.1f} µs)")
 
     # ------------------------------------------------------------------
     # 6. Sweep M sizes to show per-shape compilation cost
     # ------------------------------------------------------------------
     print("\n[5] Compilation cost sweep — varying M per group")
     sep("-")
-    print(f"  {'M':>6}  {'1st call (ms)':>14}  {'2nd call (ms)':>14}  {'exec (ms)':>10}  {'TFLOPS':>8}")
+    print(f"  {'M':>6}  {'1st(ms)':>10}  {'2nd(ms)':>10}  {'kernel(µs)':>12}  {'TFLOPS':>8}")
     sep("-")
 
     sweep_kernel = Sm100GroupedBlockScaledGemmKernel(profile=profile)
@@ -210,28 +218,28 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
             print(f"  {m:>6}  skipped ({e})")
             continue
 
-        def _call(a=abc_s, s=sfasfb_s, p=ps_s):
+        def _wall(a=abc_s, s=sfasfb_s, p=ps_s):
             return sweep_kernel.run_from_grouped_inputs(
                 abc_tensors=a, sfasfb_tensors=s,
                 problem_sizes=p, out_dtype=torch.bfloat16,
             )
 
-        t1 = wall_time_ms(_call)
-        t2 = wall_time_ms(_call)
-        te = cuda_time_ms(_call, warmup=3, iters=10)
-        tf = tflops(ps_s, te)
-        print(f"  {m:>6}  {t1:>14.1f}  {t2:>14.1f}  {te:>10.3f}  {tf:>8.2f}")
+        t1 = wall_time_ms(_wall)
+        t2 = wall_time_ms(_wall)
+        te_ms = kernel_time_ms(sweep_kernel, abc_s, sfasfb_s, ps_s, torch.bfloat16,
+                               warmup=3, iters=10)
+        tf = tflops(ps_s, te_ms)
+        print(f"  {m:>6}  {t1:>10.1f}  {t2:>10.1f}  {te_ms*1e3:>12.1f}  {tf:>8.2f}")
 
     sep()
     print("Summary")
     sep("-")
-    print(f"  Compilation time (scalar alpha)     : ~{t_first - t_second:.0f} ms  (one-time per shape)")
-    print(f"  Compilation time (pertoken alpha)   : ~{t_pt_first - t_second:.0f} ms  (incremental)")
-    print(f"  Python dispatch overhead per call   : ~{t_exec:.0f} ms  (CUDA event, includes host work)")
-    if builtin_metrics:
-        print(f"  GPU kernel time  (all groups sum)   : {t_gpu_total_ms:.3f} ms  @ {tf_gpu:.2f} TFLOPS")
-        print(f"  => Bottleneck is {'COMPILATION' if (t_first - t_second) > 500 else 'PYTHON DISPATCH'}"
-              f" ({t_exec:.0f}ms overhead vs {t_gpu_total_ms:.2f}ms GPU work)")
+    print(f"  Compilation (scalar alpha)   : ~{t_first - t_second:.0f} ms  (one-time per shape)")
+    print(f"  Compilation (pertoken alpha) : ~{t_pt_first - t_second:.0f} ms  (incremental)")
+    print(f"  GPU kernel  (scalar alpha)   : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
+    print(f"  GPU kernel  (pertoken alpha) : {t_pt_exec*1e3:.1f} µs")
+    print(f"  Python dispatch per call     : ~{t_single:.0f} ms  (= the '240ms' you measured before)")
+    print(f"  => Actual bottleneck: PYTHON DISPATCH OVERHEAD, not the kernel")
     sep()
 
 

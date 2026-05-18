@@ -212,7 +212,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 )
                 quantize_tensor_list.append(w_quantizer_fp4.quantize(x[i]))
                 if return_transpose:
-                    w_quantizer_fp8 = MXFP8Quantizer()
+                    w_quantizer_fp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
                     quantize_tensor_list_transpose.append(w_quantizer_fp8.quantize(x[i]))
 
             return GroupQuantizeResult(
@@ -302,11 +302,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
-        use_pertoken_kernel = _is_cutedsl_pertoken_path(A, B)
 
         if (
-            use_pertoken_kernel
-            and _is_sm100()
+            _is_sm100()
             and not grad
             and not gelu
             and not accumulate
@@ -324,27 +322,23 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             if layout == "NN":
                 if is_te_quantized:
                     n_cols = B[0]._rowwise_data.size(1) * 2
-                elif use_pertoken_kernel:
-                    n_cols = B[0].data_uint8.shape[1] * 2
                 else:
                     n_cols = B[0].size(1)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].data_uint8.device if use_pertoken_kernel else B[0].device,
+                    device=B[0].device,
                 )
                 out = [out]
         else:
             if is_te_quantized:
                 n_cols = B[0]._rowwise_data.size(0)
-            elif use_pertoken_kernel:
-                n_cols = B[0].data_uint8.shape[0]
             else:
                 n_cols = B[0].size(0)
             out = torch.empty(
                 [sum(m_splits), n_cols],
                 dtype=activation_dtype,
-                device=B[0].data_uint8.device if use_pertoken_kernel else B[0].device,
+                device=B[0].device,
             )
             out = [out]
 
@@ -369,6 +363,3 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         else:
             return out[0]
 
-
-# Backward-compatible alias (same class name as nvfp4_quantize_op).
-Nvfp4TiledQuantizeOp = Nvfp4Cursor2QuantizeOp

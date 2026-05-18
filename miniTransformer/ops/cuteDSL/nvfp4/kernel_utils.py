@@ -166,6 +166,9 @@ def try_export_compiled_to_disk(
                 function_name=function_name,
             )
         except TypeError:
+            # Primary signature not supported by this CuTeDSL version.
+            # Remove any partial file it may have written before retrying.
+            obj_path.unlink(missing_ok=True)
             try:
                 compiled.export_to_c(
                     str(cache_dir),
@@ -174,6 +177,11 @@ def try_export_compiled_to_disk(
                 )
             except TypeError:
                 return
+            # The alternate form may write to cache_dir/key_hash (no .o suffix).
+            # Rename to the canonical obj_path so the loader can find it.
+            alt_path = cache_dir / key_hash
+            if alt_path.exists() and not obj_path.exists():
+                alt_path.rename(obj_path)
 
 @cute.jit
 def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(

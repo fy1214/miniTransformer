@@ -93,6 +93,34 @@ def _try_load_grouped_compiled_from_disk(
             except Exception:
                 continue
 
+        # _DISK_FUNCTION_FALLBACKS didn't match — the export_to_c fallback path
+        # may have written the symbol under a prefix-derived name (e.g. "func_0").
+        # Discover it by scanning all public callables in the module.
+        discovered_name: Optional[str] = None
+        discovered_fn = None
+        try:
+            for attr_name in dir(module):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr = getattr(module, attr_name)
+                    if callable(attr):
+                        discovered_name = attr_name
+                        discovered_fn = attr
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if discovered_fn is not None:
+            logger.warning(
+                "Grouped GEMM disk cache: found callable '%s' in %s "
+                "(not in expected %s; consider updating _DISK_FUNCTION_FALLBACKS).",
+                discovered_name, obj_path, _DISK_FUNCTION_FALLBACKS,
+            )
+            return discovered_fn
+
         _DISK_LOAD_FAILURES += 1
         logger.warning(
             "Grouped GEMM disk cache: no callable in %s (expected %s); recompiling.",

@@ -197,53 +197,82 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         num_gemms = len(m_splits)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            if return_transpose:
-                quantize_tensor_list = []
-                for i in range(num_gemms):
-                    w_quantizer = NVFP4Quantizer(
-                        rowwise=True,
-                        columnwise=True,
-                        with_amax_reduction=False,
-                        amax_reduction_group=None,
-                        with_rht=qparams.with_rht,
-                        with_post_rht_amax=qparams.with_rht,
-                        with_2d_quantization=qparams.with_2d_quantization,
-                        stochastic_rounding=qparams.stochastic_rounding,
-                    )
-                    quantize_tensor_list.append(w_quantizer.quantize(x[i]))
-                return GroupQuantizeResult(
-                    data=quantize_tensor_list,
-                    data_t=quantize_tensor_list,
-                    scale=quantize_tensor_list,
-                    scale_t=quantize_tensor_list,
-                    tensor_scale=quantize_tensor_list,
-                    tensor_scale_t=quantize_tensor_list,
-                )
-
-            weight_list: List[TensorGlobalNvfp4Tensor] = []
+            quantize_tensor_list = []
+            quantize_tensor_list_transpose = []
             for i in range(num_gemms):
-                weight_list.append(quantize_weight_nvfp4_tensor_global(x[i]))
+                w_quantizer_fp4 = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=True,
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding,
+                )
+                quantize_tensor_list.append(w_quantizer_fp4.quantize(x[i]))
+                if return_transpose:
+                    w_quantizer_fp8 = MXFP8Quantizer()
+                    quantize_tensor_list_transpose.append(w_quantizer_fp8.quantize(x[i]))
+
             return GroupQuantizeResult(
-                data=weight_list,
-                scale=[w.block_scale_fp8 for w in weight_list],
-                data_t=None,
-                scale_t=None,
-                tensor_scale=[w.amax for w in weight_list],
-                tensor_scale_t=None,
+                data=quantize_tensor_list,
+                data_t=quantize_tensor_list_transpose,
+                scale=quantize_tensor_list,
+                scale_t=quantize_tensor_list_transpose,
+                tensor_scale=quantize_tensor_list,
+                tensor_scale_t=quantize_tensor_list_transpose,
             )
 
-        # Activation: per-token quant per group slice
-        act_chunks = torch.split(x, m_splits, dim=0)
-        act_list: List[PertokenNvfp4Tensor] = [
-            quantize_activation_nvfp4_pertoken(chunk) for chunk in act_chunks
-        ]
+        if qparams.param_type == qparams.param_type.X:
+            # Activation: per-token quant per group slice
+            act_chunks = torch.split(x, m_splits, dim=0)
+            act_list: List[PertokenNvfp4Tensor] = [
+                quantize_activation_nvfp4_pertoken(chunk) for chunk in act_chunks
+            ]
+
+            # Activation: MXFP8 quant for backward
+            quantizers = []
+            for i in range(num_gemms):
+                x_quantizer = MXFP8Quantizer(
+                    rowwise=True,
+                    columnwise=return_transpose,
+                )
+                quantizers.append(x_quantizer)
+            quantize_tensor_list = tex.split_quantize(
+                x,
+                m_splits,
+                quantizers,
+            )
+            return GroupQuantizeResult(
+                data=act_list,
+                scale=[a.block_scale for a in act_list],
+                data_t=quantize_tensor_list,
+                scale_t=quantize_tensor_list,
+                tensor_scale=[a.global_scale for a in act_list],
+                tensor_scale_t=quantize_tensor_list,
+            )
+
+        # Dy: MXFP8 quant for backward
+        quantizers = []
+        for i in range(num_gemms):
+            x_quantizer = MXFP8Quantizer(
+                rowwise=True,
+                columnwise=True,
+            )
+            quantizers.append(x_quantizer)
+        quantize_tensor_list = tex.split_quantize(
+            x,
+            m_splits,
+            quantizers,
+        )
         return GroupQuantizeResult(
-            data=act_list,
-            scale=[a.block_scale for a in act_list],
-            data_t=None,
-            scale_t=None,
-            tensor_scale=[a.global_scale for a in act_list],
-            tensor_scale_t=None,
+            data=quantize_tensor_list,
+            scale=quantize_tensor_list,
+            data_t=quantize_tensor_list,
+            scale_t=quantize_tensor_list,
+            tensor_scale=quantize_tensor_list,
+            tensor_scale_t=quantize_tensor_list,
         )
 
 

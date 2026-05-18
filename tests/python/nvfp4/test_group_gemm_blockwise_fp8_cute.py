@@ -3,7 +3,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_fp8 import (
+from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockwise_fp8_cute import (
     BlockwiseGroupedFp8Profile,
     BlockwiseContiguousGroupedGemmKernel,
     generate_grouped_blockwise_fp8_inputs,

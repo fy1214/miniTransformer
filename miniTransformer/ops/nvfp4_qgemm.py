@@ -8,7 +8,7 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import torch.nn.functional as F
 
-from typing import Optional
+from typing import List, Optional
 
 from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 from miniTransformer.quantiztion import quantization
@@ -18,13 +18,15 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from miniTransformer.ops.triton.gemm_tl import block_scaled_matmul
 from cutlass.cute.runtime import make_ptr
 
-from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import (
+from miniTransformer.ops.cuteDSL.nvfp4.nvfp4_blockscaled_gemm_cute import (
     ab_dtype,
     sf_dtype,
     sf_vec_size,
     get_compiled_nvfp4_gemm,
-    get_compiled_nvfp4_gemm_multi_variant,
-    Nvfp4KernelVariant,
+)
+from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockscaled_nvfp4_mxfp_cute import (
+    GroupedBlockScaledProfile,
+    Sm100GroupedBlockScaledGemmKernel,
 )
 
 def ceil_div(a, b):
@@ -471,12 +473,10 @@ def cutedsl_nvfp4_gemm_optimized(
     alpha,
     out_dtype,
     device,
-    kernel_variant: Nvfp4KernelVariant = Nvfp4KernelVariant.OPTS1,
     out=None,
     accumulate=False,
     has_swizzle=True,
     use_clc_dynamic_scheduler=False,
-    auto_kernel_variant: bool = False,
     do_benchmark=False,
     do_autotune=False,
     warmup_iterations=10,
@@ -489,31 +489,14 @@ def cutedsl_nvfp4_gemm_optimized(
     alpha_value = float(alpha.item())
     l = 1
     sf_k = ceil_div(K, sf_vec_size)
-    opts_family_variants = {
-        Nvfp4KernelVariant.OPTS2,
-        Nvfp4KernelVariant.OPTS3,
-        Nvfp4KernelVariant.OPTS4,
-    }
-    use_host_accumulate = (kernel_variant in opts_family_variants) and accumulate
-    force_fp32_kernel_output = (kernel_variant in opts_family_variants) and (out_dtype == torch.bfloat16)
-    if auto_kernel_variant:
-        # Keep dispatch path simple and robust for all variants.
-        use_host_accumulate = accumulate
-        force_fp32_kernel_output = out_dtype == torch.bfloat16
-    kernel_out_dtype = torch.float32 if force_fp32_kernel_output else out_dtype
 
     a_ref_f4 = qx.view(torch.float4_e2m1fn_x2).to(device)
     b_ref_f4 = qw.view(torch.float4_e2m1fn_x2).to(device)
-    out_tensor_before = None
     if accumulate:
         assert out is not None, "out must be provided when accumulate=True"
-        if use_host_accumulate:
-            out_tensor_before = out.to(torch.float32).clone()
-            c_tensor = torch.empty((M, N, l), dtype=torch.float32, device=device)
-        else:
-            c_tensor = out.unsqueeze(-1).contiguous().to(kernel_out_dtype).to(device)
+        c_tensor = out.unsqueeze(-1).contiguous().to(out_dtype).to(device)
     else:
-        c_tensor = torch.empty((M, N, l), dtype=kernel_out_dtype, device=device)
+        c_tensor = torch.empty((M, N, l), dtype=out_dtype, device=device)
 
     def _ref_2d_to_cute_sf(data_2d, mn, has_swizzle=True):
         ref = data_2d.unsqueeze(-1).to(dtype=torch.float8_e4m3fn)
@@ -540,59 +523,26 @@ def cutedsl_nvfp4_gemm_optimized(
     c_tensor_initial_for_autotune = None
     if do_autotune and accumulate:
         c_tensor_initial_for_autotune = c_tensor.clone()
-    selected_variant = kernel_variant
-    cache_hit = False
-    if auto_kernel_variant:
-        compiled, selected_config, selected_time, selected_variant, cache_hit = (
-            get_compiled_nvfp4_gemm_multi_variant(
-                a_ptr=a_ptr,
-                b_ptr=b_ptr,
-                sfa_ptr=sfa_ptr,
-                sfb_ptr=sfb_ptr,
-                c_ptr=c_ptr,
-                problem_size=(M, N, K, l),
-                stream=stream,
-                epilogue_op=lambda x: x,
-                epilogue_cache_tag=("scale_alpha",),
-                out_dtype=kernel_out_dtype,
-                accumulate=(False if use_host_accumulate else accumulate),
-                has_swizzle=has_swizzle,
-                use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
-                benchmark_scope_tensors=[
-                    a_ref_f4,
-                    b_ref_f4,
-                    sfa_tensor,
-                    sfb_tensor,
-                    c_tensor,
-                ],
-                warmup_iterations=max(2, min(5, warmup_iterations)),
-                iterations=max(10, min(30, iterations)),
-                use_cold_l2=False,
-            )
-        )
-        use_host_accumulate = (selected_variant in opts_family_variants) and accumulate
-    else:
-        compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
-            a_ptr=a_ptr,
-            b_ptr=b_ptr,
-            sfa_ptr=sfa_ptr,
-            sfb_ptr=sfb_ptr,
-            c_ptr=c_ptr,
-            problem_size=(M, N, K, l),
-            stream=stream,
-            epilogue_op=lambda x: x,
-            epilogue_cache_tag=("scale_alpha",),
-            out_dtype=kernel_out_dtype,
-            kernel_variant=kernel_variant,
-            accumulate=(False if use_host_accumulate else accumulate),
-            has_swizzle=has_swizzle,
-            use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
-            do_autotune=do_autotune,
-            benchmark_scope_tensors=benchmark_scope_tensors,
-            warmup_iterations=warmup_iterations,
-            iterations=iterations,
-            use_cold_l2=use_cold_l2,
-        )
+    compiled, selected_config, selected_time = get_compiled_nvfp4_gemm(
+        a_ptr=a_ptr,
+        b_ptr=b_ptr,
+        sfa_ptr=sfa_ptr,
+        sfb_ptr=sfb_ptr,
+        c_ptr=c_ptr,
+        problem_size=(M, N, K, l),
+        stream=stream,
+        epilogue_op=lambda x: x,
+        epilogue_cache_tag=("scale_alpha",),
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+        has_swizzle=has_swizzle,
+        use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+        do_autotune=do_autotune,
+        benchmark_scope_tensors=benchmark_scope_tensors,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+        use_cold_l2=use_cold_l2,
+    )
     if do_autotune and accumulate and c_tensor_initial_for_autotune is not None:
         c_tensor.copy_(c_tensor_initial_for_autotune)
 
@@ -648,25 +598,135 @@ def cutedsl_nvfp4_gemm_optimized(
         print(f"CuTeDSL BW: {bandwidth:.3f} GB/s")
 
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, (M, N, K, l), stream)
-    if use_host_accumulate:
-        c_out = c_tensor.squeeze(-1).to(torch.float32)
-        if alpha_value != 1.0:
-            c_out = c_out * alpha_value
-        out.copy_((c_out + out_tensor_before).to(out_dtype))
-        if return_dispatch_info:
-            return out, {
-                "selected_variant": selected_variant.value,
-                "selected_time_us": selected_time,
-                "cache_hit": cache_hit,
-            }
-        return out
     if alpha_value != 1.0:
         c_tensor.mul_(alpha_value)
     result = c_tensor.squeeze(-1).float().to(out_dtype)
     if return_dispatch_info:
         return result, {
-            "selected_variant": selected_variant.value,
+            "selected_config": selected_config,
             "selected_time_us": selected_time,
-            "cache_hit": cache_hit,
         }
     return result
+
+
+def _validate_nvfp4_per_token_alpha(alpha: torch.Tensor, m: int) -> None:
+    if alpha.dim() == 0 or (alpha.dim() == 1 and alpha.shape[0] == 1):
+        return
+    if alpha.dim() == 1 and alpha.shape[0] == m:
+        return
+    raise ValueError(
+        f"alpha must be shape (1,) or (M={m},), got {tuple(alpha.shape)}"
+    )
+
+
+def grouped_nvfp4_per_token_gemm(
+    a_list: List[torch.Tensor],
+    b_list: List[torch.Tensor],
+    a_descale_list: List[torch.Tensor],
+    b_descale_list: List[torch.Tensor],
+    alpha_list: List[torch.Tensor],
+    out_dtype: torch.dtype = torch.bfloat16,
+    out_list: Optional[List[torch.Tensor]] = None,
+) -> List[torch.Tensor]:
+    """Grouped NVFP4 GEMM with scalar/per-row alpha."""
+    num_groups = len(a_list)
+    if not (
+        len(b_list) == len(a_descale_list) == len(b_descale_list) == len(alpha_list) == num_groups
+    ):
+        raise ValueError("All input lists must have the same length.")
+    if num_groups == 0:
+        return []
+
+    problem_sizes = []
+    provided_out_list = out_list is not None
+    if not provided_out_list:
+        out_list = []
+    elif len(out_list) != num_groups:
+        raise ValueError("out_list length must match number of groups.")
+
+    abc_groups = []
+    sfasfb_groups = []
+    for idx in range(num_groups):
+        a = a_list[idx]
+        b = b_list[idx]
+        a_descale = a_descale_list[idx]
+        b_descale = b_descale_list[idx]
+
+        if a.dim() != 2 or b.dim() != 2:
+            raise ValueError(f"group {idx}: a and b must be 2D tensors.")
+        if a.dtype != torch.uint8 or b.dtype != torch.uint8:
+            raise ValueError(f"group {idx}: a and b must be torch.uint8 packed fp4 tensors.")
+        if a.shape[1] != b.shape[1]:
+            raise ValueError(f"group {idx}: K-packed mismatch between a and b.")
+
+        m, k_packed = a.shape
+        n = b.shape[0]
+        k = k_packed * 2
+        if k % 16 != 0:
+            raise ValueError(f"group {idx}: K ({k}) must be divisible by 16 for NVFP4 scales.")
+        if a_descale.shape != (m, k // 16):
+            raise ValueError(
+                f"group {idx}: a_descale shape must be {(m, k // 16)}, got {tuple(a_descale.shape)}."
+            )
+        if b_descale.shape != (n, k // 16):
+            raise ValueError(
+                f"group {idx}: b_descale shape must be {(n, k // 16)}, got {tuple(b_descale.shape)}."
+            )
+        if a_descale.dtype != torch.float8_e4m3fn or b_descale.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"group {idx}: a_descale/b_descale must be torch.float8_e4m3fn for NVFP4 profile."
+            )
+
+        if provided_out_list:
+            out = out_list[idx]
+            if out.shape != (m, n):
+                raise ValueError(
+                    f"group {idx}: out shape must be {(m, n)}, got {tuple(out.shape)}."
+                )
+            if out.dtype != out_dtype:
+                raise ValueError(
+                    f"group {idx}: out dtype must be {out_dtype}, got {out.dtype}."
+                )
+        else:
+            out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+            out_list.append(out)
+
+        problem_sizes.append((m, n, k, 1))
+        abc_groups.append([a, b, out])
+        sfasfb_groups.append([a_descale, b_descale])
+
+    kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
+    return kernel.run_from_grouped_inputs(
+        abc_tensors={"torch": abc_groups},
+        sfasfb_tensors={"torch": sfasfb_groups},
+        problem_sizes=problem_sizes,
+        alpha_list=alpha_list,
+        out_dtype=out_dtype,
+        accumulate=False,
+        warmup_iterations=0,
+        iterations=0,
+    )
+
+
+def dense_nvfp4_per_token_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dense NVFP4 block-scaled GEMM with scalar or per-row alpha."""
+    _validate_nvfp4_per_token_alpha(alpha, a.shape[0])
+    out_list = [out] if out is not None else None
+    result = grouped_nvfp4_per_token_gemm(
+        a_list=[a],
+        b_list=[b],
+        a_descale_list=[a_descale],
+        b_descale_list=[b_descale],
+        alpha_list=[alpha],
+        out_dtype=out_dtype,
+        out_list=out_list,
+    )
+    return result[0]

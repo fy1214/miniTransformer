@@ -1,9 +1,7 @@
-from typing import Optional
-
 import pytest
 import torch
 import miniTransformer.ops.nvfp4_qgemm as nvfp4_qgemm
-from miniTransformer.ops.cuteDSL.nvfp4.gemm_cute_opts1 import Nvfp4KernelVariant
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -64,8 +62,8 @@ def ref_kernel(
     has_swizzle: bool = True,
 ):
 
-    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2) 
-    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2) 
+    a_ref_f4 = qx.view(torch.float4_e2m1fn_x2)
+    b_ref_f4 = qw.view(torch.float4_e2m1fn_x2)
 
     sx_f8 = sx.to(torch.float8_e4m3fn) if sx.dtype != torch.float8_e4m3fn else sx
     sw_f8 = sw.to(torch.float8_e4m3fn) if sw.dtype != torch.float8_e4m3fn else sw
@@ -100,10 +98,8 @@ def make_match_reference(
     has_swizzle,
     do_benchmark,
     do_autotune,
-    kernel_variant: Optional[Nvfp4KernelVariant],
     use_clc_dynamic_scheduler: bool = False,
     device="cuda",
-    auto_kernel_variant: bool = False,
     return_dispatch_info: bool = False,
 ):
     seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
@@ -115,13 +111,12 @@ def make_match_reference(
     )
 
     if accumulate:
-        # accu mode only use in wgrad, aplha = 1.0
         alpha_t = torch.tensor(1.0, device=device, dtype=torch.float32)
     else:
         factor = 6.0 * 6.0 * 448.0 * 448.0
         alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
         alpha_t = torch.tensor(alpha, device=device, dtype=torch.float32)
-  
+
     y_ref = ref_kernel(
         qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device,
         return_fp32=accumulate, has_swizzle=has_swizzle
@@ -131,12 +126,10 @@ def make_match_reference(
 
     d_cute = nvfp4_qgemm.cutedsl_nvfp4_gemm_optimized(
         qx, qw, sx, sw, M, N, K, alpha_t, out_dtype, device,
-        kernel_variant=kernel_variant,
         out=out_init_dsl,
         accumulate=accumulate,
         has_swizzle=has_swizzle,
         use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
-        auto_kernel_variant=auto_kernel_variant,
         return_dispatch_info=return_dispatch_info,
         do_benchmark=do_benchmark,
         do_autotune=do_autotune,
@@ -167,23 +160,15 @@ def make_match_reference(
     if return_dispatch_info:
         return dispatch_info
 
+
 class TestCuTeDSLNvfp4Gemm:
- 
+
     @pytest.mark.parametrize("M, K, N", GEMM_WORKLOAD_PARAMS_OPTIMIZED)
     @pytest.mark.parametrize("accumulate", [False, True])
     @pytest.mark.parametrize("acc_dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("do_benchmark", [False])
     @pytest.mark.parametrize("do_autotune", [False])
-    @pytest.mark.parametrize(
-        "kernel_variant",
-        [
-            Nvfp4KernelVariant.OPTS0,
-            Nvfp4KernelVariant.OPTS1,
-            Nvfp4KernelVariant.OPTS2,
-            Nvfp4KernelVariant.OPTS3,
-        ],
-    )
-    def test_cutedsl_nvfp4_all_kernels(
+    def test_cutedsl_nvfp4_gemm(
         self,
         M,
         K,
@@ -192,7 +177,6 @@ class TestCuTeDSLNvfp4Gemm:
         acc_dtype,
         do_benchmark,
         do_autotune,
-        kernel_variant,
         nvfp4_cuda_device,
     ):
         make_match_reference(
@@ -204,7 +188,6 @@ class TestCuTeDSLNvfp4Gemm:
             has_swizzle=False,
             do_benchmark=do_benchmark,
             do_autotune=do_autotune,
-            kernel_variant=kernel_variant,
             device=nvfp4_cuda_device,
         )
 
@@ -214,9 +197,8 @@ class TestCuTeDSLNvfp4Gemm:
     @pytest.mark.parametrize("has_swizzle", [False])
     @pytest.mark.parametrize("do_benchmark", [True])
     @pytest.mark.parametrize("do_autotune", [False])
-    @pytest.mark.parametrize("kernel_variant", [None])
     @pytest.mark.parametrize("nvfp4_cuda_device", ["cuda:7"])
-    def test_cutedsl_nvfp4_current_kernels(
+    def test_cutedsl_nvfp4_gemm_benchmark(
         self,
         M,
         K,
@@ -226,7 +208,6 @@ class TestCuTeDSLNvfp4Gemm:
         has_swizzle,
         do_benchmark,
         do_autotune,
-        kernel_variant,
         nvfp4_cuda_device,
     ):
         make_match_reference(
@@ -238,9 +219,7 @@ class TestCuTeDSLNvfp4Gemm:
             has_swizzle=has_swizzle,
             do_benchmark=do_benchmark,
             do_autotune=do_autotune,
-            kernel_variant=kernel_variant,
             device=nvfp4_cuda_device,
-            auto_kernel_variant=True,
             return_dispatch_info=True,
         )
 

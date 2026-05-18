@@ -3,7 +3,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute import (
+from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockscaled_nvfp4_mxfp_cute import (
     GroupedBlockScaledProfile,
     Sm100GroupedBlockScaledGemmKernel,
     generate_grouped_blockscaled_inputs,
@@ -107,7 +107,7 @@ class TestGroupedBlockScaledGemm:
 
     @pytest.mark.parametrize("case", CASE_MULTISTREAM_PARAMS)
     @pytest.mark.parametrize("num_streams", [2, 4])
-    def test_blockwise_group_gemm_multi_stream_round_robin_nvfp4(self, case, num_streams):
+    def test_group_gemm_multi_stream_round_robin_nvfp4(self, case, num_streams):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
         pytest.importorskip("flashinfer")

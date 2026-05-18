@@ -22,7 +22,7 @@ sys.path.insert(0, "/home/admin/yanglin/workspace/TransformerEngine")
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 
-from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute import (
+from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockscaled_nvfp4_mxfp_cute import (
     Sm100GroupedBlockScaledGemmKernel,
     GroupedBlockScaledProfile,
 )

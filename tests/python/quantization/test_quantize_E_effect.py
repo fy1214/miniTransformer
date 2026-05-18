@@ -1,350 +1,41 @@
-"""
-quantize_exp.py
-===============
-作者: mingfa
-日期: 2026-04-29
+"""Fixed M=1, varying E=2/3/4/5: quantization precision vs exponent bits.
 
-功能:
-    探索固定尾数位数(M=1)、变化指数位数(E=2/3/4/5)的低精度浮点量化格式，
-    结合两种 block scale 存储方式（E8M0 / E4M3）的量化精度对比实验。
+Schemes (8 total): E5M1 / E4M1 / E3M1 / E2M1  ×  E4M3 scale / E8M0 scale
 
-量化方案（共 8 种）:
-    数据格式: E5M1 / E4M1 / E3M1 / E2M1
-    Scale  : E8M0（2的幂次，ceil取整） / E4M3（round-to-nearest，clamp兜底）
-
-核心设计（参考 nvfp4_quantize_op_ref._quantize_blockwise_reference）:
-    1. decode_scale = round-to-nearest(block_amax / fp_max)，不做 ceil
-    2. encode_scale = 1 / decode_scale，从量化后值反算，保证 encode/decode 互逆
-    3. x_scaled = x * encode_scale，配合 clamp(x_scaled, -fp_max, fp_max) 兜底
-
-评估指标: MAE / Mean Rel Err / SNR / Rel_L2
+Key finding: wider exponent increases dynamic range but not mantissa resolution.
+Metrics: MAE / Mean Rel Err / SNR / Rel_L2
 """
 import torch
 
-# CUDA Graph compatible: lazy pos_vals cache per device
-_POS_VALS_CACHE: dict = {}
-
-def _get_cached_pos_vals(name: str, vals_cpu: torch.Tensor, device) -> torch.Tensor:
-    """First call moves tensor to device and caches; subsequent calls return cache.
-    Warmup before CUDA Graph capture triggers the H2D copy; capture sees no H2D ops."""
-    key = f"{name}:{device}"
-    if key not in _POS_VALS_CACHE:
-        _POS_VALS_CACHE[key] = vals_cpu.to(device)
-    return _POS_VALS_CACHE[key]
-
-# ============================================================
-# 核心：浮点分解 + 重建
-# ============================================================
-
-def get_fp_components(x: torch.Tensor, e_bits: int, m_bits: int):
-    bias    = (1 << (e_bits - 1)) - 1
-    max_exp = (1 << e_bits) - 1
-    m_max   = (1 << m_bits)
-
-    fp_max = (2.0 ** (max_exp - bias)) * (1.0 + (m_max - 1) / m_max)
-
-    x32   = x.float()
-    sign  = torch.sign(x32)
-    sign  = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    abs_x = x32.abs().clamp(max=fp_max)
-
-    is_zero = (abs_x == 0)
-
-    safe_abs    = abs_x.clamp(min=2.0 ** (1 - bias - m_bits))
-    e_real_f    = torch.floor(torch.log2(safe_abs))
-    e_stored_f  = (e_real_f + bias).clamp(1, max_exp)
-    e_real_used = e_stored_f - bias
-
-    scale   = torch.pow(2.0, e_real_used)
-    frac    = (abs_x / scale - 1.0).clamp(0.0, 1.0)
-    m_int_f = torch.round(frac * m_max)
-
-    # 进位处理
-    carry      = (m_int_f >= m_max)
-    e_stored_f = torch.where(carry, (e_stored_f + 1).clamp(1, max_exp), e_stored_f)
-    m_int_f    = torch.where(carry, torch.zeros_like(m_int_f), m_int_f)
-
-    # 非规格化
-    denorm_threshold = 2.0 ** (1 - bias)
-    is_denorm        = (abs_x < denorm_threshold) & (~is_zero)
-    m_int_denorm     = torch.round(abs_x / denorm_threshold * m_max).clamp(0, m_max - 1).long()
-
-    e_final = torch.where(is_denorm | is_zero,
-                          torch.zeros_like(e_stored_f.long()),
-                          e_stored_f.long())
-    m_final = torch.where(is_denorm, m_int_denorm,
-              torch.where(is_zero,   torch.zeros_like(m_int_f.long()),
-                                     m_int_f.long()))
-    return sign, e_final, m_final, bias, max_exp, m_max
-
-
-def reconstruct_fp(sign, e_stored, m_int, bias, m_max):
-    e_f = e_stored.float()
-    m_f = m_int.float()
-
-    is_zero   = (e_stored == 0) & (m_int == 0)
-    is_denorm = (e_stored == 0) & (m_int != 0)
-
-    val_norm   = torch.pow(2.0, e_f - bias) * (1.0 + m_f / m_max)
-    val_denorm = (2.0 ** (1.0 - bias)) * (m_f / m_max)
-
-    val = torch.where(~is_zero & ~is_denorm, val_norm,
-          torch.where(is_denorm,             val_denorm,
-                                             torch.zeros_like(val_norm)))
-    return sign * val
-
-
-# ============================================================
-# scale 量化工具
-# ============================================================
-
-def cast_to_e8m0(decode_scale: torch.Tensor) -> torch.Tensor:
-    """Cast to E8M0: 2^ceil(log2(x))，纯 2 的幂次"""
-    exponent = torch.ceil(torch.log2(decode_scale.clamp(min=1e-38)))
-    exponent = torch.clamp(exponent, -127, 127)
-    return torch.pow(2.0, exponent)
-
-
-def cast_to_e4m3(decode_scale: torch.Tensor) -> torch.Tensor:
-    """round-to-nearest 到 E4M3，直接用 PyTorch 原生转换"""
-    E4M3_MAX = 448.0
-    decode_scale = decode_scale.clamp(-E4M3_MAX, E4M3_MAX)
-    return decode_scale.to(torch.float8_e4m3fn).to(torch.float32)
-
-
-# ============================================================
-# 通用 per-block 量化框架（nvfp4 风格：round + clamp，encode_scale 反算）
-# ============================================================
-
-def quant_dequant_block(
-    x          : torch.Tensor,
-    block_size : int,
-    fp_max     : float,
-    quantize_fn,            # 将 x_scaled (float32) 量化并返回 float32
-    scale_type : str,       # "e8m0" | "e4m3"
-    debug_name : str = "",
-    debug      : bool = False,
-) -> torch.Tensor:
-    """
-    通用 per-block 量化/反量化框架，与 nvfp4_quantize_op_ref 实现思路一致：
-    - decode_scale = round-to-nearest（e8m0 或 e4m3），不做 ceil
-    - encode_scale 从量化后的 decode_scale 反算，保证 encode/decode 严格互逆
-    - 量化后用 clamp 兜底，防止因 round 偏小导致的溢出
-    """
-    orig_shape = x.shape
-    x32 = x.float().reshape(-1)
-    N   = x32.numel()
-    assert N % block_size == 0, (
-        f"numel()={N} 必须是 block_size={block_size} 的整数倍，请在调用前 pad"
-    )
-    x_blocks = x32.reshape(-1, block_size)           # [B, block_size]
-
-    # ── step1: 计算 raw decode_scale ─────────────────────────
-    block_max  = x_blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-38)
-    decode_scale_raw = block_max / fp_max            # = vec_max / fp_max
-
-    # ── step2: round-to-nearest 量化 decode_scale ────────────
-    if scale_type == "e8m0":
-        decode_scale_q = cast_to_e8m0(decode_scale_raw)
-    elif scale_type == "e4m3":
-        decode_scale_q = cast_to_e4m3(decode_scale_raw)
-    else:
-        raise ValueError(f"未知 scale_type: {scale_type}")
-
-    # ── step3: 从量化后的 decode_scale 反算 encode_scale ─────
-    # encode_scale = 1 / decode_scale_q
-    encode_scale = torch.reciprocal(decode_scale_q.clamp(min=1e-38))
-
-    # ── step4: 缩放 + clamp 兜底 ──────────────────────────────
-    x_scaled = x_blocks * encode_scale              # 缩放到 [-fp_max, fp_max] 附近
-    x_scaled = torch.clamp(x_scaled, -fp_max, fp_max)  # clamp 兜底（round 偏小时保护）
-
-
-
-    # ── step5: 量化数据 ───────────────────────────────────────
-    x_q = quantize_fn(x_scaled.reshape(-1)).reshape(-1, block_size)
-
-    # ── step6: 反量化（乘以 decode_scale_q）─────────────────
-    x_dq = (x_q * decode_scale_q).reshape(-1).reshape(orig_shape)
-    return x_dq.bfloat16()
-
-
-# ============================================================
-# 各格式量化函数
-# ============================================================
-
-_POS_VALS_E5M1 = torch.tensor(
-    [0, 3.05176e-05, 6.10352e-05, 9.15527e-05, 0.0001220703, 0.0001831055, 0.0002441406, 0.0003662109, 0.0004882812, 0.0007324219, 0.0009765625, 0.0014648438, 0.001953125, 0.0029296875, 0.00390625, 0.005859375, 0.0078125, 0.01171875, 0.015625, 0.0234375, 0.03125, 0.046875, 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304],
-    dtype=torch.float32
+from _quant_utils import (
+    fp_format_max, quant_dequant_block,
+    _quantize_e5m1, _quantize_e4m1, _quantize_e3m1, _quantize_e2m1,
+    print_metrics, print_summary_table, make_test_tensor,
 )
 
-def _quantize_e5m1(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = _get_cached_pos_vals("E5M1", _POS_VALS_E5M1, x.device)
-    x32  = x.float()
-    sign = torch.sign(x32)
-    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
-    idx  = diff.argmin(dim=-1)
-    return sign * pos_vals[idx]
 
-_POS_VALS_E4M1 = torch.tensor(
-    [0, 0.0078125, 0.015625, 0.0234375, 0.03125, 0.046875, 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384],
-    dtype=torch.float32
-)
-
-def _quantize_e4m1(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = _get_cached_pos_vals("E4M1", _POS_VALS_E4M1, x.device)
-    x32  = x.float()
-    sign = torch.sign(x32)
-    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
-    idx  = diff.argmin(dim=-1)
-    return sign * pos_vals[idx]
-
-_POS_VALS_E3M1 = torch.tensor(
-    [0, 0.125, 0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24],
-    dtype=torch.float32
-)
-
-def _quantize_e3m1(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = _get_cached_pos_vals("E3M1", _POS_VALS_E3M1, x.device)
-    x32  = x.float()
-    sign = torch.sign(x32)
-    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
-    idx  = diff.argmin(dim=-1)
-    return sign * pos_vals[idx]
-
-_POS_VALS_E2M1 = torch.tensor(
-    [0, 0.5, 1, 1.5, 2, 3, 4, 6],
-    dtype=torch.float32
-)
-
-def _quantize_e2m1(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = _get_cached_pos_vals("E2M1", _POS_VALS_E2M1, x.device)
-    x32  = x.float()
-    sign = torch.sign(x32)
-    sign = torch.where(x32 == 0, torch.ones_like(sign), sign)
-    diff = (x32.abs().unsqueeze(-1) - pos_vals.unsqueeze(0)).abs()
-    idx  = diff.argmin(dim=-1)
-    return sign * pos_vals[idx]
-
-
-def fp_format_max(e_bits: int, m_bits: int) -> float:
-    bias    = (1 << (e_bits - 1)) - 1
-    max_exp = (1 << e_bits) - 1
-    m_max   = (1 << m_bits)
-    return (2.0 ** (max_exp - bias)) * (1.0 + (m_max - 1) / m_max)
-
-
-# ============================================================
-# 对外接口
-# ============================================================
-
-def quant_dequant_e5m1_e4m3scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(5, 1),
-        quantize_fn=_quantize_e5m1, scale_type="e4m3",
-        debug_name="E5M1 + E4M3 scale", debug=debug)
-
-def quant_dequant_e4m1_e4m3scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(4, 1),
-        quantize_fn=_quantize_e4m1, scale_type="e4m3",
-        debug_name="E4M1 + E4M3 scale", debug=debug)
-
-def quant_dequant_e3m1_e4m3scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(3, 1),
-        quantize_fn=_quantize_e3m1, scale_type="e4m3",
-        debug_name="E3M1 + E4M3 scale", debug=debug)
-
-def quant_dequant_e2m1_e4m3scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(2, 1),
-        quantize_fn=_quantize_e2m1, scale_type="e4m3",
-        debug_name="E2M1 + E4M3 scale", debug=debug)
-
-def quant_dequant_e5m1_e8m0scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(5, 1),
-        quantize_fn=_quantize_e5m1, scale_type="e8m0",
-        debug_name="E5M1 + E8M0 scale", debug=debug)
-
-def quant_dequant_e4m1_e8m0scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(4, 1),
-        quantize_fn=_quantize_e4m1, scale_type="e8m0",
-        debug_name="E4M1 + E8M0 scale", debug=debug)
-
-def quant_dequant_e3m1_e8m0scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(3, 1),
-        quantize_fn=_quantize_e3m1, scale_type="e8m0",
-        debug_name="E3M1 + E8M0 scale", debug=debug)
-
-def quant_dequant_e2m1_e8m0scale(x, block_size=16, debug=False):
-    return quant_dequant_block(x, block_size, fp_max=fp_format_max(2, 1),
-        quantize_fn=_quantize_e2m1, scale_type="e8m0",
-        debug_name="E2M1 + E8M0 scale", debug=debug)
-
-
-# ============================================================
-# 误差统计 & 主测试
-# ============================================================
-
-def compute_metrics(x_orig, x_dq, name):
-    x32    = x_orig.float()
-    dq32   = x_dq.float()
-    ae     = (x32 - dq32).abs()
-    re     = ae / (x32.abs() + 1e-8)
-    snr    = 10 * torch.log10(x32.pow(2).mean() / (ae.pow(2).mean() + 1e-20))
-    rel_l2 = torch.norm(x32 - dq32) / (torch.norm(x32) + 1e-20)
-
-    print(f"\n{'=' * 58}")
-    print(f"  {name}")
-    print(f"{'=' * 58}")
-    print(f"  原始范围     : [{x32.min():.4f}, {x32.max():.4f}]")
-    print(f"  量化后范围   : [{dq32.min():.4f}, {dq32.max():.4f}]")
-    print(f"  MAE          : {ae.mean():.6f}")
-    print(f"  Max Abs Err  : {ae.max():.6f}")
-    print(f"  Mean Rel Err : {re.mean():.4%}")
-    print(f"  SNR          : {snr:.2f} dB")
-    print(f"  Rel_L2       : {rel_l2:.6f}")
-    return snr.item(), ae.mean().item(), rel_l2.item()
-
-
-def run_all_tests():
-    torch.manual_seed(42)
-    m, n = 32, 32
-    N = m * n
-    x = torch.cat([
-        torch.randn(N // 2) * 0.5,
-        torch.rand(N // 4)  * 4 - 2,
-        torch.randn(N // 4) * 5,
-    ]).reshape(m, n).bfloat16()
-
-    print(f"输入 Tensor: shape={x.shape}, dtype={x.dtype}")
-    print(f"值域: [{x.float().min():.4f}, {x.float().max():.4f}]")
-    print(f"均值: {x.float().mean():.4f}, 标准差: {x.float().std():.4f}")
+def run_exponent_bits_experiment() -> None:
+    x = make_test_tensor(32, 32)
+    print(f"Input: shape={x.shape}, dtype={x.dtype}")
+    print(f"Range: [{x.float().min():.4f}, {x.float().max():.4f}],"
+          f" std={x.float().std():.4f}")
 
     configs = [
-        ("E5M1         | E4M3 scale", lambda: quant_dequant_e5m1_e4m3scale(x, debug=True)),
-        ("E4M1         | E4M3 scale", lambda: quant_dequant_e4m1_e4m3scale(x, debug=True)),
-        ("E3M1         | E4M3 scale", lambda: quant_dequant_e3m1_e4m3scale(x, debug=True)),
-        ("E2M1         | E4M3 scale", lambda: quant_dequant_e2m1_e4m3scale(x, debug=True)),
-        ("E5M1         | E8M0 scale", lambda: quant_dequant_e5m1_e8m0scale(x, debug=True)),
-        ("E4M1         | E8M0 scale", lambda: quant_dequant_e4m1_e8m0scale(x, debug=True)),
-        ("E3M1         | E8M0 scale", lambda: quant_dequant_e3m1_e8m0scale(x, debug=True)),
-        ("E2M1         | E8M0 scale", lambda: quant_dequant_e2m1_e8m0scale(x, debug=True)),
+        ("E5M1 | E4M3", lambda: quant_dequant_block(x, 16, fp_format_max(5, 1), _quantize_e5m1, "e4m3")),
+        ("E4M1 | E4M3", lambda: quant_dequant_block(x, 16, fp_format_max(4, 1), _quantize_e4m1, "e4m3")),
+        ("E3M1 | E4M3", lambda: quant_dequant_block(x, 16, fp_format_max(3, 1), _quantize_e3m1, "e4m3")),
+        ("E2M1 | E4M3", lambda: quant_dequant_block(x, 16, fp_format_max(2, 1), _quantize_e2m1, "e4m3")),
+        ("E5M1 | E8M0", lambda: quant_dequant_block(x, 16, fp_format_max(5, 1), _quantize_e5m1, "e8m0")),
+        ("E4M1 | E8M0", lambda: quant_dequant_block(x, 16, fp_format_max(4, 1), _quantize_e4m1, "e8m0")),
+        ("E3M1 | E8M0", lambda: quant_dequant_block(x, 16, fp_format_max(3, 1), _quantize_e3m1, "e8m0")),
+        ("E2M1 | E8M0", lambda: quant_dequant_block(x, 16, fp_format_max(2, 1), _quantize_e2m1, "e8m0")),
     ]
 
     results = {}
     for name, fn in configs:
-        xq = fn()
-        snr, mae, rel_l2 = compute_metrics(x, xq, name)
-        results[name] = (snr, mae, rel_l2)
-
-    print(f"\n{'=' * 65}")
-    print(f"  {'格式 + Scale':<38} {'MAE':>9} {'SNR(dB)':>9} {'Rel_L2':>10}")
-    print(f"  {'-' * 70}")
-    for name, (snr, mae, rel_l2) in results.items():
-        print(f"  {name:<38} {mae:>9.6f} {snr:>9.2f} {rel_l2:>10.6f}")
-    print()
+        results[name] = print_metrics(name, x, fn())
+    print_summary_table(results)
 
 
 if __name__ == "__main__":
-    run_all_tests()
+    run_exponent_bits_experiment()

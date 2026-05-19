@@ -192,6 +192,13 @@ def build_grouped_compile_cache_key(
     alpha_modes: Optional[Tuple[int, ...]] = None,
     host_problem_shape_available: bool = True,
 ) -> Tuple[Any, ...]:
+    if host_problem_shape_available:
+        # Exact M baked into kernel via total_num_clusters; each distinct M set compiles separately.
+        shape_key: tuple = tuple(tuple(ps) for ps in problem_sizes)
+    else:
+        # Persistent kernel: total_num_clusters = max_active_clusters.
+        # M, N, K are all runtime values (problem_shape_mnkl tensor); no shape affects compilation.
+        shape_key = ()
     return (
         _CACHE_VERSION,
         variant,
@@ -199,7 +206,7 @@ def build_grouped_compile_cache_key(
         profile_name,
         profile_cfg_cache_tuple(profile_cfg),
         int(num_groups),
-        tuple(tuple(ps) for ps in problem_sizes),
+        shape_key,
         str(out_dtype),
         alpha_modes if alpha_modes is not None else ("no_alpha",),
         bool(host_problem_shape_available),

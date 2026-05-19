@@ -210,7 +210,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 )
                 quantize_tensor_list.append(w_quantizer_fp4.quantize(x[i]))
                 if return_transpose:
-                    w_quantizer_fp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
+                    w_quantizer_fp8 = MXFP8Quantizer(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
                     quantize_tensor_list_transpose.append(w_quantizer_fp8.quantize(x[i]))
 
             return GroupQuantizeResult(
@@ -244,7 +244,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             quantizers = []
             for i in range(num_gemms):
                 x_quantizer = MXFP8Quantizer(
-                    rowwise=True,
+                    rowwise=False,
                     columnwise=return_transpose,
                     fp8_dtype=tex.DType.kFloat8E4M3
                 )
@@ -355,7 +355,6 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             A=B,
             B=A,
             out=out,
-            quantization_params=[None] * len(B),
             out_dtype=activation_dtype,
             layout=layout,
             m_splits=m_splits,

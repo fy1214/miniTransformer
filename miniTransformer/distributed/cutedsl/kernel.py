@@ -115,8 +115,8 @@ def _spin_lock_atom_cas_acquire_wait_sys(
             T.i32(),
             AtomicOpKind.CAS,
             lock_ptr.llvm_ptr,
-            Int32(reset_val).ir_value(loc=loc, ip=ip),
-            b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+            Int32(expected_val).ir_value(loc=loc, ip=ip),
+            b=Int32(reset_val).ir_value(loc=loc, ip=ip),
             mem_order=MemOrderKind.ACQUIRE,
             syncscope=MemScopeKind.SYS,
             loc=loc,
@@ -1228,10 +1228,11 @@ class PersistentDenseGemmKernel:
                     if warp_idx == self.all_reduce_warp_id[0]:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
-                            _spin_lock_atom_cas_acquire_wait_sys(
+                            utils.distributed.spin_lock_atom_cas_relaxed_wait(
                                 lock_ptr=flag,
                                 expected_val=num_ranks,
                                 reset_val=0,
+                                scope="gpu",
                             )
 
                     self.all_reduce_sync_barrier.arrive_and_wait()

@@ -6,7 +6,6 @@ import pathlib
 import subprocess
 import setuptools
 from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
@@ -34,6 +33,11 @@ def cuda_version() -> tuple[int, ...]:
 
 
 def build_extensions() -> list[setuptools.Extension]:
+    try:
+        from torch.utils.cpp_extension import CUDAExtension
+    except ImportError:
+        return []
+
     debug_mode = os.getenv("DEBUG", "0") == "1"
     opt_flag = "-O0" if debug_mode else "-O3"
 
@@ -99,6 +103,14 @@ def build_extensions() -> list[setuptools.Extension]:
     )]
 
 
+def get_cmdclass() -> dict:
+    try:
+        from torch.utils.cpp_extension import BuildExtension
+        return {"build_ext": BuildExtension}
+    except ImportError:
+        return {}
+
+
 def get_requirements() -> list[str]:
     req_file = ROOT_DIR / "requirement.txt"
     reqs = ["torch"]
@@ -117,5 +129,5 @@ setup(
     packages=setuptools.find_packages(exclude=["tests*", "doc*"]),
     install_requires=get_requirements(),
     ext_modules=build_extensions(),
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass=get_cmdclass(),
 )

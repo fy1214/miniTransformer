@@ -1336,10 +1336,11 @@ class PersistentDenseGemmKernel:
                             scope="sys",
                             order="release",
                         )
+                        # fence_proxy(alias): commit the NVLS proxy write to DRAM so
+                        # the subsequent normal-path relaxed CAS can see the flag increment.
+                        # Same fix as tile-level flags in epilogue_release_flag.
+                        cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
                         # Relaxed spin-lock wait flag with sys scope
-                        # TODO: upgrade to acquire semantics + fence_proxy("alias")
-                        # to remove the Python-side dist.barrier() requirement.
-                        # Reference: FlashInfer PR #2171
                         utils.distributed.spin_lock_atom_cas_relaxed_wait(
                             lock_ptr=barrier_flag.iterator
                             + last_tile_id_linear

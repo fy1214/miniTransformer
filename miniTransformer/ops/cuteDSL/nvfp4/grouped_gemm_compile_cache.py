@@ -16,7 +16,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -31,8 +31,6 @@ from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-GroupedGemmAlpha = Union[float, int, torch.Tensor]
 
 # Bump when compile cache key semantics change (invalidates old on-disk blobs).
 _CACHE_VERSION = "grouped_blockscaled_v2"
@@ -159,27 +157,6 @@ def profile_cfg_cache_tuple(profile_cfg: Any) -> Tuple[Any, ...]:
     )
 
 
-def infer_alpha_modes(
-    alphas: Optional[List[GroupedGemmAlpha]],
-    problem_sizes: List[Tuple[int, int, int, int]],
-) -> Tuple[int, ...]:
-    """Per-group alpha epilogue mode: 0=scalar, 1=row [M]."""
-    modes: List[int] = []
-    for i, (m, _n, _k, _l) in enumerate(problem_sizes):
-        if alphas is None:
-            modes.append(0)
-            continue
-        alpha = alphas[i]
-        if isinstance(alpha, (float, int)):
-            modes.append(0)
-            continue
-        if isinstance(alpha, torch.Tensor) and (alpha.ndim == 0 or alpha.numel() == 1):
-            modes.append(0)
-            continue
-        modes.append(1)
-    return tuple(modes)
-
-
 def build_grouped_compile_cache_key(
     *,
     variant: str,
@@ -189,7 +166,6 @@ def build_grouped_compile_cache_key(
     num_groups: int,
     problem_sizes: List[Tuple[int, int, int, int]],
     out_dtype: torch.dtype,
-    alpha_modes: Optional[Tuple[int, ...]] = None,
     host_problem_shape_available: bool = True,
 ) -> Tuple[Any, ...]:
     if host_problem_shape_available:
@@ -208,7 +184,6 @@ def build_grouped_compile_cache_key(
         int(num_groups),
         shape_key,
         str(out_dtype),
-        alpha_modes if alpha_modes is not None else ("no_alpha",),
         bool(host_problem_shape_available),
     )
 

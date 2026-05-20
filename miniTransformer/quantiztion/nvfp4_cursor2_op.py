@@ -330,9 +330,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if grad:
             if layout == "NN":
                 if is_te_quantized:
-                    n_cols = B[0]._rowwise_data.size(1)
+                    n_cols = B[0]._columnwise_data.size(0)
                 else:
-                    n_cols = B[0].size(1)
+                    n_cols = B[0]._columnwise_data.size(0)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
@@ -341,9 +341,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 out = [out]
         else:
             if is_te_quantized:
-                n_cols = B[0]._columnwise_data.size(1)
+                n_cols = B[0]._rowwise_data.size(0)
             else:
-                n_cols = B[0].size(1)
+                n_cols = B[0].size(0)
             out = torch.empty(
                 [sum(m_splits), n_cols],
                 dtype=activation_dtype,

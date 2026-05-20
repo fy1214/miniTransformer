@@ -1149,7 +1149,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             strides_abc,
             tensor_address_abc,
             tensor_address_sfasfb,
-            tensor_alpha_ptrs,
+            tensor_alpha_buf,
             tensormap_cute_tensor,
         ).launch(
             grid=grid,
@@ -1190,7 +1190,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         strides_abc: cute.Tensor,
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
-        alpha_ptrs: cute.Tensor,
+        alpha_buf: cute.Tensor,
         tensormaps: cute.Tensor,
     ):
         """

@@ -12,10 +12,14 @@ _FP4_E2M1_MAX = 6.0
 _MX_E2M1_POS = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
+_MX_E2M1_POS_CACHE: dict = {}
 
 
 def mx_e2m1_quantize(x: torch.Tensor) -> torch.Tensor:
-    pos_vals = _MX_E2M1_POS.to(x.device)
+    device = x.device
+    if device not in _MX_E2M1_POS_CACHE:
+        _MX_E2M1_POS_CACHE[device] = _MX_E2M1_POS.to(device)
+    pos_vals = _MX_E2M1_POS_CACHE[device]
     x32 = x.float()
     sign = torch.sign(x32)
     sign = torch.where(x32 == 0, torch.ones_like(sign), sign)

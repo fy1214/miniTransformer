@@ -245,7 +245,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             for i in range(num_gemms):
                 x_quantizer = MXFP8Quantizer(
                     rowwise=False,
-                    columnwise=return_transpose,
+                    columnwise=True,
                     fp8_dtype=tex.DType.kFloat8E4M3
                 )
                 quantizers.append(x_quantizer)

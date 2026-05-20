@@ -163,47 +163,40 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"    TFLOPS      : {tflops_val:.2f}")
 
     # ------------------------------------------------------------------
-    # 3b. Python dispatch overhead per single call
+    # 4. Steady-state wall time (full call, all caches warm)
     # ------------------------------------------------------------------
-    t_single = wall_time_ms(lambda: kernel.run_from_grouped_inputs(
-        abc_tensors=abc, sfasfb_tensors=sfasfb,
-        problem_sizes=problem_sizes,
-        out_dtype=torch.bfloat16,
-        iterations=0,
-    ))
-    print(f"\n[3b] Single Python call overhead")
-    print(f"    Wall time       : {t_single:.1f} ms")
-    print(f"    Python overhead : ~{t_single - t_exec:.1f} ms  (wall - kernel)")
+    STEADY_WARMUP  = 10
+    STEADY_MEASURE = 50
 
-    # ------------------------------------------------------------------
-    # 4. _pack_alpha_buf micro-benchmark
-    # ------------------------------------------------------------------
-    print("\n[4] _pack_alpha_buf micro-benchmark")
-    ALPHA_WARMUP  = 20
-    ALPHA_MEASURE = 200
+    def full_call():
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
+            problem_sizes=problem_sizes,
+            out_dtype=torch.bfloat16,
+        )
 
-    for G in [8, 32, 64]:
-        ms = [128 * (i % 8 + 1) for i in range(G)]
-        alphas_row = [torch.ones(m, device="cuda", dtype=torch.float32) for m in ms]
-        torch.cuda.synchronize()
-        for _ in range(ALPHA_WARMUP):
-            Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas_row, torch.device("cuda"))
-            torch.cuda.synchronize()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(ALPHA_MEASURE):
-            Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas_row, torch.device("cuda"))
-            torch.cuda.synchronize()
-        us = (time.perf_counter() - t0) / ALPHA_MEASURE * 1e6
-        print(f"    G={G:<3}  {us:.1f} µs")
+    for _ in range(STEADY_WARMUP):
+        full_call()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(STEADY_MEASURE):
+        full_call()
+    torch.cuda.synchronize()
+    t_steady_us = (time.perf_counter() - t0) / STEADY_MEASURE * 1e6
+
+    print(f"\n[4] Steady-state full call (warmup={STEADY_WARMUP}, iters={STEADY_MEASURE})")
+    print(f"    Wall time (mean) : {t_steady_us:.1f} µs")
+    print(f"    GPU kernel       : {t_exec*1e3:.1f} µs")
+    print(f"    Python overhead  : ~{t_steady_us - t_exec*1e3:.1f} µs")
 
     sep()
     print("Summary")
     sep("-")
-    print(f"  Compilation (scalar alpha)   : ~{t_first - t_second:.0f} ms  (one-time per shape)")
-    print(f"  GPU kernel                   : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
-    print(f"  Python dispatch per call     : ~{t_single:.0f} ms")
-    print(f"  => GPU kernel is the bottleneck at steady state")
+    print(f"  Compilation          : ~{t_first - t_second:.0f} ms  (one-time per shape)")
+    print(f"  GPU kernel           : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
+    print(f"  Steady-state (full)  : {t_steady_us:.1f} µs")
+    print(f"  Python overhead      : ~{t_steady_us - t_exec*1e3:.1f} µs")
     sep()
 
 

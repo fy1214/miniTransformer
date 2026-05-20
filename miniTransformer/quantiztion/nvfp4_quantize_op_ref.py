@@ -76,34 +76,6 @@ def cast_to_fp4x2(x):
 
 
 def cast_from_fp4x2(x, dq_dtype):
-    # 解包 fp4x2 -> 两个 fp4
-    second_bit = torch.div(x, 16, rounding_mode="floor").to(torch.long)
-    first_bit  = (x - second_bit * 16).to(torch.long)
-    def fp4_to_float(v):
-        # v: int tensor, value in [0, 15]
-        sign = (v >> 3) & 1          # 1 bit
-        exp  = (v >> 1) & 0x3        # 2 bits
-        mant = v & 1                 # 1 bit
-        # exp == 0: subnormal, value = (-1)^sign * 0.5 * (0 + mant*0.5) = mant * 0.25
-        # exp != 0: normal,    value = (-1)^sign * 2^(exp-1) * (1 + mant*0.5)
-        normal_val   = (1.0 + mant * 0.5) * (2.0 ** (exp.float() - 1))
-        subnormal_val = mant * 0.25
-        val = torch.where(exp == 0, subnormal_val.to(dq_dtype), normal_val.to(dq_dtype))
-        val = torch.where(sign == 1, -val, val)
-        return val
-    first_bit_values  = fp4_to_float(first_bit)
-    second_bit_values = fp4_to_float(second_bit)
-    result = torch.zeros(
-        (x.shape[0], x.shape[1] * 2),
-        device=x.device,
-        dtype=dq_dtype,
-    )
-    result[:, ::2]  = first_bit_values
-    result[:, 1::2] = second_bit_values
-    return result
-
-'''
-def cast_from_fp4x2(x, dq_dtype):
     """Dequantize FP4 E2M1 tensor that has been represented in a byte tensor"""
     fp4_values = torch.tensor(
         [
@@ -145,7 +117,7 @@ def cast_from_fp4x2(x, dq_dtype):
     result[:, 1::2] = second_bit_values
 
     return result
-'''
+
 
 def high_precision_gemm_ref(
     a: torch.Tensor,

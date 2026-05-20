@@ -76,7 +76,7 @@ def _fp4_nibble_to_float(v: torch.Tensor, dq_dtype: torch.dtype) -> torch.Tensor
     exp = (v >> 1) & 0x3
     mant = v & 1
     normal_val = (1.0 + mant * 0.5) * (2.0 ** (exp.float() - 1))
-    subnormal_val = mant * 0.25
+    subnormal_val = mant * 0.5
     val = torch.where(exp == 0, subnormal_val.to(dq_dtype), normal_val.to(dq_dtype))
     val = torch.where(sign == 1, -val, val)
     return val

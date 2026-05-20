@@ -102,6 +102,7 @@ def _run_grouped_gemm_cached(
         accumulate=False,
         alphas=alphas,
         iterations=0,
+        host_problem_shape_available=False,
     )
 
 

@@ -286,7 +286,6 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             A=B,
             B=A,
             out=out,
-            quantization_params=[None] * len(B),
             out_dtype=activation_dtype,
             layout=layout,
             m_splits=m_splits,

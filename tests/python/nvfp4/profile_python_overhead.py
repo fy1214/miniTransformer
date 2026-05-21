@@ -404,25 +404,29 @@ def main():
 
     # ------------------------------------------------------------------ #
     # Path B: alphas_packed  (per-token, real forward path)
+    # Wall time only covers run_from_grouped_inputs (ap pre-built outside loop)
     # ------------------------------------------------------------------ #
-    def prod_call_packed():
-        ap = _build_alphas_packed(problem_sizes, device)
-        kernel.run_from_grouped_inputs(
-            abc_tensors=abc, sfasfb_tensors=sfasfb,
-            problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
-            alphas_packed=ap,
-            iterations=0,
-        )
 
+    # Warmup with pre-built ap
     for _ in range(WARMUP):
         ap = _build_alphas_packed(problem_sizes, device)
         kernel.run_instrumented(abc, sfasfb, problem_sizes, alphas_packed=ap)
-        prod_call_packed()
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
+            problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
+            alphas_packed=ap, iterations=0,
+        )
 
+    # Measure run_from_grouped_inputs only (ap pre-built, not counted)
+    ap = _build_alphas_packed(problem_sizes, device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(MEASURE):
-        prod_call_packed()
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
+            problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
+            alphas_packed=ap, iterations=0,
+        )
     torch.cuda.synchronize()
     wall_packed = (time.perf_counter() - t0) / MEASURE * 1e6
 
@@ -433,11 +437,21 @@ def main():
         for k, v in t.items():
             accum_packed[k] += v
 
+    # Measure _build_alphas_packed separately (constructor cost, not kernel cost)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        _build_alphas_packed(problem_sizes, device)
+    torch.cuda.synchronize()
+    wall_build_us = (time.perf_counter() - t0) / MEASURE * 1e6
+
     # ------------------------------------------------------------------ #
     # Print
     # ------------------------------------------------------------------ #
     _print_breakdown("=== Path A: alphas=None (all-ones cached) ===", wall_none, accum_none)
     _print_breakdown("=== Path B: alphas_packed (per-token forward) ===", wall_packed, accum_packed)
+    print(f"\n  _build_alphas_packed() (caller side, not kernel): {wall_build_us:.1f} µs")
+    print(f"  Path B total (build + kernel):                    {wall_build_us + wall_packed:.1f} µs")
 
 
 if __name__ == "__main__":

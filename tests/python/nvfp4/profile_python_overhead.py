@@ -370,6 +370,7 @@ def main():
     kernel.run_from_grouped_inputs(
         abc_tensors=abc, sfasfb_tensors=sfasfb,
         problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
+        host_problem_shape_available=False,
     )
     print("Done. Warming up...")
 
@@ -382,7 +383,7 @@ def main():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
-            iterations=0,
+            iterations=0, host_problem_shape_available=False,
         )
 
     for _ in range(WARMUP):
@@ -414,7 +415,7 @@ def main():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
-            alphas_packed=ap, iterations=0,
+            alphas_packed=ap, iterations=0, host_problem_shape_available=False,
         )
 
     # Measure run_from_grouped_inputs only (ap pre-built, not counted)
@@ -425,7 +426,7 @@ def main():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
-            alphas_packed=ap, iterations=0,
+            alphas_packed=ap, iterations=0, host_problem_shape_available=False,
         )
     torch.cuda.synchronize()
     wall_packed = (time.perf_counter() - t0) / MEASURE * 1e6

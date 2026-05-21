@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import fp4_gemm
 from typing import Optional, List, Tuple, Union
@@ -23,6 +24,11 @@ use_cpp_allocator = False
 # Set to 0 to disable entirely (zero overhead on non-printing iterations).
 _GEMM_TIMING_INTERVAL: int = 50
 _GEMM_CALL_COUNT: int = 0
+
+# Capture one torch.profiler trace at this call index (0 = first call).
+# Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
+_GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
+_GEMM_PROFILED: bool = False
 
 
 def _is_sm100() -> bool:
@@ -53,25 +59,61 @@ def _grouped_gemm_cutedsl_pertoken(
     )
     import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
     import time
-    global _GEMM_CALL_COUNT
+    global _GEMM_CALL_COUNT, _GEMM_PROFILED
 
-    if _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0:
+    do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
+    do_profile = (
+        not _GEMM_PROFILED
+        and _GEMM_PROFILE_AT >= 0
+        and _GEMM_CALL_COUNT == _GEMM_PROFILE_AT
+    )
+
+    if do_profile:
+        profile_dir = os.environ.get("NVFP4_PROFILE_DIR", "/tmp")
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        trace_path = os.path.join(profile_dir, f"nvfp4_gemm_rank{rank}_call{_GEMM_CALL_COUNT}")
+        print(f"[GEMM #{_GEMM_CALL_COUNT:5d}] capturing torch.profiler trace → {trace_path}")
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+        )
+        prof.__enter__()
+
+    if do_timing:
         _impl._timing_enabled = True
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    if do_timing:
         torch.cuda.synchronize()
         t_us = (time.perf_counter() - t0) * 1e6
         _impl._timing_enabled = False
         t = _impl._last_timing_us
         print(
-            f"[GEMM #{_GEMM_CALL_COUNT:5d}] "
-            f"total={t_us:6.1f} µs | "
-            f"alpha_build={t.get('alpha_build_us', float('nan')):5.1f} µs | "
-            f"kernel_dispatch={t.get('kernel_dispatch_us', float('nan')):5.1f} µs"
+            f"[GEMM #{_GEMM_CALL_COUNT:5d}] total={t_us:8.1f} µs\n"
+            f"  loop={t.get('loop_us', float('nan')):8.1f} µs"
+            f"  | make_fp4={t.get('make_fp4_us', float('nan')):7.1f} µs"
+            f"  | block_scale_fp8={t.get('block_scale_fp8_us', float('nan')):7.1f} µs\n"
+            f"  sfa_d2h={t.get('make_cute_sf_d2h_us', float('nan')):7.1f} µs"
+            f"  | sfa_cvt={t.get('make_cute_sf_cvt_us', float('nan')):7.1f} µs"
+            f"  (alloc={t.get('create_sf_alloc_us', float('nan')):6.1f} µs"
+            f"  cvt_jit={t.get('create_sf_cvt_jit_us', float('nan')):6.1f} µs"
+            f"  h2d={t.get('create_sf_h2d_us', float('nan')):6.1f} µs)\n"
+            f"  alpha_build={t.get('alpha_build_us', float('nan')):7.1f} µs"
+            f"  | kernel_dispatch={t.get('kernel_dispatch_us', float('nan')):7.1f} µs"
         )
-    else:
-        res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    if do_profile:
+        prof.__exit__(None, None, None)
+        prof.export_chrome_trace(trace_path + ".json")
+        print(f"[GEMM #{_GEMM_CALL_COUNT:5d}] trace saved to {trace_path}.json")
+        _GEMM_PROFILED = True
 
     _GEMM_CALL_COUNT += 1
     return res
@@ -258,12 +300,11 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 PertokenNvfp4Tensor(
                     data_uint8=d,
                     block_scale=bs,
-                    global_scale=gs,
+                    global_scale_full=qresult_full.global_scale,
                 )
-                for d, bs, gs in zip(
+                for d, bs in zip(
                     torch.split(qresult_full.data_uint8, m_splits, dim=0),
                     torch.split(qresult_full.block_scale, m_splits, dim=0),
-                    torch.split(qresult_full.global_scale, m_splits, dim=0),
                 )
             ]
 

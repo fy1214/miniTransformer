@@ -426,6 +426,10 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     """
     Create the CUTE-format scale factor tensor on CUDA from ref (mn, sf_k, l).
     """
+    import time as _t
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        _timing_enabled, _last_timing_us,
+    )
     atom_m = (32, 4)
     atom_k = 4
     mma_shape = (
@@ -438,9 +442,15 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     )
     # ref_f8_torch_tensor_cpu_permuted: (mn//128, sf_k//4, 32, 16, 1)
     mma_permute_order = (3, 4, 1, 5, 2, 0) # (32, 4, mn/128, 4, sf_k/4, 1)
+    if _timing_enabled:
+        _t0 = _t.perf_counter()
     rand_int_tensor = torch.randint(0, 2, mma_shape, dtype=torch.int8)
     cute_f8_torch_tensor_cpu = rand_int_tensor.to(dtype=torch.float8_e4m3fn)
     cute_f8_torch_tensor_cpu = cute_f8_torch_tensor_cpu.permute(*mma_permute_order)
+    if _timing_enabled:
+        _last_timing_us.setdefault("create_sf_alloc_us", 0.0)
+        _last_timing_us["create_sf_alloc_us"] += (_t.perf_counter() - _t0) * 1e6
+        _t0 = _t.perf_counter()
     cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         make_ptr(
             cutlass.Float8E4M3FN,
@@ -459,7 +469,15 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
         l,
         mma_shape,
     )
-    return cute_f8_torch_tensor_cpu.cuda()
+    if _timing_enabled:
+        _last_timing_us.setdefault("create_sf_cvt_jit_us", 0.0)
+        _last_timing_us["create_sf_cvt_jit_us"] += (_t.perf_counter() - _t0) * 1e6
+        _t0 = _t.perf_counter()
+    result = cute_f8_torch_tensor_cpu.cuda()
+    if _timing_enabled:
+        _last_timing_us.setdefault("create_sf_h2d_us", 0.0)
+        _last_timing_us["create_sf_h2d_us"] += (_t.perf_counter() - _t0) * 1e6
+    return result
 
 
 def cutedsl_nvfp4_gemm_optimized(

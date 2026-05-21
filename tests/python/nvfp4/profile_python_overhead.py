@@ -339,13 +339,20 @@ def _print_breakdown(title, wall_us, accum):
     print(f"  {'TOTAL (wall)':<36}  {wall_us:>8.1f}  {'100.0':>6}%")
 
 
-def _build_alphas_packed(problem_sizes, device):
-    """Simulate what grouped_gemm_cutedsl_pertoken builds each call."""
+def _build_alphas_packed(problem_sizes, device, global_scale_views=None):
+    """Simulate what grouped_gemm_cutedsl_pertoken builds each call.
+
+    global_scale_views: list of pre-allocated GPU tensors (like act.global_scale).
+    If None, falls back to torch.rand (NOT representative of production).
+    """
     alpha_b_per_group = [0.01] * len(problem_sizes)  # dummy scalar per group
-    global_scales = torch.cat([
-        torch.rand(m, dtype=torch.float32, device=device)
-        for m, *_ in problem_sizes
-    ])
+    if global_scale_views is not None:
+        global_scales = torch.cat([g.float() for g in global_scale_views])
+    else:
+        global_scales = torch.cat([
+            torch.rand(m, dtype=torch.float32, device=device)
+            for m, *_ in problem_sizes
+        ])
     alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
     active_m = [ps[0] for ps in problem_sizes]
     repeats = torch.tensor(active_m, dtype=torch.int64, device=device)
@@ -375,6 +382,13 @@ def main():
     print("Done. Warming up...")
 
     device = abc["torch"][0][0].device
+
+    # Pre-allocated global_scale views — matches act.global_scale in production
+    # (a view into an existing GPU tensor, not torch.rand).
+    gs_views = [
+        torch.empty(m, dtype=torch.float32, device=device)
+        for m, *_ in problem_sizes
+    ]
 
     # ------------------------------------------------------------------ #
     # Path A: alphas=None  (all-ones, fully cached)
@@ -410,7 +424,7 @@ def main():
 
     # Warmup with pre-built ap
     for _ in range(WARMUP):
-        ap = _build_alphas_packed(problem_sizes, device)
+        ap = _build_alphas_packed(problem_sizes, device, gs_views)
         kernel.run_instrumented(abc, sfasfb, problem_sizes, alphas_packed=ap)
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
@@ -419,7 +433,7 @@ def main():
         )
 
     # Measure run_from_grouped_inputs only (ap pre-built, not counted)
-    ap = _build_alphas_packed(problem_sizes, device)
+    ap = _build_alphas_packed(problem_sizes, device, gs_views)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(MEASURE):
@@ -433,26 +447,107 @@ def main():
 
     accum_packed = defaultdict(float)
     for _ in range(MEASURE):
-        ap = _build_alphas_packed(problem_sizes, device)
+        ap = _build_alphas_packed(problem_sizes, device, gs_views)
         t = kernel.run_instrumented(abc, sfasfb, problem_sizes, alphas_packed=ap)
         for k, v in t.items():
             accum_packed[k] += v
 
     # Measure _build_alphas_packed separately (constructor cost, not kernel cost)
+    # With gs_views (realistic) and without (torch.rand, inflated).
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        _build_alphas_packed(problem_sizes, device, gs_views)
+    torch.cuda.synchronize()
+    wall_build_realistic_us = (time.perf_counter() - t0) / MEASURE * 1e6
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(MEASURE):
         _build_alphas_packed(problem_sizes, device)
     torch.cuda.synchronize()
-    wall_build_us = (time.perf_counter() - t0) / MEASURE * 1e6
+    wall_build_rand_us = (time.perf_counter() - t0) / MEASURE * 1e6
 
     # ------------------------------------------------------------------ #
     # Print
     # ------------------------------------------------------------------ #
     _print_breakdown("=== Path A: alphas=None (all-ones cached) ===", wall_none, accum_none)
     _print_breakdown("=== Path B: alphas_packed (per-token forward) ===", wall_packed, accum_packed)
-    print(f"\n  _build_alphas_packed() (caller side, not kernel): {wall_build_us:.1f} µs")
-    print(f"  Path B total (build + kernel):                    {wall_build_us + wall_packed:.1f} µs")
+    print(f"\n  alpha_build (realistic, torch.cat of existing tensors): {wall_build_realistic_us:.1f} µs")
+    print(f"  alpha_build (torch.rand, NOT representative):           {wall_build_rand_us:.1f} µs")
+    print(f"  Path B total (realistic build + kernel):                {wall_build_realistic_us + wall_packed:.1f} µs")
+
+    # ------------------------------------------------------------------ #
+    # Path C: real production inputs via grouped_gemm_cutedsl_pertoken
+    # PertokenNvfp4Tensor activation + TensorGlobalNvfp4Tensor weights,
+    # mirroring the nvfp4_cursor2_op.grouped_gemm forward path.
+    # ------------------------------------------------------------------ #
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        quantize_activation_nvfp4_pertoken,
+        quantize_weight_nvfp4_tensor_global,
+        PertokenNvfp4Tensor,
+        grouped_gemm_cutedsl_pertoken as _prod_gemm,
+    )
+    import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
+
+    m_splits_c = [ps[0] for ps in problem_sizes]
+    M_TOTAL_C = sum(m_splits_c)
+    N_C, K_C = problem_sizes[0][1], problem_sizes[0][2]
+
+    print("\nPath C: pre-quantizing weights (one-time)...")
+    weight_list = [
+        quantize_weight_nvfp4_tensor_global(
+            torch.randn(N_C, K_C, dtype=torch.bfloat16, device=device)
+        ).precompute_cute_tensors()
+        for _ in problem_sizes
+    ]
+
+    def build_act_list():
+        """Mirror group_quantize(X): quantize full [M_total, K] then split."""
+        x = torch.randn(M_TOTAL_C, K_C, dtype=torch.bfloat16, device=device)
+        qr = quantize_activation_nvfp4_pertoken(x)
+        return [
+            PertokenNvfp4Tensor(d, bs, global_scale_full=qr.global_scale)
+            for d, bs in zip(
+                torch.split(qr.data_uint8, m_splits_c, dim=0),
+                torch.split(qr.block_scale, m_splits_c, dim=0),
+            )
+        ]
+
+    for _ in range(WARMUP):
+        _prod_gemm(build_act_list(), weight_list, m_splits_c, torch.bfloat16)
+
+    # Wall time: GEMM only (act pre-built, same convention as Path B)
+    act_list = build_act_list()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        _prod_gemm(act_list, weight_list, m_splits_c, torch.bfloat16)
+    torch.cuda.synchronize()
+    wall_c_gemm_us = (time.perf_counter() - t0) / MEASURE * 1e6
+
+    # Wall time: activation quantization only
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        build_act_list()
+    torch.cuda.synchronize()
+    wall_c_quant_us = (time.perf_counter() - t0) / MEASURE * 1e6
+
+    # Single-call breakdown via impl timing flags
+    _impl._timing_enabled = True
+    _impl._last_timing_us.clear()
+    _prod_gemm(build_act_list(), weight_list, m_splits_c, torch.bfloat16)
+    _impl._timing_enabled = False
+    alpha_build_us = _impl._last_timing_us.get("alpha_build_us", float("nan"))
+    kernel_dispatch_us = _impl._last_timing_us.get("kernel_dispatch_us", float("nan"))
+
+    print(f"\n=== Path C: grouped_gemm_cutedsl_pertoken (production inputs) ===")
+    print(f"  GEMM wall time (act pre-built): {wall_c_gemm_us:.1f} µs")
+    print(f"    alpha_build_us:               {alpha_build_us:.1f} µs")
+    print(f"    kernel_dispatch_us:           {kernel_dispatch_us:.1f} µs")
+    print(f"  Activation quantization only:   {wall_c_quant_us:.1f} µs")
+    print(f"  Full step (quant + GEMM):        {wall_c_quant_us + wall_c_gemm_us:.1f} µs")
 
 
 if __name__ == "__main__":

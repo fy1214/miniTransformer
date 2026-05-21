@@ -425,9 +425,21 @@ def create_ref_scale_factor_tensor(l, mn, sf_k):
     return ref_f8_torch_tensor_cpu_permuted
 
 
+# Per-process caches for CPU buffers used in scale-factor format conversion.
+# Keyed on (mn_padded, sf_k, l) so that buffers are reused across calls with the same
+# padded shape — eliminates repeated torch.empty / torch.randint allocation overhead.
+_CPU_SF_OUT_BUF: dict = {}  # output tensor in MMA-tiled layout (written by conversion kernel)
+_CPU_SF_REF_BUF: dict = {}  # input  tensor in row-major layout  (read   by conversion kernel)
+
+
 def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permuted):
     """
     Create the CUTE-format scale factor tensor on CUDA from ref (mn, sf_k, l).
+
+    mn is rounded up to the next multiple of 128 (atom_rows) before compilation so
+    that continuously-varying token counts (RL training) map to a small number of
+    unique compile targets instead of one per distinct token count.  The GEMM kernel
+    only accesses the first mn rows of the output, so the extra padded rows are safe.
     """
     import time as _t
     from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
@@ -435,28 +447,52 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
     )
     atom_m = (32, 4)
     atom_k = 4
+    atom_rows = atom_m[0] * atom_m[1]  # 128
+
+    # Round mn up to a multiple of atom_rows to minimise unique JIT compile targets.
+    mn_padded = ((mn + atom_rows - 1) // atom_rows) * atom_rows
+
     mma_shape = (
         l,
-        ceil_div(mn, atom_m[0] * atom_m[1]),
+        mn_padded // atom_rows,   # exact integer after padding
         ceil_div(sf_k, atom_k),
         atom_m[0],
         atom_m[1],
         atom_k,
     )
-    # ref_f8_torch_tensor_cpu_permuted: (mn//128, sf_k//4, 32, 16, 1)
-    mma_permute_order = (3, 4, 1, 5, 2, 0) # (32, 4, mn/128, 4, sf_k/4, 1)
+    mma_permute_order = (3, 4, 1, 5, 2, 0)
+
     if _timing_enabled:
         _t0 = _t.perf_counter()
-    rand_int_tensor = torch.randint(0, 2, mma_shape, dtype=torch.int8)
-    cute_f8_torch_tensor_cpu = rand_int_tensor.to(dtype=torch.float8_e4m3fn)
-    cute_f8_torch_tensor_cpu = cute_f8_torch_tensor_cpu.permute(*mma_permute_order)
+
+    _buf_key = (mn_padded, sf_k, l)
+    if _buf_key not in _CPU_SF_OUT_BUF:
+        # Allocate once; the conversion kernel overwrites every element so there is no
+        # need to initialise with random values (torch.randint was wasted work).
+        _CPU_SF_OUT_BUF[_buf_key] = (
+            torch.empty(mma_shape, dtype=torch.float8_e4m3fn).permute(*mma_permute_order)
+        )
+        # Row-major (mn_padded, sf_k, l) ref buffer; extra rows (mn..mn_padded-1) are
+        # zero-initialised once and may contain stale data on reuse — safe because the
+        # GEMM kernel never reads beyond the first mn output rows.
+        _CPU_SF_REF_BUF[_buf_key] = torch.zeros(
+            mn_padded, sf_k, l, dtype=torch.float8_e4m3fn
+        )
+    cute_f8_torch_tensor_cpu = _CPU_SF_OUT_BUF[_buf_key]
+    ref_buf = _CPU_SF_REF_BUF[_buf_key]
+
+    # Copy real scale factors into the first mn rows of the pre-allocated ref buffer.
+    # ref_f8_torch_tensor_cpu_permuted has shape (mn, sf_k, l), possibly non-contiguous.
+    ref_buf[:mn].copy_(ref_f8_torch_tensor_cpu_permuted)
+
     if _timing_enabled:
         _last_timing_us.setdefault("create_sf_alloc_us", 0.0)
         _last_timing_us["create_sf_alloc_us"] += (_t.perf_counter() - _t0) * 1e6
         _t0 = _t.perf_counter()
+
     ref_ptr = make_ptr(
         cutlass.Float8E4M3FN,
-        ref_f8_torch_tensor_cpu_permuted.data_ptr(),
+        ref_buf.data_ptr(),
         cute.AddressSpace.gmem,
         assumed_align=32,
     )
@@ -466,7 +502,7 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
         cute.AddressSpace.gmem,
         assumed_align=32,
     )
-    get_or_compile_cvt_sf(ref_ptr, mma_ptr, mn, sf_k, l, mma_shape)
+    get_or_compile_cvt_sf(ref_ptr, mma_ptr, mn_padded, sf_k, l, mma_shape)
     if _timing_enabled:
         _last_timing_us.setdefault("create_sf_cvt_jit_us", 0.0)
         _last_timing_us["create_sf_cvt_jit_us"] += (_t.perf_counter() - _t0) * 1e6

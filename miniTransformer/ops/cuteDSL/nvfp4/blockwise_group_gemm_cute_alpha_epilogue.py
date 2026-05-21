@@ -350,6 +350,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         out_dtype: torch.dtype = torch.bfloat16,
         accumulate: bool = False,
         alphas: Optional[List[torch.Tensor]] = None,
+        alphas_packed: Optional[torch.Tensor] = None,
         host_problem_shape_available: bool = True,
         warmup_iterations: int = 0,
         iterations: int = 1,
@@ -363,10 +364,23 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
         device = abc_tensors["torch"][0][0].device
 
-        # Alpha buffer caching: when alphas=None (all-ones), cache both the packed
-        # buffer and its cute_tensor_like wrapper to avoid repeated torch.ones + cat.
         _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
-        if alphas is None:
+        if alphas_packed is not None:
+            # Pre-packed contiguous [sum(M_i)] float32 tensor from caller.
+            # Cache a cute_tensor_like wrapper keyed by (total_M, device); reuse the
+            # underlying raw buffer via copy_ to avoid a new cute_tensor_like each call.
+            total_m = alphas_packed.shape[0]
+            _packed_key = (total_m, str(device))
+            if _packed_key not in _alpha_cache:
+                raw_buf = torch.empty(total_m, dtype=torch.float32, device=device)
+                wrapper, _ = cutlass_torch.cute_tensor_like(
+                    raw_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
+                )
+                _alpha_cache[_packed_key] = (raw_buf, wrapper)
+            raw_buf, tensor_of_alpha_buf = _alpha_cache[_packed_key]
+            raw_buf.copy_(alphas_packed)
+        elif alphas is None:
+            # All-ones alpha: fully cacheable.
             _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
             if _alpha_key not in _alpha_cache:
                 alphas_list = [
@@ -383,7 +397,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 _alpha_cache[_alpha_key] = tensor_of_alpha_buf
             tensor_of_alpha_buf = _alpha_cache[_alpha_key]
         else:
-            # User-provided alphas: no caching (may vary per call)
+            # Fallback: list of per-group tensors (legacy callers).
             alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
             tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
                 alpha_buf,

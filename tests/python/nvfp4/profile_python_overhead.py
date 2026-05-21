@@ -58,16 +58,31 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
         problem_sizes,
         out_dtype: torch.dtype = torch.bfloat16,
         alphas: Optional[List[torch.Tensor]] = None,
+        alphas_packed: Optional[torch.Tensor] = None,
     ) -> dict:
         timings = {}
 
         # ------------------------------------------------------------------ #
-        # Stage 1: alpha pack
+        # Stage 1: alpha buf — three sub-paths:
+        #   alphas_packed: copy_ into cached raw_buf (fast path, real forward)
+        #   alphas=None:   all-ones, fully cached
+        #   alphas=list:   legacy pack + cute_tensor_like each call
         # ------------------------------------------------------------------ #
         device = abc_tensors["torch"][0][0].device
         _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
         t0 = now_us()
-        if alphas is None:
+        if alphas_packed is not None:
+            total_m = alphas_packed.shape[0]
+            _packed_key = (total_m, str(device))
+            if _packed_key not in _alpha_cache:
+                raw_buf = torch.empty(total_m, dtype=torch.float32, device=device)
+                wrapper, _ = cutlass_torch.cute_tensor_like(
+                    raw_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
+                )
+                _alpha_cache[_packed_key] = (raw_buf, wrapper)
+            raw_buf, tensor_of_alpha_buf = _alpha_cache[_packed_key]
+            raw_buf.copy_(alphas_packed)
+        elif alphas is None:
             _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
             if _alpha_key not in _alpha_cache:
                 alphas_list = [
@@ -85,7 +100,7 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
             tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
                 alpha_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
             )
-        timings["1_pack_alpha_and_8c"] = now_us() - t0
+        timings["1_alpha_buf"] = now_us() - t0
 
         # ------------------------------------------------------------------ #
         # Stage 2: can_implement check
@@ -306,6 +321,37 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
         return timings
 
 
+def _print_breakdown(title, wall_us, accum):
+    total_tracked = sum(accum.values()) / MEASURE
+    untracked_us = wall_us - total_tracked
+    print(f"\n{title}")
+    print(f"Ground-truth wall time: {wall_us:.1f} µs")
+    print(f"\nPer-stage breakdown  (mean over {MEASURE} iters)")
+    print(f"{'Stage':<38}  {'µs':>8}  {'%wall':>7}")
+    print("-" * 60)
+    for stage, total in sorted(accum.items()):
+        us = total / MEASURE
+        pct = us / wall_us * 100
+        print(f"  {stage:<36}  {us:>8.1f}  {pct:>6.1f}%")
+    print("-" * 60)
+    print(f"  {'tracked subtotal':<36}  {total_tracked:>8.1f}  {total_tracked/wall_us*100:>6.1f}%")
+    print(f"  {'untracked (gaps between stages)':<36}  {untracked_us:>8.1f}  {untracked_us/wall_us*100:>6.1f}%")
+    print(f"  {'TOTAL (wall)':<36}  {wall_us:>8.1f}  {'100.0':>6}%")
+
+
+def _build_alphas_packed(problem_sizes, device):
+    """Simulate what grouped_gemm_cutedsl_pertoken builds each call."""
+    alpha_b_per_group = [0.01] * len(problem_sizes)  # dummy scalar per group
+    global_scales = torch.cat([
+        torch.rand(m, dtype=torch.float32, device=device)
+        for m, *_ in problem_sizes
+    ])
+    alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
+    active_m = [ps[0] for ps in problem_sizes]
+    repeats = torch.tensor(active_m, dtype=torch.int64, device=device)
+    return global_scales * alpha_b_vec.repeat_interleave(repeats)
+
+
 def main():
     profile = GroupedBlockScaledProfile["NVFP4"]
     shapes = DEFAULT_SHAPES
@@ -320,56 +366,78 @@ def main():
 
     kernel = StagedKernel(profile=profile)
 
-    # Trigger compilation via the normal path first
     print("Compiling kernel (first call)...")
     kernel.run_from_grouped_inputs(
         abc_tensors=abc, sfasfb_tensors=sfasfb,
         problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
     )
-    print("Done. Warming up instrumented path...")
+    print("Done. Warming up...")
 
-    def prod_call():
+    device = abc["torch"][0][0].device
+
+    # ------------------------------------------------------------------ #
+    # Path A: alphas=None  (all-ones, fully cached)
+    # ------------------------------------------------------------------ #
+    def prod_call_none():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
             iterations=0,
         )
 
-    # Warmup
     for _ in range(WARMUP):
         kernel.run_instrumented(abc, sfasfb, problem_sizes)
-        prod_call()
+        prod_call_none()
 
-    # Ground-truth: wall time of real run_from_grouped_inputs with iterations=0 + sync
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(MEASURE):
-        prod_call()
+        prod_call_none()
     torch.cuda.synchronize()
-    wall_us = (time.perf_counter() - t0) / MEASURE * 1e6
+    wall_none = (time.perf_counter() - t0) / MEASURE * 1e6
 
-    # Measure per-stage
-    accum = defaultdict(float)
+    accum_none = defaultdict(float)
     for _ in range(MEASURE):
         t = kernel.run_instrumented(abc, sfasfb, problem_sizes)
         for k, v in t.items():
-            accum[k] += v
+            accum_none[k] += v
 
-    total_tracked = sum(accum.values()) / MEASURE
-    untracked_us = wall_us - total_tracked
+    # ------------------------------------------------------------------ #
+    # Path B: alphas_packed  (per-token, real forward path)
+    # ------------------------------------------------------------------ #
+    def prod_call_packed():
+        ap = _build_alphas_packed(problem_sizes, device)
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
+            problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
+            alphas_packed=ap,
+            iterations=0,
+        )
 
-    print(f"\nGround-truth wall time (run_from_grouped_inputs): {wall_us:.1f} µs")
-    print(f"\nPer-stage breakdown  (mean over {MEASURE} iters)")
-    print(f"{'Stage':<38}  {'µs':>8}  {'%wall':>7}")
-    print("-" * 60)
-    for stage, total in sorted(accum.items()):
-        us = total / MEASURE
-        pct = us / wall_us * 100
-        print(f"  {stage:<36}  {us:>8.1f}  {pct:>6.1f}%")
-    print("-" * 60)
-    print(f"  {'tracked subtotal':<36}  {total_tracked:>8.1f}  {total_tracked/wall_us*100:>6.1f}%")
-    print(f"  {'untracked (gaps between stages)':<36}  {untracked_us:>8.1f}  {untracked_us/wall_us*100:>6.1f}%")
-    print(f"  {'TOTAL (wall)':<36}  {wall_us:>8.1f}  {'100.0':>6}%")
+    for _ in range(WARMUP):
+        ap = _build_alphas_packed(problem_sizes, device)
+        kernel.run_instrumented(abc, sfasfb, problem_sizes, alphas_packed=ap)
+        prod_call_packed()
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        prod_call_packed()
+    torch.cuda.synchronize()
+    wall_packed = (time.perf_counter() - t0) / MEASURE * 1e6
+
+    accum_packed = defaultdict(float)
+    for _ in range(MEASURE):
+        ap = _build_alphas_packed(problem_sizes, device)
+        t = kernel.run_instrumented(abc, sfasfb, problem_sizes, alphas_packed=ap)
+        for k, v in t.items():
+            accum_packed[k] += v
+
+    # ------------------------------------------------------------------ #
+    # Print
+    # ------------------------------------------------------------------ #
+    _print_breakdown("=== Path A: alphas=None (all-ones cached) ===", wall_none, accum_none)
+    _print_breakdown("=== Path B: alphas_packed (per-token forward) ===", wall_packed, accum_packed)
 
 
 if __name__ == "__main__":

@@ -91,7 +91,8 @@ def _run_grouped_gemm_cached(
     sfasfb_torch,
     problem_sizes,
     out_dtype: torch.dtype,
-    alphas,
+    alphas=None,
+    alphas_packed=None,
 ) -> list:
     kernel = _get_nvfp4_grouped_kernel()
     return kernel.run_from_grouped_inputs(
@@ -101,6 +102,7 @@ def _run_grouped_gemm_cached(
         out_dtype=out_dtype,
         accumulate=False,
         alphas=alphas,
+        alphas_packed=alphas_packed,
         iterations=0,
         host_problem_shape_available=False,
     )
@@ -357,7 +359,9 @@ def grouped_gemm_cutedsl_pertoken(
     k = act0.data_uint8.shape[1] * 2
     sf_k = k // _NVFP4_SF_VEC_SIZE
 
-    abc_torch, sfasfb_torch, problem_sizes, alphas = [], [], [], []
+    abc_torch, sfasfb_torch, problem_sizes = [], [], []
+    alpha_b_per_group: list = []   # scalar alpha_b for each non-empty group
+    active_acts: list = []         # PertokenNvfp4Tensor for each non-empty group
     # Track output tensors in original order; empty groups bypass the kernel.
     outputs: list = []
     kernel_output_indices: list = []  # positions in `outputs` that the kernel fills
@@ -407,13 +411,24 @@ def grouped_gemm_cutedsl_pertoken(
         abc_torch.append([a_fp4, b_fp4, c_out])
         sfasfb_torch.append([sfa, sfb])
         problem_sizes.append((m_i, n_i, k, 1))
-        alphas.append(build_group_alpha_pertoken(act, B[i], alpha_b, n_i))
+        alpha_b_per_group.append(alpha_b)
+        active_acts.append(act)
         kernel_output_indices.append(len(outputs))
         outputs.append(None)  # placeholder, filled below
 
     if abc_torch:
+        # Build alphas_packed as a single contiguous [sum(M_i)] tensor via vectorized ops.
+        # active_acts[i].global_scale are views into the original [M_total] buffer (from
+        # torch.split), so torch.cat here is a single allocation + G small copies.
+        global_scales = torch.cat([a.global_scale.float() for a in active_acts])  # [sum(M_i)]
+        alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
+        active_m = [ps[0] for ps in problem_sizes]
+        repeats = torch.tensor(active_m, dtype=torch.int64, device=device)
+        alphas_packed = global_scales * alpha_b_vec.repeat_interleave(repeats)
+
         kernel_results = _run_grouped_gemm_cached(
-            abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
+            abc_torch, sfasfb_torch, problem_sizes, out_dtype,
+            alphas_packed=alphas_packed,
         )
         for idx, result in zip(kernel_output_indices, kernel_results):
             outputs[idx] = result

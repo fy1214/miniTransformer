@@ -163,12 +163,12 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"    TFLOPS      : {tflops_val:.2f}")
 
     # ------------------------------------------------------------------
-    # 4. Steady-state wall time (full call, all caches warm)
+    # 4. Steady-state: alphas=None (all-ones, fully cached)
     # ------------------------------------------------------------------
     STEADY_WARMUP  = 10
     STEADY_MEASURE = 50
 
-    def full_call():
+    def full_call_none():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes,
@@ -176,27 +176,66 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
         )
 
     for _ in range(STEADY_WARMUP):
-        full_call()
+        full_call_none()
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     for _ in range(STEADY_MEASURE):
-        full_call()
+        full_call_none()
     torch.cuda.synchronize()
-    t_steady_us = (time.perf_counter() - t0) / STEADY_MEASURE * 1e6
+    t_steady_none_us = (time.perf_counter() - t0) / STEADY_MEASURE * 1e6
 
-    print(f"\n[4] Steady-state full call (warmup={STEADY_WARMUP}, iters={STEADY_MEASURE})")
-    print(f"    Wall time (mean) : {t_steady_us:.1f} µs")
+    print(f"\n[4] Steady-state: alphas=None (warmup={STEADY_WARMUP}, iters={STEADY_MEASURE})")
+    print(f"    Wall time (mean) : {t_steady_none_us:.1f} µs")
     print(f"    GPU kernel       : {t_exec*1e3:.1f} µs")
-    print(f"    Python overhead  : ~{t_steady_us - t_exec*1e3:.1f} µs")
+    print(f"    Python overhead  : ~{t_steady_none_us - t_exec*1e3:.1f} µs")
+
+    # ------------------------------------------------------------------
+    # 5. Steady-state: alphas_packed (per-token forward path)
+    # ------------------------------------------------------------------
+    device = abc["torch"][0][0].device
+
+    def _make_alphas_packed():
+        alpha_b_per_group = [0.01] * len(problem_sizes)
+        global_scales = torch.cat([
+            torch.rand(m, dtype=torch.float32, device=device)
+            for m, *_ in problem_sizes
+        ])
+        alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
+        repeats = torch.tensor([ps[0] for ps in problem_sizes], dtype=torch.int64, device=device)
+        return global_scales * alpha_b_vec.repeat_interleave(repeats)
+
+    def full_call_packed():
+        ap = _make_alphas_packed()
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
+            problem_sizes=problem_sizes,
+            out_dtype=torch.bfloat16,
+            alphas_packed=ap,
+        )
+
+    for _ in range(STEADY_WARMUP):
+        full_call_packed()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(STEADY_MEASURE):
+        full_call_packed()
+    torch.cuda.synchronize()
+    t_steady_packed_us = (time.perf_counter() - t0) / STEADY_MEASURE * 1e6
+
+    print(f"\n[5] Steady-state: alphas_packed (warmup={STEADY_WARMUP}, iters={STEADY_MEASURE})")
+    print(f"    Wall time (mean) : {t_steady_packed_us:.1f} µs")
+    print(f"    GPU kernel       : {t_exec*1e3:.1f} µs")
+    print(f"    Python overhead  : ~{t_steady_packed_us - t_exec*1e3:.1f} µs")
 
     sep()
     print("Summary")
     sep("-")
-    print(f"  Compilation          : ~{t_first - t_second:.0f} ms  (one-time per shape)")
-    print(f"  GPU kernel           : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
-    print(f"  Steady-state (full)  : {t_steady_us:.1f} µs")
-    print(f"  Python overhead      : ~{t_steady_us - t_exec*1e3:.1f} µs")
+    print(f"  Compilation             : ~{t_first - t_second:.0f} ms  (one-time per shape)")
+    print(f"  GPU kernel              : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
+    print(f"  Steady-state none       : {t_steady_none_us:.1f} µs  (Python overhead ~{t_steady_none_us - t_exec*1e3:.1f} µs)")
+    print(f"  Steady-state packed     : {t_steady_packed_us:.1f} µs  (Python overhead ~{t_steady_packed_us - t_exec*1e3:.1f} µs)")
     sep()
 
 

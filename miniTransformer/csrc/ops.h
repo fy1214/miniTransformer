@@ -75,6 +75,38 @@ void rtn_fp4_binding(
     float scale_override
 );
 
+void four_six_fp4_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void rtn_fp4_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void four_six_fp4_pertoken_linear_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void rtn_fp4_pertoken_linear_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
 void eden_fp4_binding(
     at::Tensor& out,
     at::Tensor& scales,

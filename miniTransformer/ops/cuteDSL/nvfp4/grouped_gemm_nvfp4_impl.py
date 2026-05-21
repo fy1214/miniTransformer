@@ -10,10 +10,16 @@ Quantization sources:
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple, Union
 
 import torch
+
+# Lightweight timing hook — set by nvfp4_cursor2_op._grouped_gemm_cutedsl_pertoken
+# when it wants a breakdown; zero cost when False.
+_timing_enabled: bool = False
+_last_timing_us: dict = {}
 
 from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
 from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2, cast_to_fp4x2
@@ -420,16 +426,26 @@ def grouped_gemm_cutedsl_pertoken(
         # Build alphas_packed as a single contiguous [sum(M_i)] tensor via vectorized ops.
         # active_acts[i].global_scale are views into the original [M_total] buffer (from
         # torch.split), so torch.cat here is a single allocation + G small copies.
+        if _timing_enabled:
+            _t = _time.perf_counter()
+
         global_scales = torch.cat([a.global_scale.float() for a in active_acts])  # [sum(M_i)]
         alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
         active_m = [ps[0] for ps in problem_sizes]
         repeats = torch.tensor(active_m, dtype=torch.int64, device=device)
         alphas_packed = global_scales * alpha_b_vec.repeat_interleave(repeats)
 
+        if _timing_enabled:
+            _last_timing_us["alpha_build_us"] = (_time.perf_counter() - _t) * 1e6
+            _t = _time.perf_counter()
+
         kernel_results = _run_grouped_gemm_cached(
             abc_torch, sfasfb_torch, problem_sizes, out_dtype,
             alphas_packed=alphas_packed,
         )
+
+        if _timing_enabled:
+            _last_timing_us["kernel_dispatch_us"] = (_time.perf_counter() - _t) * 1e6
         for idx, result in zip(kernel_output_indices, kernel_results):
             outputs[idx] = result
 

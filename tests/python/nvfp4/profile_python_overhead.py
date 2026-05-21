@@ -284,7 +284,7 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
             num_groups=num_groups,
             problem_sizes=problem_sizes,
             out_dtype=out_dtype,
-            host_problem_shape_available=True,
+            host_problem_shape_available=False,
         )
         compiled_grouped_gemm = get_or_compile_grouped_gemm(
             compile_cache_key, lambda: None  # should always hit cache here

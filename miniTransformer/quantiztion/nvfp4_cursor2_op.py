@@ -19,6 +19,11 @@ nvfp4_scale_t = torch.float8_e4m3fn
 
 use_cpp_allocator = False
 
+# Print a timing breakdown every N grouped-GEMM calls.
+# Set to 0 to disable entirely (zero overhead on non-printing iterations).
+_GEMM_TIMING_INTERVAL: int = 50
+_GEMM_CALL_COUNT: int = 0
+
 
 def _is_sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
@@ -46,8 +51,30 @@ def _grouped_gemm_cutedsl_pertoken(
     from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
         grouped_gemm_cutedsl_pertoken,
     )
+    import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
+    import time
+    global _GEMM_CALL_COUNT
 
-    return grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+    if _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0:
+        _impl._timing_enabled = True
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+        torch.cuda.synchronize()
+        t_us = (time.perf_counter() - t0) * 1e6
+        _impl._timing_enabled = False
+        t = _impl._last_timing_us
+        print(
+            f"[GEMM #{_GEMM_CALL_COUNT:5d}] "
+            f"total={t_us:6.1f} µs | "
+            f"alpha_build={t.get('alpha_build_us', float('nan')):5.1f} µs | "
+            f"kernel_dispatch={t.get('kernel_dispatch_us', float('nan')):5.1f} µs"
+        )
+    else:
+        res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    _GEMM_CALL_COUNT += 1
+    return res
 
 
 class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):

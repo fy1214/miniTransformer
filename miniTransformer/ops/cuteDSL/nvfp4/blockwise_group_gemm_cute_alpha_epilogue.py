@@ -503,41 +503,43 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         # Stages 7 & 8: in-place buffer update — avoids per-call GPU allocation and CUTE tensor
         # creation for shapes/ptrs tensors that change every step in dynamic-M MoE workloads.
-        # Buffers are pre-allocated once per (num_groups, out_dtype, device) and reused.
+        # cute_tensor_like() allocates an internal GPU buffer and wraps it; the CUTE tensor reads
+        # from that internal buffer, NOT from the data_ref passed in.  We therefore save the
+        # internal buffer (second return value) and update it on every call.
         _inplace_key = (num_groups, str(out_dtype), str(device))
         if _inplace_key not in self._inplace_buf:
-            _raw_mnkl = torch.empty((num_groups, 4), dtype=torch.int32, device=device)
-            _raw_strides = torch.empty((num_groups, 3, 2), dtype=torch.int32, device=device)
-            _raw_ptrs_abc = torch.empty((num_groups, len(ptrs_abc[0])), dtype=torch.int64, device=device)
-            _raw_ptrs_sfasfb = torch.empty((num_groups, len(ptrs_sfasfb[0])), dtype=torch.int64, device=device)
-            _cute_mnkl, _ = cutlass_torch.cute_tensor_like(
-                _raw_mnkl, cutlass.Int32, is_dynamic_layout=False, assumed_align=16
+            _cute_mnkl, _buf_mnkl = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, 4), dtype=torch.int32, device=device),
+                cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
             )
-            _cute_strides, _ = cutlass_torch.cute_tensor_like(
-                _raw_strides, cutlass.Int32, is_dynamic_layout=False, assumed_align=16
+            _cute_strides, _buf_strides = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, 3, 2), dtype=torch.int32, device=device),
+                cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
             )
-            _cute_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
-                _raw_ptrs_abc, cutlass.Int64, is_dynamic_layout=False, assumed_align=16
+            _cute_ptrs_abc, _buf_ptrs_abc = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, len(ptrs_abc[0])), dtype=torch.int64, device=device),
+                cutlass.Int64, is_dynamic_layout=False, assumed_align=16,
             )
-            _cute_ptrs_sfasfb, _ = cutlass_torch.cute_tensor_like(
-                _raw_ptrs_sfasfb, cutlass.Int64, is_dynamic_layout=False, assumed_align=16
+            _cute_ptrs_sfasfb, _buf_ptrs_sfasfb = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, len(ptrs_sfasfb[0])), dtype=torch.int64, device=device),
+                cutlass.Int64, is_dynamic_layout=False, assumed_align=16,
             )
             self._inplace_buf[_inplace_key] = (
-                _raw_mnkl, _cute_mnkl,
-                _raw_strides, _cute_strides,
-                _raw_ptrs_abc, _cute_ptrs_abc,
-                _raw_ptrs_sfasfb, _cute_ptrs_sfasfb,
+                _buf_mnkl, _cute_mnkl,
+                _buf_strides, _cute_strides,
+                _buf_ptrs_abc, _cute_ptrs_abc,
+                _buf_ptrs_sfasfb, _cute_ptrs_sfasfb,
             )
         (
-            _raw_mnkl, tensor_of_dim_size_mnkl,
-            _raw_strides, tensor_of_strides_abc,
-            _raw_ptrs_abc, tensor_of_ptrs_abc,
-            _raw_ptrs_sfasfb, tensor_of_ptrs_sfasfb,
+            _buf_mnkl, tensor_of_dim_size_mnkl,
+            _buf_strides, tensor_of_strides_abc,
+            _buf_ptrs_abc, tensor_of_ptrs_abc,
+            _buf_ptrs_sfasfb, tensor_of_ptrs_sfasfb,
         ) = self._inplace_buf[_inplace_key]
-        _raw_mnkl.copy_(torch.tensor(problem_sizes, dtype=torch.int32))
-        _raw_strides.copy_(torch.tensor(strides_abc, dtype=torch.int32))
-        _raw_ptrs_abc.copy_(torch.tensor(ptrs_abc, dtype=torch.int64))
-        _raw_ptrs_sfasfb.copy_(torch.tensor(ptrs_sfasfb, dtype=torch.int64))
+        _buf_mnkl.copy_(torch.tensor(problem_sizes, dtype=torch.int32))
+        _buf_strides.copy_(torch.tensor(strides_abc, dtype=torch.int32))
+        _buf_ptrs_abc.copy_(torch.tensor(ptrs_abc, dtype=torch.int64))
+        _buf_ptrs_sfasfb.copy_(torch.tensor(ptrs_sfasfb, dtype=torch.int64))
 
         def compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn) -> int:
             total = 0

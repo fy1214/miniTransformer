@@ -65,15 +65,27 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
         # Stage 1: alpha pack
         # ------------------------------------------------------------------ #
         device = abc_tensors["torch"][0][0].device
+        _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
         t0 = now_us()
         if alphas is None:
-            alphas = [
-                torch.ones(m, dtype=torch.float32, device=device)
-                for m, *_ in problem_sizes
-            ]
-        alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
-        torch.cuda.synchronize()
-        timings["1_pack_alpha"] = now_us() - t0
+            _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
+            if _alpha_key not in _alpha_cache:
+                alphas_list = [
+                    torch.ones(m, dtype=torch.float32, device=device)
+                    for m, *_ in problem_sizes
+                ]
+                alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas_list, device)
+                tensor_of_alpha_buf_new, _ = cutlass_torch.cute_tensor_like(
+                    alpha_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
+                )
+                _alpha_cache[_alpha_key] = tensor_of_alpha_buf_new
+            tensor_of_alpha_buf = _alpha_cache[_alpha_key]
+        else:
+            alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
+            tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
+                alpha_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
+            )
+        timings["1_pack_alpha_and_8c"] = now_us() - t0
 
         # ------------------------------------------------------------------ #
         # Stage 2: can_implement check
@@ -227,11 +239,7 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
         tensor_of_ptrs_sfasfb = _ptrs[_ptrs_sfasfb_key]
         timings["8b_ptrs_sfasfb_tensor"] = now_us() - t0
 
-        t0 = now_us()
-        tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
-            alpha_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
-        )
-        timings["8c_alpha_buf_tensor"] = now_us() - t0
+        # tensor_of_alpha_buf already built in stage 1_pack_alpha_and_8c
 
         # ------------------------------------------------------------------ #
         # Stage 9: compute_total_num_clusters

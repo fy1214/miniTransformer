@@ -362,12 +362,35 @@ class Sm100GroupedBlockScaledGemmKernel:
                 f"alphas length ({len(alphas)}) must match problem_sizes ({len(problem_sizes)})."
             )
         device = abc_tensors["torch"][0][0].device
+
+        # Alpha buffer caching: when alphas=None (all-ones), cache both the packed
+        # buffer and its cute_tensor_like wrapper to avoid repeated torch.ones + cat.
+        _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
         if alphas is None:
-            alphas = [
-                torch.ones(m, dtype=torch.float32, device=device)
-                for m, *_ in problem_sizes
-            ]
-        alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
+            _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
+            if _alpha_key not in _alpha_cache:
+                alphas_list = [
+                    torch.ones(m, dtype=torch.float32, device=device)
+                    for m, *_ in problem_sizes
+                ]
+                alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas_list, device)
+                tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
+                    alpha_buf,
+                    cutlass.Float32,
+                    is_dynamic_layout=False,
+                    assumed_align=16,
+                )
+                _alpha_cache[_alpha_key] = tensor_of_alpha_buf
+            tensor_of_alpha_buf = _alpha_cache[_alpha_key]
+        else:
+            # User-provided alphas: no caching (may vary per call)
+            alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
+            tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
+                alpha_buf,
+                cutlass.Float32,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
         if self.profile_cfg is None:
             raise ValueError("run_from_grouped_inputs requires kernel initialized with `profile`.")
 
@@ -502,13 +525,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 assumed_align=16,
             )
         tensor_of_ptrs_sfasfb = _ptrs[_ptrs_sfasfb_key]
-
-        tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
-            alpha_buf,
-            cutlass.Float32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
 
         def compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn) -> int:
             total = 0

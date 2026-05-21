@@ -1,3 +1,4 @@
+import functools
 import torch
 import fp4_gemm
 
@@ -6,6 +7,35 @@ from miniTransformer.utils import utils
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
+
+# FP4 E2M1 value lookup table: index (nibble 0–15) → float (CPU master copy)
+_FP4_GRID = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _fp4_grid(device_str: str) -> torch.Tensor:
+    # Cached per-device GPU copy.  lru_cache ensures the H2D transfer happens
+    # only once (during warmup), so CUDA graph capture sees no host→device copy.
+    return _FP4_GRID.to(torch.device(device_str))
+
+
+def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 [m, n//2] → int32 [m, n] nibble indices 0–15."""
+    p = packed.to(torch.int32)
+    return torch.stack([p & 0x0F, (p >> 4) & 0x0F], dim=-1).flatten(start_dim=-2)
+
+
+def _unswizzle_scale(scale_flat: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Convert tcgen05 swizzled flat scale [m*n//16] → row-major [m, n//16]."""
+    n_row_tiles = rows // 128
+    n_col_tiles = (cols // 16) // 4
+    s = scale_flat.reshape(n_row_tiles * n_col_tiles, 32, 4, 4)
+    s = s.permute(0, 2, 1, 3).reshape(n_row_tiles, n_col_tiles, 128, 4)
+    return s.permute(0, 2, 1, 3).reshape(rows, n_col_tiles * 4)
 
 
 def quantize_nvfp4_cuda(
@@ -167,3 +197,52 @@ def quantize_nvfp4_pertoken_swizzled(
         scale=scale,
         tensor_scale=global_scale,
     )
+
+
+def dequantize_nvfp4_pertoken(result: quantization.QuantizeResult) -> torch.Tensor:
+    """Dequantize the output of :func:`quantize_nvfp4_pertoken` back to BF16.
+
+    Args:
+        result: QuantizeResult from quantize_nvfp4_pertoken.
+                data          – uint8 [m, n//2]
+                scale         – float8_e4m3fn [m, n//16], row-major
+                tensor_scale  – float32 [m]
+
+    Returns:
+        Reconstructed BF16 tensor of shape [m, n].
+    """
+    data = result.data
+    scale = result.scale
+    global_scale = result.tensor_scale
+
+    grid = _fp4_grid(str(data.device))
+    fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)           # [m, n]
+    scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [m, n]
+    gs = global_scale.to(torch.float32).unsqueeze(1)               # [m, 1]
+    return (fp4_vals * scale_expanded * gs).to(torch.bfloat16)
+
+
+def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> torch.Tensor:
+    """Dequantize the output of :func:`quantize_nvfp4_pertoken_swizzled` back to BF16.
+
+    Args:
+        result: QuantizeResult from quantize_nvfp4_pertoken_swizzled.
+                data          – uint8 [m, n//2]
+                scale         – float8_e4m3fn [m*n//16], tcgen05 swizzled flat
+                tensor_scale  – float32 [m]
+
+    Returns:
+        Reconstructed BF16 tensor of shape [m, n].
+    """
+    data = result.data
+    global_scale = result.tensor_scale
+
+    m, nhalf = data.shape
+    n = nhalf * 2
+
+    scale_rm = _unswizzle_scale(result.scale.to(torch.float32), m, n)  # [m, n//16]
+    grid = _fp4_grid(str(data.device))
+    fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)               # [m, n]
+    scale_expanded = scale_rm.repeat_interleave(16, dim=1)             # [m, n]
+    gs = global_scale.to(torch.float32).unsqueeze(1)                   # [m, 1]
+    return (fp4_vals * scale_expanded * gs).to(torch.bfloat16)

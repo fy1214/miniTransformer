@@ -174,6 +174,7 @@ def try_export_compiled_to_disk(
             if alt_path.exists() and not obj_path.exists():
                 alt_path.rename(obj_path)
 
+@cute.jit
 def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_ptr: cute.Pointer,
     sf_mma_ptr: cute.Pointer,

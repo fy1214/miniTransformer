@@ -245,7 +245,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             for i in range(num_gemms):
                 x_quantizer = MXFP8Quantizer(
                     rowwise=False,
-                    columnwise=return_transpose,
+                    columnwise=True,
                     fp8_dtype=tex.DType.kFloat8E4M3
                 )
                 quantizers.append(x_quantizer)
@@ -330,9 +330,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if grad:
             if layout == "NN":
                 if is_te_quantized:
-                    n_cols = B[0]._rowwise_data.size(1)
+                    n_cols = B[0]._columnwise_data.size(0)
                 else:
-                    n_cols = B[0].size(1)
+                    n_cols = B[0]._columnwise_data.size(0)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,

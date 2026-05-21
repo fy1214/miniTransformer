@@ -50,7 +50,6 @@ from cutlass.cute.runtime import from_dlpack
 from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_compile_cache import (
     build_grouped_compile_cache_key,
     get_or_compile_grouped_gemm,
-    infer_alpha_modes,
 )
 
 
@@ -113,19 +112,11 @@ def _resolve_profile(profile: Union[GroupedBlockScaledProfile, str]) -> GroupedB
     return GroupedBlockScaledProfile(str(profile).lower())
 
 
-GroupedGemmAlpha = Union[float, int, torch.Tensor]
-
-# Per-group alpha layout in ``tensor_of_alpha_desc`` (int64, shape [G, 4]):
-#   [0] device pointer to float32 alpha buffer (0 for scalar mode)
-#   [1] mode: 0=scalar (TE / global×global), 1=row [M] (pertoken A × global B)
-#   [2] M, [3] N (N unused for row mode; kept for descriptor shape)
-ALPHA_MODE_SCALAR = 0
-ALPHA_MODE_ROW = 1
 
 
 def apply_grouped_gemm_alphas(
     outputs: List[torch.Tensor],
-    alphas: List[GroupedGemmAlpha],
+    alphas: List[Union[float, int, torch.Tensor]],
 ) -> List[torch.Tensor]:
     """
     Apply NVFP4 global-scale correction after blockscaled grouped GEMM.
@@ -317,53 +308,15 @@ class Sm100GroupedBlockScaledGemmKernel:
         ]
 
     @staticmethod
-    def _pack_alpha_descriptors(
-        alphas: Optional[List[GroupedGemmAlpha]],
-        problem_sizes: List[Tuple[int, int, int, int]],
+    def _pack_alpha_buf(
+        alphas: List[torch.Tensor],
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """
-        Pack per-group alpha into scalar tensor + device descriptor table.
-
-        Returns ``(group_alphas, alpha_desc, keepalive_tensors)``.
-        """
-        num_groups = len(problem_sizes)
-        scalar_alphas = torch.ones(num_groups, dtype=torch.float32, device=device)
-        desc = torch.zeros((num_groups, 4), dtype=torch.int64, device=device)
-        keepalive: List[torch.Tensor] = []
-
-        if alphas is None:
-            for i, (m, n, _, _) in enumerate(problem_sizes):
-                desc[i, 1] = ALPHA_MODE_SCALAR
-                desc[i, 2] = m
-                desc[i, 3] = n
-            return scalar_alphas, desc, keepalive
-
-        for i, (alpha, (m, n, _, _)) in enumerate(zip(alphas, problem_sizes)):
-            desc[i, 2] = m
-            desc[i, 3] = n
-            if isinstance(alpha, (float, int)):
-                scalar_alphas[i] = float(alpha)
-                desc[i, 1] = ALPHA_MODE_SCALAR
-                continue
-            if isinstance(alpha, torch.Tensor) and alpha.ndim == 0:
-                scalar_alphas[i] = float(alpha.item())
-                desc[i, 1] = ALPHA_MODE_SCALAR
-                continue
-            if not isinstance(alpha, torch.Tensor):
-                raise TypeError(f"Unsupported alpha type: {type(alpha)}")
-
-            a = alpha.to(device=device, dtype=torch.float32).contiguous()
-            if a.ndim != 1 or a.numel() != m:
-                raise ValueError(
-                    f"Pertoken epilogue alpha must be 1D [M]; got shape {tuple(a.shape)} "
-                    f"for group output M={m}, N={n}."
-                )
-            keepalive.append(a)
-            desc[i, 0] = int(a.data_ptr())
-            desc[i, 1] = ALPHA_MODE_ROW
-
-        return scalar_alphas, desc, keepalive
+    ) -> torch.Tensor:
+        """Concatenate per-group 1D [M_i] alpha tensors into one contiguous [sum(M_i)] buffer."""
+        return torch.cat([
+            a.to(device=device, dtype=torch.float32).contiguous()
+            for a in alphas
+        ])
 
     @staticmethod
     def _infer_strides_from_abc_tensors(
@@ -396,7 +349,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         problem_sizes,
         out_dtype: torch.dtype = torch.bfloat16,
         accumulate: bool = False,
-        alphas: Optional[List[GroupedGemmAlpha]] = None,
+        alphas: Optional[List[torch.Tensor]] = None,
         host_problem_shape_available: bool = True,
         warmup_iterations: int = 0,
         iterations: int = 1,
@@ -409,11 +362,35 @@ class Sm100GroupedBlockScaledGemmKernel:
                 f"alphas length ({len(alphas)}) must match problem_sizes ({len(problem_sizes)})."
             )
         device = abc_tensors["torch"][0][0].device
-        alpha_values, alpha_desc, alpha_keepalive = (
-            Sm100GroupedBlockScaledGemmKernel._pack_alpha_descriptors(
-                alphas, problem_sizes, device
+
+        # Alpha buffer caching: when alphas=None (all-ones), cache both the packed
+        # buffer and its cute_tensor_like wrapper to avoid repeated torch.ones + cat.
+        _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
+        if alphas is None:
+            _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
+            if _alpha_key not in _alpha_cache:
+                alphas_list = [
+                    torch.ones(m, dtype=torch.float32, device=device)
+                    for m, *_ in problem_sizes
+                ]
+                alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas_list, device)
+                tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
+                    alpha_buf,
+                    cutlass.Float32,
+                    is_dynamic_layout=False,
+                    assumed_align=16,
+                )
+                _alpha_cache[_alpha_key] = tensor_of_alpha_buf
+            tensor_of_alpha_buf = _alpha_cache[_alpha_key]
+        else:
+            # User-provided alphas: no caching (may vary per call)
+            alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
+            tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
+                alpha_buf,
+                cutlass.Float32,
+                is_dynamic_layout=False,
+                assumed_align=16,
             )
-        )
         if self.profile_cfg is None:
             raise ValueError("run_from_grouped_inputs requires kernel initialized with `profile`.")
 
@@ -528,30 +505,26 @@ class Sm100GroupedBlockScaledGemmKernel:
             _shapes[_shape_key] = (_t_mnkl, _t_strides)
         tensor_of_dim_size_mnkl, tensor_of_strides_abc = _shapes[_shape_key]
 
-        tensor_of_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_ptrs_sfasfb, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_group_alphas, _ = cutlass_torch.cute_tensor_like(
-            alpha_values,
-            cutlass.Float32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_alpha_desc, _ = cutlass_torch.cute_tensor_like(
-            alpha_desc,
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
+        _ptrs = self._run_cache.setdefault("ptrs", {})
+        _ptrs_abc_key = (tuple(tuple(r) for r in ptrs_abc), str(device))
+        if _ptrs_abc_key not in _ptrs:
+            _ptrs[_ptrs_abc_key], _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
+                cutlass.Int64,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+        tensor_of_ptrs_abc = _ptrs[_ptrs_abc_key]
+
+        _ptrs_sfasfb_key = (tuple(tuple(r) for r in ptrs_sfasfb), str(device))
+        if _ptrs_sfasfb_key not in _ptrs:
+            _ptrs[_ptrs_sfasfb_key], _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
+                cutlass.Int64,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+        tensor_of_ptrs_sfasfb = _ptrs[_ptrs_sfasfb_key]
 
         def compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn) -> int:
             total = 0
@@ -574,7 +547,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         profile_name = (
             self.profile.value if self.profile is not None else "custom"
         )
-        alpha_modes = infer_alpha_modes(alphas, problem_sizes)
         compile_cache_key = build_grouped_compile_cache_key(
             variant="alpha_epilogue",
             device=device,
@@ -583,7 +555,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             num_groups=num_groups,
             problem_sizes=problem_sizes,
             out_dtype=out_dtype,
-            alpha_modes=alpha_modes,
             host_problem_shape_available=host_problem_shape_available,
         )
 
@@ -600,8 +571,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 tensor_of_strides_abc,
                 tensor_of_ptrs_abc,
                 tensor_of_ptrs_sfasfb,
-                tensor_of_group_alphas,
-                tensor_of_alpha_desc,
+                tensor_of_alpha_buf,
                 total_num_clusters,
                 tensor_of_tensormap,
                 max_active_clusters,
@@ -622,8 +592,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensor_of_strides_abc,
             tensor_of_ptrs_abc,
             tensor_of_ptrs_sfasfb,
-            tensor_of_group_alphas,
-            tensor_of_alpha_desc,
+            tensor_of_alpha_buf,
             tensor_of_tensormap,
             current_stream,
         )
@@ -653,7 +622,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     + strides_abc_torch.numel() * strides_abc_torch.element_size()
                     + ptrs_abc_torch.numel() * ptrs_abc_torch.element_size()
                     + ptrs_sfasfb_torch.numel() * ptrs_sfasfb_torch.element_size()
-                    + alpha_values.numel() * alpha_values.element_size()
+                    + alpha_buf.numel() * alpha_buf.element_size()
                     + tensormap_shape[0]
                     * tensormap_shape[1]
                     * tensormap_shape[2]
@@ -730,8 +699,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                     workspace_strides_abc[ws_idx],
                     workspace_ptrs_abc[ws_idx],
                     workspace_ptrs_sfasfb[ws_idx],
-                    tensor_of_group_alphas,
-                    tensor_of_alpha_desc,
+                    tensor_of_alpha_buf,
                     workspace_tensormap[ws_idx],
                     current_stream,
                 )
@@ -762,7 +730,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                     "problem_sizes": problem_sizes,
                 }
             )
-        _ = alpha_keepalive  # keep non-scalar alpha buffers alive through launch
         return [group_tensors[2] for group_tensors in abc_tensors["torch"]]
 
     # Set up configurations that dependent on gemm inputs.
@@ -942,8 +909,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         strides_abc: cute.Tensor,
         tensor_address_abc: cute.Tensor,
         tensor_address_sfasfb: cute.Tensor,
-        tensor_group_alphas: cute.Tensor,
-        tensor_alpha_desc: cute.Tensor,
+        tensor_alpha_buf: cute.Tensor,
         total_num_clusters: cutlass.Constexpr[int],
         tensormap_cute_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr[int],
@@ -1208,8 +1174,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             strides_abc,
             tensor_address_abc,
             tensor_address_sfasfb,
-            tensor_group_alphas,
-            tensor_alpha_desc,
+            tensor_alpha_buf,
             tensormap_cute_tensor,
         ).launch(
             grid=grid,
@@ -1250,8 +1215,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         strides_abc: cute.Tensor,
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
-        group_alphas: cute.Tensor,
-        alpha_desc: cute.Tensor,
+        alpha_buf: cute.Tensor,
         tensormaps: cute.Tensor,
     ):
         """
@@ -2092,11 +2056,8 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
             # group index to start searching
             last_group_idx = cutlass.Int32(-1)
-            cur_group_alpha = cutlass.Float32(1.0)
-            cur_alpha_mode = cutlass.Int32(ALPHA_MODE_SCALAR)
-            cur_alpha_ptr = cutlass.Int64(0)
+            cur_alpha_offset = cutlass.Int32(0)
             cur_alpha_m = cutlass.Int32(0)
-            cur_alpha_n = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
                 grouped_gemm_cta_tile_info = work_tile.group_search_result
@@ -2107,11 +2068,12 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 # We still need to store 0s when k_tile_cnt is 0
                 if is_group_changed:
-                    cur_group_alpha = group_alphas[(cur_group_idx,)]
-                    cur_alpha_mode = cutlass.Int32(alpha_desc[cur_group_idx, 1])
-                    cur_alpha_ptr = alpha_desc[cur_group_idx, 0]
-                    cur_alpha_m = cutlass.Int32(alpha_desc[cur_group_idx, 2])
-                    cur_alpha_n = cutlass.Int32(alpha_desc[cur_group_idx, 3])
+                    # Incrementally advance offset: add previous group's M.
+                    # Group indices are non-decreasing per CTA in persistent scheduling,
+                    # so a single addition suffices (no O(G) loop needed).
+                    if last_group_idx >= cutlass.Int32(0):
+                        cur_alpha_offset = cur_alpha_offset + cur_alpha_m
+                    cur_alpha_m = cutlass.Int32(problem_sizes_mnkl[cur_group_idx, 0])
                     # construct tensor c based on real shape, stride information
                     real_tensor_c = self.make_tensor_abc_for_tensormap_update(
                         cur_group_idx,
@@ -2194,22 +2156,19 @@ class Sm100GroupedBlockScaledGemmKernel:
                         #
                         # Convert to C type and apply global alpha in epilogue
                         #
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        if cur_alpha_mode == ALPHA_MODE_SCALAR:
-                            acc_vec = acc_vec * cur_group_alpha
-                        else:
-                            tTR_cC_sub = tTR_cC_tile[(None, None, None, subtile_idx)]
-                            m_tile_origin = (
-                                mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
-                            )
-                            acc_vec = self._multiply_acc_vec_by_group_alpha_row(
-                                tTR_rAcc,
-                                tiled_copy_r2s,
-                                tTR_cC_sub,
-                                cur_alpha_ptr,
-                                cur_alpha_m,
-                                m_tile_origin,
-                            )
+                        tTR_cC_sub = tTR_cC_tile[(None, None, None, subtile_idx)]
+                        m_tile_origin = (
+                            mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
+                        )
+                        acc_vec = self._multiply_acc_vec_by_group_alpha_row(
+                            tTR_rAcc,
+                            tiled_copy_r2s,
+                            tTR_cC_sub,
+                            alpha_buf,
+                            cur_alpha_offset,
+                            cur_alpha_m,
+                            m_tile_origin,
+                        )
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                     else:
                         if cutlass.const_expr(self.is_nvfp4_output):
@@ -2630,24 +2589,18 @@ class Sm100GroupedBlockScaledGemmKernel:
         tTR_rAcc: cute.Tensor,
         tiled_copy_r2s: cute.TiledCopy,
         tTR_cC_sub: cute.Tensor,
-        alpha_ptr: cutlass.Int64,
+        alpha_buf: cute.Tensor,
+        alpha_offset: cutlass.Int32,
         alpha_m: cutlass.Int32,
         m_tile_origin: cutlass.Int32,
     ):
         """Apply 1D row global alpha ``alpha[M]`` (pertoken A amax × global B amax)."""
-        alpha_gmem_ptr = cute.make_ptr(
-            cutlass.Float32, alpha_ptr, cute.AddressSpace.gmem
-        )
-        g_alpha = cute.make_tensor(
-            alpha_gmem_ptr, cute.make_layout((alpha_m,), stride=(1,))
-        )
-
         tRS_acc = tiled_copy_r2s.retile(tTR_rAcc)
         tRS_crd = tiled_copy_r2s.retile(tTR_cC_sub)
         for i in cutlass.range_constexpr(cute.size(tRS_acc)):
             crd = tRS_crd[i]
             m_g = crd[0] + m_tile_origin
-            tRS_acc[i] = tRS_acc[i] * g_alpha[m_g]
+            tRS_acc[i] = tRS_acc[i] * alpha_buf[(alpha_offset + m_g,)]
         return tRS_acc.load()
 
     @staticmethod

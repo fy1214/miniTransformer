@@ -163,83 +163,40 @@ def run_profile(profile_name: str, use_disk_cache: bool, shapes=None):
     print(f"    TFLOPS      : {tflops_val:.2f}")
 
     # ------------------------------------------------------------------
-    # 3b. Python dispatch overhead per single call
+    # 4. Steady-state wall time (full call, all caches warm)
     # ------------------------------------------------------------------
-    t_single = wall_time_ms(lambda: kernel.run_from_grouped_inputs(
-        abc_tensors=abc, sfasfb_tensors=sfasfb,
-        problem_sizes=problem_sizes,
-        out_dtype=torch.bfloat16,
-        iterations=0,
-    ))
-    print(f"\n[3b] Single Python call overhead")
-    print(f"    Wall time       : {t_single:.1f} ms")
-    print(f"    Python overhead : ~{t_single - t_exec:.1f} ms  (wall - kernel)")
+    STEADY_WARMUP  = 10
+    STEADY_MEASURE = 50
 
-    # ------------------------------------------------------------------
-    # 5. Per-token alpha path (different epilogue => separate compilation)
-    # ------------------------------------------------------------------
-    print("\n[4] Per-token alpha path (separate compilation)")
-    alphas_pertoken = [
-        torch.ones(m, device="cuda", dtype=torch.float32) for m in m_list
-    ]
-
-    def call_kernel_pertoken(abc_, sfasfb_):
-        return kernel.run_from_grouped_inputs(
-            abc_tensors=abc_, sfasfb_tensors=sfasfb_,
+    def full_call():
+        kernel.run_from_grouped_inputs(
+            abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes,
             out_dtype=torch.bfloat16,
-            alphas=alphas_pertoken,
         )
 
-    t_pt_first = wall_time_ms(lambda: call_kernel_pertoken(abc, sfasfb))
-    print(f"    First call  : {t_pt_first:.1f} ms  (includes per-token epilogue compilation)")
+    for _ in range(STEADY_WARMUP):
+        full_call()
+    torch.cuda.synchronize()
 
-    t_pt_exec = kernel_time_ms(kernel, abc, sfasfb, problem_sizes, torch.bfloat16,
-                               alphas=alphas_pertoken, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
-    print(f"    Kernel mean : {t_pt_exec:.3f} ms  ({t_pt_exec*1e3:.1f} µs)")
+    t0 = time.perf_counter()
+    for _ in range(STEADY_MEASURE):
+        full_call()
+    torch.cuda.synchronize()
+    t_steady_us = (time.perf_counter() - t0) / STEADY_MEASURE * 1e6
 
-    # ------------------------------------------------------------------
-    # 6. Sweep M sizes to show per-shape compilation cost
-    # ------------------------------------------------------------------
-    print("\n[5] Compilation cost sweep — varying M per group")
-    sep("-")
-    print(f"  {'M':>6}  {'1st(ms)':>10}  {'2nd(ms)':>10}  {'kernel(µs)':>12}  {'TFLOPS':>8}")
-    sep("-")
-
-    sweep_kernel = Sm100GroupedBlockScaledGemmKernel(profile=profile)
-    for m in [32, 64, 128, 256, 512]:
-        ml = [m] * len(shapes)
-        try:
-            abc_s, sfasfb_s, ps_s = generate_grouped_blockscaled_inputs(
-                m_list=ml, n_list=n_list, k_list=k_list,
-                profile=profile, device="cuda", out_dtype=torch.bfloat16,
-            )
-        except Exception as e:
-            print(f"  {m:>6}  skipped ({e})")
-            continue
-
-        def _wall(a=abc_s, s=sfasfb_s, p=ps_s):
-            return sweep_kernel.run_from_grouped_inputs(
-                abc_tensors=a, sfasfb_tensors=s,
-                problem_sizes=p, out_dtype=torch.bfloat16,
-            )
-
-        t1 = wall_time_ms(_wall)
-        t2 = wall_time_ms(_wall)
-        te_ms = kernel_time_ms(sweep_kernel, abc_s, sfasfb_s, ps_s, torch.bfloat16,
-                               warmup=3, iters=10)
-        tf = tflops(ps_s, te_ms)
-        print(f"  {m:>6}  {t1:>10.1f}  {t2:>10.1f}  {te_ms*1e3:>12.1f}  {tf:>8.2f}")
+    print(f"\n[4] Steady-state full call (warmup={STEADY_WARMUP}, iters={STEADY_MEASURE})")
+    print(f"    Wall time (mean) : {t_steady_us:.1f} µs")
+    print(f"    GPU kernel       : {t_exec*1e3:.1f} µs")
+    print(f"    Python overhead  : ~{t_steady_us - t_exec*1e3:.1f} µs")
 
     sep()
     print("Summary")
     sep("-")
-    print(f"  Compilation (scalar alpha)   : ~{t_first - t_second:.0f} ms  (one-time per shape)")
-    print(f"  Compilation (pertoken alpha) : ~{t_pt_first - t_second:.0f} ms  (incremental)")
-    print(f"  GPU kernel  (scalar alpha)   : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
-    print(f"  GPU kernel  (pertoken alpha) : {t_pt_exec*1e3:.1f} µs")
-    print(f"  Python dispatch per call     : ~{t_single:.0f} ms")
-    print(f"  => GPU kernel is the bottleneck at steady state")
+    print(f"  Compilation          : ~{t_first - t_second:.0f} ms  (one-time per shape)")
+    print(f"  GPU kernel           : {t_exec*1e3:.1f} µs  @ {tflops_val:.2f} TFLOPS")
+    print(f"  Steady-state (full)  : {t_steady_us:.1f} µs")
+    print(f"  Python overhead      : ~{t_steady_us - t_exec*1e3:.1f} µs")
     sep()
 
 

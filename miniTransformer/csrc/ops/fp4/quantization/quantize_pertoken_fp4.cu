@@ -80,7 +80,7 @@ __global__ void fp4_pertoken_kernel(
     float scale_override,
     int cols_div16)   // cols / 16
 {
-    extern __shared__ nv_bfloat16 smem[];   // blockDim.x bf16 slots
+    extern __shared__ nv_bfloat16 smem[];   // blockDim.x + 1 bf16 slots (extra OOB guard)
 
     const int row           = blockIdx.x;
     const int tid           = threadIdx.x;
@@ -91,6 +91,9 @@ __global__ void fp4_pertoken_kernel(
     // ---- Step 1: per-row abs-max via shared-memory tree reduce ----
     nv_bfloat16 local_abs_max = vecReduceAbsMax(x);
     smem[tid] = local_abs_max;
+    // Guard: the pairwise reduction reads smem[tid+stride+1]; when tid==stride-1
+    // that is smem[nvecs_per_row], one past the end.  Zero is safe for a max-reduce.
+    if (tid == nvecs_per_row - 1) smem[nvecs_per_row] = __float2bfloat16(0.0f);
     __syncthreads();
 
     for (int stride = nvecs_per_row / 2; stride >= 2; stride /= 2) {
@@ -169,7 +172,7 @@ static void launch_fp4_pertoken(
     const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
 {
     int threads = static_cast<int>(cols / 8);
-    size_t smem = static_cast<size_t>(threads) * sizeof(nv_bfloat16);
+    size_t smem = (static_cast<size_t>(threads) + 1) * sizeof(nv_bfloat16);
     int cdiv16  = static_cast<int>(cols / 16);
 
     if (num_candidates == 2 && swizzle)

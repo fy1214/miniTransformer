@@ -22,7 +22,7 @@ nvfp4_scale_t = torch.float8_e4m3fn
 use_cpp_allocator = False
 
 
-class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
+class Nvfp4Cursor2QuantizeOpRef(quantization.QuantizeOpBase):
     """
   NVFP4 quantize op for GroupLinear (cursor2 path):
 

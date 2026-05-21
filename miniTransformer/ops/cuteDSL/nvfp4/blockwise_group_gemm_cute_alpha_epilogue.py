@@ -482,18 +482,27 @@ class Sm100GroupedBlockScaledGemmKernel:
             _shapes[_shape_key] = (_t_mnkl, _t_strides)
         tensor_of_dim_size_mnkl, tensor_of_strides_abc = _shapes[_shape_key]
 
-        tensor_of_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_ptrs_sfasfb, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
+        _ptrs = self._run_cache.setdefault("ptrs", {})
+        _ptrs_abc_key = (tuple(tuple(r) for r in ptrs_abc), str(device))
+        if _ptrs_abc_key not in _ptrs:
+            _ptrs[_ptrs_abc_key], _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
+                cutlass.Int64,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+        tensor_of_ptrs_abc = _ptrs[_ptrs_abc_key]
+
+        _ptrs_sfasfb_key = (tuple(tuple(r) for r in ptrs_sfasfb), str(device))
+        if _ptrs_sfasfb_key not in _ptrs:
+            _ptrs[_ptrs_sfasfb_key], _ = cutlass_torch.cute_tensor_like(
+                torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
+                cutlass.Int64,
+                is_dynamic_layout=False,
+                assumed_align=16,
+            )
+        tensor_of_ptrs_sfasfb = _ptrs[_ptrs_sfasfb_key]
+
         tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
             alpha_buf,
             cutlass.Float32,

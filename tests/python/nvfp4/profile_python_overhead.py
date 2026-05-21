@@ -268,7 +268,7 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
         timings["10b_default_stream"] = now_us() - t0
 
         # ------------------------------------------------------------------ #
-        # Stage 11: first compiled_grouped_gemm call (tensormap init + kernel)
+        # Stage 11: kernel dispatch (async, no sync — mirrors production path)
         # ------------------------------------------------------------------ #
         t0 = now_us()
         compiled_grouped_gemm(
@@ -285,65 +285,7 @@ class StagedKernel(Sm100GroupedBlockScaledGemmKernel):
             tensor_of_tensormap,
             current_stream,
         )
-        torch.cuda.synchronize()
-        timings["11_first_dispatch_syncd"] = now_us() - t0
-
-        # ------------------------------------------------------------------ #
-        # Stage 12: workspace list setup (iterations=1 path)
-        # ------------------------------------------------------------------ #
-        t0 = now_us()
-        workspace_ptrs_abc    = [tensor_of_ptrs_abc]
-        workspace_ptrs_sfasfb = [tensor_of_ptrs_sfasfb]
-        workspace_strides_abc = [tensor_of_strides_abc]
-        workspace_tensormap   = [tensor_of_tensormap]
-        exec_step = 0
-        timings["12_workspace_setup"] = now_us() - t0
-
-        # ------------------------------------------------------------------ #
-        # Stage 13: CUDA event create + record start
-        # ------------------------------------------------------------------ #
-        t0 = now_us()
-        start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt   = torch.cuda.Event(enable_timing=True)
-        start_evt.record()
-        timings["13_event_create_record"] = now_us() - t0
-
-        # ------------------------------------------------------------------ #
-        # Stage 14: benchmark_call (1 iteration) — Python dispatch only
-        # ------------------------------------------------------------------ #
-        t0 = now_us()
-        ws_idx = exec_step % len(workspace_ptrs_abc)
-        exec_step += 1
-        compiled_grouped_gemm(
-            initial_cute_tensors_abc[0],
-            initial_cute_tensors_abc[1],
-            initial_cute_tensors_abc[2],
-            initial_cute_tensors_sfasfb[0],
-            initial_cute_tensors_sfasfb[1],
-            tensor_of_dim_size_mnkl,
-            workspace_strides_abc[ws_idx],
-            workspace_ptrs_abc[ws_idx],
-            workspace_ptrs_sfasfb[ws_idx],
-            tensor_of_alpha_buf,
-            workspace_tensormap[ws_idx],
-            current_stream,
-        )
-        timings["14_benchmark_dispatch"] = now_us() - t0
-
-        # ------------------------------------------------------------------ #
-        # Stage 15: end event record + synchronize
-        # ------------------------------------------------------------------ #
-        t0 = now_us()
-        end_evt.record()
-        torch.cuda.synchronize()
-        timings["15_event_record_sync"] = now_us() - t0
-
-        # ------------------------------------------------------------------ #
-        # Stage 16: elapsed_time + metrics append
-        # ------------------------------------------------------------------ #
-        t0 = now_us()
-        _ = start_evt.elapsed_time(end_evt)
-        timings["16_elapsed_metrics"] = now_us() - t0
+        timings["11_dispatch_async"] = now_us() - t0
 
         return timings
 
@@ -370,18 +312,23 @@ def main():
     )
     print("Done. Warming up instrumented path...")
 
-    # Warmup
-    for _ in range(WARMUP):
-        kernel.run_instrumented(abc, sfasfb, problem_sizes)
-
-    # Measure wall time of real run_from_grouped_inputs (ground truth)
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(MEASURE):
+    def prod_call():
         kernel.run_from_grouped_inputs(
             abc_tensors=abc, sfasfb_tensors=sfasfb,
             problem_sizes=problem_sizes, out_dtype=torch.bfloat16,
+            iterations=0,
         )
+
+    # Warmup
+    for _ in range(WARMUP):
+        kernel.run_instrumented(abc, sfasfb, problem_sizes)
+        prod_call()
+
+    # Ground-truth: wall time of real run_from_grouped_inputs with iterations=0 + sync
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE):
+        prod_call()
     torch.cuda.synchronize()
     wall_us = (time.perf_counter() - t0) / MEASURE * 1e6
 

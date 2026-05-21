@@ -1,4 +1,9 @@
+from __future__ import annotations
+
 import functools
+from dataclasses import dataclass
+from typing import List
+
 import torch
 import fp4_gemm
 
@@ -7,6 +12,8 @@ from miniTransformer.utils import utils
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
+
+_MMA_TILE_ROWS = 128   # tcgen05 MMA tile height; scale buffers must be padded to this
 
 # FP4 E2M1 value lookup table: index (nibble 0–15) → float (CPU master copy)
 _FP4_GRID = torch.tensor(
@@ -246,3 +253,107 @@ def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> t
     scale_expanded = scale_rm.repeat_interleave(16, dim=1)             # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)                   # [m, 1]
     return (fp4_vals * scale_expanded * gs).to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Grouped per-token quantization with per-group tcgen05 swizzled scale layout
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroupQuantizeSwizzledResult:
+    """Output of group_quantize_nvfp4_pertoken_swizzled.
+
+    data          – [total_m, k//2] uint8, packed FP4x2, row-major.
+    global_scale  – [total_m] float32, per-row global scale.
+    scale_flat    – flat FP8 buffer; group g lives at
+                    scale_flat[scale_offsets[g]:scale_offsets[g+1]].
+    scale_views   – list[Tensor | None], one per group, shaped (32,4,nMT,4,nKT,1)
+                    matching the tensor returned by _make_cute_sf, ready for the
+                    Sm100 GEMM kernel.  None for empty groups (m_i == 0).
+    scale_offsets – list[int], len = num_groups+1, cumulative FP8 element counts.
+    row_offsets   – list[int], len = num_groups+1, cumulative row counts.
+    """
+    data:          torch.Tensor
+    global_scale:  torch.Tensor
+    scale_flat:    torch.Tensor
+    scale_views:   List[torch.Tensor]
+    scale_offsets: List[int]
+    row_offsets:   List[int]
+
+
+_SCALE_VIEW_PERM = (3, 4, 1, 5, 2, 0)   # matches mma_permute_order in nvfp4_qgemm.py
+
+
+def group_quantize_nvfp4_pertoken_swizzled(
+    x: torch.Tensor,
+    m_splits: List[int],
+    *,
+    four_six: bool = False,
+    scale_override: float = 1.0,
+) -> GroupQuantizeSwizzledResult:
+    """Grouped per-token NVFP4 quantization with per-group tcgen05 swizzled scales.
+
+    Replaces the D2H → CPU CuTeDSL layout-conversion → H2D path in
+    grouped_gemm_nvfp4_impl._make_cute_sf with a single GPU kernel launch.
+
+    Args:
+        x:              2-D BF16 tensor [total_m, k], contiguous, on CUDA.
+                        k must be divisible by 128 and <= 4096.
+        m_splits:       Row counts per group; sum must equal x.shape[0].
+        four_six:       Round-4-or-6 if True; RTN otherwise (default).
+        scale_override: Scalar multiplier for the per-row global scale.
+
+    Returns:
+        GroupQuantizeSwizzledResult.  scale_views[g] is shaped (32,4,nMT,4,nKT,1)
+        and has the same memory layout as what _make_cute_sf returns, so it can
+        be passed directly to Sm100GroupedBlockScaledGemmKernel without changes.
+
+    Scale buffer sizing per group:
+        Each group allocates ceil(m_i/128)*128 * k//16 elements (zero-padded).
+        Padding to the next 128-row tile boundary is mandatory: the tcgen05
+        swizzle formula addresses the full tile even when m_i < 128.
+    """
+    assert x.is_cuda and x.dtype == torch.bfloat16, "x must be a CUDA bfloat16 tensor"
+    assert x.dim() == 2 and x.is_contiguous(), "x must be a contiguous 2-D tensor"
+    assert sum(m_splits) == x.shape[0], "sum(m_splits) must equal x.shape[0]"
+
+    total_m, k = x.shape
+    device = x.device
+
+    row_offsets: List[int] = [0]
+    scale_offsets: List[int] = [0]
+    for m_i in m_splits:
+        row_offsets.append(row_offsets[-1] + m_i)
+        m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+        scale_offsets.append(scale_offsets[-1] + m_padded * k // 16)
+
+    data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
+    global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
+    scale_flat   = torch.zeros(scale_offsets[-1], dtype=nvfp4_scale_t, device=device)
+
+    row_offsets_gpu   = torch.tensor(row_offsets,   dtype=torch.int32, device=device)
+    scale_offsets_gpu = torch.tensor(scale_offsets, dtype=torch.int64, device=device)
+
+    fn = fp4_gemm.four_six_fp4_group_pertoken if four_six else fp4_gemm.rtn_fp4_group_pertoken
+    fn(data, scale_flat, global_scale, x, row_offsets_gpu, scale_offsets_gpu, scale_override)
+
+    nKT = k // 64
+    scale_views: List[torch.Tensor] = []
+    for g, m_i in enumerate(m_splits):
+        if m_i == 0:
+            scale_views.append(None)
+            continue
+        m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+        nMT  = m_padded // _MMA_TILE_ROWS
+        sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
+        view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
+        scale_views.append(view)
+
+    return GroupQuantizeSwizzledResult(
+        data=data,
+        global_scale=global_scale,
+        scale_flat=scale_flat,
+        scale_views=scale_views,
+        scale_offsets=scale_offsets,
+        row_offsets=row_offsets,
+    )

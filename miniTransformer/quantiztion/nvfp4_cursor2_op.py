@@ -135,6 +135,41 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
         self.should_update_quantize_weights = True
+        # Cached quantizers — rebuilt only when num_gemms or qparams change.
+        self._cached_num_gemms: int = 0
+        self._w_quantizers_fp8: List = []   # rowwise=False, columnwise=True
+        self._x_quantizers: List = []       # rowwise=False, columnwise=True
+        self._dy_quantizers: List = []      # rowwise=True,  columnwise=True
+        self._w_quantizer_fp4: Optional[NVFP4Quantizer] = None
+        self._cached_fp4_key: tuple = ()    # (with_rht, with_2d_quantization, stochastic_rounding)
+
+    def _refresh_quantizer_cache(self, num_gemms: int) -> None:
+        """Rebuild MXFP8 quantizer lists when num_gemms changes."""
+        if self._cached_num_gemms == num_gemms:
+            return
+        self._cached_num_gemms = num_gemms
+        fp8_col = dict(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
+        fp8_both = dict(rowwise=True, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
+        self._w_quantizers_fp8 = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
+        self._x_quantizers = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
+        self._dy_quantizers = [MXFP8Quantizer(**fp8_both) for _ in range(num_gemms)]
+
+    def _get_w_quantizer_fp4(self, qparams) -> NVFP4Quantizer:
+        """Return a cached NVFP4Quantizer, rebuilding only when qparams change."""
+        key = (qparams.with_rht, qparams.with_2d_quantization, qparams.stochastic_rounding)
+        if self._w_quantizer_fp4 is None or self._cached_fp4_key != key:
+            self._cached_fp4_key = key
+            self._w_quantizer_fp4 = NVFP4Quantizer(
+                rowwise=True,
+                columnwise=True,
+                with_amax_reduction=False,
+                amax_reduction_group=None,
+                with_rht=qparams.with_rht,
+                with_post_rht_amax=qparams.with_rht,
+                with_2d_quantization=qparams.with_2d_quantization,
+                stochastic_rounding=qparams.stochastic_rounding,
+            )
+        return self._w_quantizer_fp4
 
     @property
     def supports_allgather(self) -> bool:
@@ -262,25 +297,22 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         )
 
         num_gemms = len(m_splits)
+        self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            quantize_tensor_list = []
-            quantize_tensor_list_transpose = []
-            for i in range(num_gemms):
-                w_quantizer_fp4 = NVFP4Quantizer(
-                    rowwise=True,
-                    columnwise=True,
-                    with_amax_reduction=False,
-                    amax_reduction_group=None,
-                    with_rht=qparams.with_rht,
-                    with_post_rht_amax=qparams.with_rht,
-                    with_2d_quantization=qparams.with_2d_quantization,
-                    stochastic_rounding=qparams.stochastic_rounding,
+            w_quantizer_fp4 = self._get_w_quantizer_fp4(qparams)
+            quantize_tensor_list = [
+                w_quantizer_fp4.quantize(x[i]) for i in range(num_gemms)
+            ]
+            if return_transpose:
+                w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
+                quantize_tensor_list_transpose = tex.split_quantize(
+                    x.reshape(-1, x.shape[-1]),
+                    w_out_splits,
+                    self._w_quantizers_fp8,
                 )
-                quantize_tensor_list.append(w_quantizer_fp4.quantize(x[i]))
-                if return_transpose:
-                    w_quantizer_fp8 = MXFP8Quantizer(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
-                    quantize_tensor_list_transpose.append(w_quantizer_fp8.quantize(x[i]))
+            else:
+                quantize_tensor_list_transpose = []
 
             return GroupQuantizeResult(
                 data=quantize_tensor_list,
@@ -308,19 +340,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 )
             ]
 
-            # Activation: MXFP8 quant for backward
-            quantizers = []
-            for i in range(num_gemms):
-                x_quantizer = MXFP8Quantizer(
-                    rowwise=False,
-                    columnwise=True,
-                    fp8_dtype=tex.DType.kFloat8E4M3
-                )
-                quantizers.append(x_quantizer)
             quantize_tensor_list = tex.split_quantize(
                 x,
                 m_splits,
-                quantizers,
+                self._x_quantizers,
             )
             return GroupQuantizeResult(
                 data=act_list,
@@ -332,18 +355,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         # Dy: MXFP8 quant for backward
-        quantizers = []
-        for i in range(num_gemms):
-            x_quantizer = MXFP8Quantizer(
-                rowwise=True,
-                columnwise=True,
-                fp8_dtype=tex.DType.kFloat8E4M3
-            )
-            quantizers.append(x_quantizer)
         quantize_tensor_list = tex.split_quantize(
             x,
             m_splits,
-            quantizers,
+            self._dy_quantizers,
         )
         return GroupQuantizeResult(
             data=quantize_tensor_list,
@@ -397,10 +412,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         if grad:
             if layout == "NN":
-                if is_te_quantized:
-                    n_cols = B[0]._columnwise_data.size(0)
-                else:
-                    n_cols = B[0]._columnwise_data.size(0)
+                # dgrad = dy @ W → in_features = last dim of _columnwise_data.
+                # size(0) is out_features; size(-1) is in_features.
+                n_cols = B[0]._columnwise_data.size(-1)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,

@@ -228,4 +228,4 @@ def get_or_compile_cvt_sf(
             ref_ptr, mma_ptr, mn, sf_k, l, mma_shape,
         )
         _CVT_SF_COMPILED[mma_shape] = compiled
-    compiled(ref_ptr, mma_ptr)
+    compiled(ref_ptr, mma_ptr, mn, sf_k, l, mma_shape)

@@ -10,7 +10,10 @@ import torch.nn.functional as F
 
 from typing import List, Optional
 
-from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import cvt_sf_MKL_to_M32x4xrm_K4xrk_L
+from miniTransformer.ops.cuteDSL.nvfp4.kernel_utils import (
+    cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+    get_or_compile_cvt_sf,
+)
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import cast_from_fp4x2
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
@@ -451,24 +454,19 @@ def create_cute_scale_factor_tensor(l, mn, sf_k, ref_f8_torch_tensor_cpu_permute
         _last_timing_us.setdefault("create_sf_alloc_us", 0.0)
         _last_timing_us["create_sf_alloc_us"] += (_t.perf_counter() - _t0) * 1e6
         _t0 = _t.perf_counter()
-    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-        make_ptr(
-            cutlass.Float8E4M3FN,
-            ref_f8_torch_tensor_cpu_permuted.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        ),
-        make_ptr(
-            cutlass.Float8E4M3FN,
-            cute_f8_torch_tensor_cpu.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        ),
-        mn,
-        sf_k,
-        l,
-        mma_shape,
+    ref_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        ref_f8_torch_tensor_cpu_permuted.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
     )
+    mma_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        cute_f8_torch_tensor_cpu.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    get_or_compile_cvt_sf(ref_ptr, mma_ptr, mn, sf_k, l, mma_shape)
     if _timing_enabled:
         _last_timing_us.setdefault("create_sf_cvt_jit_us", 0.0)
         _last_timing_us["create_sf_cvt_jit_us"] += (_t.perf_counter() - _t0) * 1e6

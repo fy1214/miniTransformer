@@ -334,11 +334,9 @@ def quantize_weight_nvfp4_swizzled(
 
     nMT = n_padded // _MMA_TILE_ROWS
     nKT = k // 64
-    cute_sfb = (
-        scale_flat.view(1, nMT, nKT, 32, 4, 4)
-        .permute(*_SCALE_VIEW_PERM)
-        .contiguous()
-    )
+    cute_sfb = scale_flat.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
+    # Non-contiguous intentionally: strides must match create_cute_scale_factor_tensor output
+    # (physical (1,nMT,nKT,32,4,4) C-order) so the CuTe kernel stub sees identical strides.
     cute_fp4 = _make_fp4_tensor_for_cutedsl(data, n, k, device)
 
     t = TensorGlobalNvfp4Tensor(

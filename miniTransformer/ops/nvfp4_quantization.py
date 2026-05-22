@@ -152,8 +152,13 @@ def quantize_nvfp4_pertoken(
     scale = torch.empty((rows, cols // 16), dtype=nvfp4_scale_t, device=x.device)
     global_scale = torch.empty(rows, dtype=torch.float32, device=x.device)
 
-    fn = fp4_gemm.four_six_fp4_pertoken_linear if four_six else fp4_gemm.rtn_fp4_pertoken_linear
-    fn(out, scale, global_scale, x_c, scale_override)
+    if cols <= 8192:
+        fn = fp4_gemm.four_six_fp4_pertoken_linear_fused if four_six else fp4_gemm.rtn_fp4_pertoken_linear_fused
+        fn(out, scale, global_scale, x_c, scale_override)
+    else:
+        amax_per_row = x_c.abs().amax(dim=1).to(torch.float32)
+        fn = fp4_gemm.four_six_fp4_pertoken_linear if four_six else fp4_gemm.rtn_fp4_pertoken_linear
+        fn(out, scale, global_scale, x_c, amax_per_row, scale_override)
 
     return quantization.QuantizeResult(
         data=out,
@@ -196,8 +201,13 @@ def quantize_nvfp4_pertoken_swizzled(
     scale = torch.empty(rows * cols // 16, dtype=nvfp4_scale_t, device=x.device)
     global_scale = torch.empty(rows, dtype=torch.float32, device=x.device)
 
-    fn = fp4_gemm.four_six_fp4_pertoken if four_six else fp4_gemm.rtn_fp4_pertoken
-    fn(out, scale, global_scale, x_c, scale_override)
+    if cols <= 8192:
+        fn = fp4_gemm.four_six_fp4_pertoken_fused if four_six else fp4_gemm.rtn_fp4_pertoken_fused
+        fn(out, scale, global_scale, x_c, scale_override)
+    else:
+        amax_per_row = x_c.abs().amax(dim=1).to(torch.float32)
+        fn = fp4_gemm.four_six_fp4_pertoken if four_six else fp4_gemm.rtn_fp4_pertoken
+        fn(out, scale, global_scale, x_c, amax_per_row, scale_override)
 
     return quantization.QuantizeResult(
         data=out,

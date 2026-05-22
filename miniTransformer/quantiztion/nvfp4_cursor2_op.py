@@ -97,10 +97,11 @@ def _grouped_gemm_cutedsl_pertoken(
             b_data = getattr(b, 'data_uint8', b)
             a_gs   = getattr(a, 'global_scale', None)
             b_alpha = getattr(b, '_alpha_b_cached', None)
+            gs_str    = f"{a_gs.abs().max().item():.4g}" if a_gs is not None else "N/A"
+            alpha_str = f"{b_alpha:.4g}" if b_alpha is not None else "N/A"
+            gs_nan_str = f"{a_gs.isnan().any().item()}" if a_gs is not None else "N/A"
             print(f"[GEMM PRE g={i}] A.data={a_data.shape} B.data={b_data.shape} "
-                  f"A.gs_nan={a_gs.isnan().any().item() if a_gs is not None else 'N/A'} "
-                  f"A.gs_max={a_gs.abs().max().item():.4g if a_gs is not None else 'N/A'} "
-                  f"B.alpha_b={b_alpha:.4g if b_alpha is not None else 'N/A'}", flush=True)
+                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} B.alpha_b={alpha_str}", flush=True)
 
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
 

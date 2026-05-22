@@ -55,7 +55,7 @@ pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or
 # ---------------------------------------------------------------------------
 
 try:
-    from miniTransformer.ops.nvfp4_quantization import (
+    from miniTransformer.ops.nvfp4_quantize import (
         GroupQuantizeSwizzledResult,
         group_quantize_nvfp4_pertoken_swizzled,
     )

@@ -323,7 +323,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         if qparams.param_type == qparams.param_type.X:
-            from miniTransformer.ops.nvfp4_quantization import group_quantize_nvfp4_pertoken_swizzled
+            from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
 
             gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
             act_list: List[PertokenNvfp4Tensor] = [

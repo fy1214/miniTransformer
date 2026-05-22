@@ -231,7 +231,7 @@ def _pad_2d_to_multiples_of_32(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int
 
 def quantize_weight_nvfp4_tensor_global(x: torch.Tensor) -> TensorGlobalNvfp4Tensor:
     # Tensor-global amax: CUDA fp4_gemm path.
-    from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
+    from miniTransformer.ops.nvfp4_quantize import quantize_nvfp4_cuda
 
     assert x.ndim == 2
     assert x.is_cuda, "quantize_weight_nvfp4_tensor_global requires a CUDA tensor."

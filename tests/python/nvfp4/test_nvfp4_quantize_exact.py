@@ -21,7 +21,7 @@ except ImportError:
 
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.quantization import QParams
-from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
+from miniTransformer.ops.nvfp4_quantize import quantize_nvfp4_cuda
 
 try:
     from transformer_engine.pytorch import NVFP4Quantizer

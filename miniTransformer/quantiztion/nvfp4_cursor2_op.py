@@ -88,7 +88,24 @@ def _grouped_gemm_cutedsl_pertoken(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
+    if _GEMM_CALL_COUNT < 3:
+        for i, (a, b) in enumerate(zip(A, B)):
+            a_data = getattr(a, 'data_uint8', a)
+            b_data = getattr(b, 'data_uint8', b)
+            a_gs   = getattr(a, 'global_scale', None)
+            b_alpha = getattr(b, '_alpha_b_cached', None)
+            print(f"[GEMM PRE g={i}] A.data={a_data.shape} B.data={b_data.shape} "
+                  f"A.gs_nan={a_gs.isnan().any().item() if a_gs is not None else 'N/A'} "
+                  f"A.gs_max={a_gs.abs().max().item():.4g if a_gs is not None else 'N/A'} "
+                  f"B.alpha_b={b_alpha:.4g if b_alpha is not None else 'N/A'}", flush=True)
+
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    if _GEMM_CALL_COUNT < 3:
+        res_t = res if isinstance(res, torch.Tensor) else res[0] if res else None
+        if res_t is not None:
+            print(f"[GEMM POST   ] out={res_t.shape} nan={res_t.isnan().any().item()} "
+                  f"inf={res_t.isinf().any().item()} max={res_t.abs().max().item():.4g}", flush=True)
 
     if do_timing:
         torch.cuda.synchronize()
@@ -301,9 +318,24 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.WEIGHT:
             from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
 
+            if _GEMM_CALL_COUNT < 3:
+                for i in range(num_gemms):
+                    wi = x[i]
+                    print(f"[W-QUANT PRE  g={i}] shape={wi.shape} dtype={wi.dtype} "
+                          f"nan={wi.isnan().any().item()} inf={wi.isinf().any().item()} "
+                          f"max={wi.abs().max().item():.4g}", flush=True)
+
             quantize_tensor_list = [
                 quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
             ]
+
+            if _GEMM_CALL_COUNT < 3:
+                for i, t in enumerate(quantize_tensor_list):
+                    sfb = t.block_scale_fp8
+                    print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
+                          f"sfb_nan={sfb.isnan().any().item()} sfb_inf={sfb.isinf().any().item()} "
+                          f"alpha_b={t._alpha_b_cached:.4g}", flush=True)
+
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
                 quantize_tensor_list_transpose = tex.split_quantize(
@@ -326,7 +358,22 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.X:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
 
+            if _GEMM_CALL_COUNT < 3:
+                print(f"[X-QUANT PRE ] shape={x.shape} dtype={x.dtype} "
+                      f"nan={x.isnan().any().item()} inf={x.isinf().any().item()} "
+                      f"max={x.abs().max().item():.4g} m_splits={m_splits}", flush=True)
+
             gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+
+            if _GEMM_CALL_COUNT < 3:
+                print(f"[X-QUANT POST] data={gq.data.shape} "
+                      f"data_nan={gq.data.isnan().any().item()} "
+                      f"gs_nan={gq.global_scale.isnan().any().item()} "
+                      f"gs_inf={gq.global_scale.isinf().any().item()} "
+                      f"gs_max={gq.global_scale.abs().max().item():.4g} "
+                      f"sfb_nan={gq.scale_flat.isnan().any().item()} "
+                      f"sfb_inf={gq.scale_flat.isinf().any().item()}", flush=True)
+
             act_list: List[PertokenNvfp4Tensor] = [
                 PertokenNvfp4Tensor(
                     data_uint8=gq.data[gq.row_offsets[g]: gq.row_offsets[g + 1]],

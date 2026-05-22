@@ -198,3 +198,42 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
     pass
+
+
+_CVT_SF_COMPILED: dict = {}  # mma_shape → compiled callable
+
+
+def get_or_compile_cvt_sf(
+    ref_ptr: cute.Pointer,
+    mma_ptr: cute.Pointer,
+    mn: int,
+    sf_k: int,
+    l: int,
+    mma_shape: tuple,
+):
+    """Compile cvt_sf_MKL_to_M32x4xrm_K4xrk_L once per (mn, sf_k, l, mma_shape), cache for reuse.
+
+    @cute.jit recompiles on every call with no cross-call caching.  This wrapper
+    calls cute.compile() explicitly and re-uses the compiled callable for all
+    subsequent calls with the same (mn, sf_k, l, mma_shape).
+
+    Note: mma_shape encodes only ceil_div(mn, 128), not mn itself.  Multiple distinct
+    mn values can share the same mma_shape, but CuTeDSL treats mn as a compile-time
+    constant — using the wrong compiled kernel for a different mn causes illegal
+    instruction errors.  The full (mn, sf_k, l, mma_shape) tuple is therefore the
+    correct cache key.
+    """
+    cache_key = (mn, sf_k, l, mma_shape)
+    compiled = _CVT_SF_COMPILED.get(cache_key)
+    if compiled is None:
+        import logging
+        logging.getLogger(__name__).info(
+            "[CuTeDSL] cvt_sf: compiling for mn=%d sf_k=%d l=%d mma_shape=%s",
+            mn, sf_k, l, mma_shape,
+        )
+        compiled = cute.compile(
+            cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+            ref_ptr, mma_ptr, mn, sf_k, l, mma_shape,
+        )
+        _CVT_SF_COMPILED[cache_key] = compiled
+    compiled(ref_ptr, mma_ptr, mn, sf_k, l, mma_shape)

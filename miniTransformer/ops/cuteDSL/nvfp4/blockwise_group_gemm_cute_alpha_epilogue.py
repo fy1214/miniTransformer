@@ -299,6 +299,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         # _SHAPES_CACHE_MAX: caps _run_cache['shapes'] to avoid unbounded growth in dynamic-M MoE
         # (each distinct problem_sizes tuple creates a new entry; in practice <= 32 distinct configs)
         self._SHAPES_CACHE_MAX = 128
+        # Pre-allocated in-place buffers for shapes/ptrs — updated every call, never reallocated.
+        # Keyed on (num_groups, out_dtype_str, device_str) — only reallocated when num_groups changes.
+        self._inplace_buf: dict = {}
 
     @staticmethod
     def _extract_ptrs_from_groups(grouped_tensors: List[List[torch.Tensor]]) -> List[List[int]]:
@@ -350,6 +353,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         out_dtype: torch.dtype = torch.bfloat16,
         accumulate: bool = False,
         alphas: Optional[List[torch.Tensor]] = None,
+        alphas_packed: Optional[torch.Tensor] = None,
         host_problem_shape_available: bool = True,
         warmup_iterations: int = 0,
         iterations: int = 1,
@@ -363,10 +367,23 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
         device = abc_tensors["torch"][0][0].device
 
-        # Alpha buffer caching: when alphas=None (all-ones), cache both the packed
-        # buffer and its cute_tensor_like wrapper to avoid repeated torch.ones + cat.
         _alpha_cache = self._run_cache.setdefault("alpha_buf", {})
-        if alphas is None:
+        if alphas_packed is not None:
+            # Pre-packed contiguous [sum(M_i)] float32 tensor from caller.
+            # Cache a cute_tensor_like wrapper keyed by (total_M, device); reuse the
+            # underlying raw buffer via copy_ to avoid a new cute_tensor_like each call.
+            total_m = alphas_packed.shape[0]
+            _packed_key = (total_m, str(device))
+            if _packed_key not in _alpha_cache:
+                raw_buf = torch.empty(total_m, dtype=torch.float32, device=device)
+                wrapper, _ = cutlass_torch.cute_tensor_like(
+                    raw_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
+                )
+                _alpha_cache[_packed_key] = (raw_buf, wrapper)
+            raw_buf, tensor_of_alpha_buf = _alpha_cache[_packed_key]
+            raw_buf.copy_(alphas_packed)
+        elif alphas is None:
+            # All-ones alpha: fully cacheable.
             _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
             if _alpha_key not in _alpha_cache:
                 alphas_list = [
@@ -383,7 +400,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 _alpha_cache[_alpha_key] = tensor_of_alpha_buf
             tensor_of_alpha_buf = _alpha_cache[_alpha_key]
         else:
-            # User-provided alphas: no caching (may vary per call)
+            # Fallback: list of per-group tensors (legacy callers).
             alpha_buf = Sm100GroupedBlockScaledGemmKernel._pack_alpha_buf(alphas, device)
             tensor_of_alpha_buf, _ = cutlass_torch.cute_tensor_like(
                 alpha_buf,
@@ -484,47 +501,45 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
         tensor_of_tensormap = _tmaps[_tmap_key]
 
-        _shape_key = (tuple(tuple(ps) for ps in problem_sizes), str(out_dtype))
-        _shapes = self._run_cache.setdefault("shapes", {})
-        if _shape_key not in _shapes:
-            if len(_shapes) >= self._SHAPES_CACHE_MAX:
-                # FIFO eviction: drop oldest entry to bound memory growth in dynamic-M MoE workloads
-                _shapes.pop(next(iter(_shapes)))
-            _t_mnkl, _ = cutlass_torch.cute_tensor_like(
-                torch.tensor(problem_sizes, dtype=torch.int32, device=device),
-                cutlass.Int32,
-                is_dynamic_layout=False,
-                assumed_align=16,
+        # Stages 7 & 8: in-place buffer update — avoids per-call GPU allocation and CUTE tensor
+        # creation for shapes/ptrs tensors that change every step in dynamic-M MoE workloads.
+        # cute_tensor_like() allocates an internal GPU buffer and wraps it; the CUTE tensor reads
+        # from that internal buffer, NOT from the data_ref passed in.  We therefore save the
+        # internal buffer (second return value) and update it on every call.
+        _inplace_key = (num_groups, str(out_dtype), str(device))
+        if _inplace_key not in self._inplace_buf:
+            _cute_mnkl, _buf_mnkl = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, 4), dtype=torch.int32, device=device),
+                cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
             )
-            _t_strides, _ = cutlass_torch.cute_tensor_like(
-                torch.tensor(strides_abc, dtype=torch.int32, device=device),
-                cutlass.Int32,
-                is_dynamic_layout=False,
-                assumed_align=16,
+            _cute_strides, _buf_strides = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, 3, 2), dtype=torch.int32, device=device),
+                cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
             )
-            _shapes[_shape_key] = (_t_mnkl, _t_strides)
-        tensor_of_dim_size_mnkl, tensor_of_strides_abc = _shapes[_shape_key]
-
-        _ptrs = self._run_cache.setdefault("ptrs", {})
-        _ptrs_abc_key = (tuple(tuple(r) for r in ptrs_abc), str(device))
-        if _ptrs_abc_key not in _ptrs:
-            _ptrs[_ptrs_abc_key], _ = cutlass_torch.cute_tensor_like(
-                torch.tensor(ptrs_abc, dtype=torch.int64, device=device),
-                cutlass.Int64,
-                is_dynamic_layout=False,
-                assumed_align=16,
+            _cute_ptrs_abc, _buf_ptrs_abc = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, len(ptrs_abc[0])), dtype=torch.int64, device=device),
+                cutlass.Int64, is_dynamic_layout=False, assumed_align=16,
             )
-        tensor_of_ptrs_abc = _ptrs[_ptrs_abc_key]
-
-        _ptrs_sfasfb_key = (tuple(tuple(r) for r in ptrs_sfasfb), str(device))
-        if _ptrs_sfasfb_key not in _ptrs:
-            _ptrs[_ptrs_sfasfb_key], _ = cutlass_torch.cute_tensor_like(
-                torch.tensor(ptrs_sfasfb, dtype=torch.int64, device=device),
-                cutlass.Int64,
-                is_dynamic_layout=False,
-                assumed_align=16,
+            _cute_ptrs_sfasfb, _buf_ptrs_sfasfb = cutlass_torch.cute_tensor_like(
+                torch.empty((num_groups, len(ptrs_sfasfb[0])), dtype=torch.int64, device=device),
+                cutlass.Int64, is_dynamic_layout=False, assumed_align=16,
             )
-        tensor_of_ptrs_sfasfb = _ptrs[_ptrs_sfasfb_key]
+            self._inplace_buf[_inplace_key] = (
+                _buf_mnkl, _cute_mnkl,
+                _buf_strides, _cute_strides,
+                _buf_ptrs_abc, _cute_ptrs_abc,
+                _buf_ptrs_sfasfb, _cute_ptrs_sfasfb,
+            )
+        (
+            _buf_mnkl, tensor_of_dim_size_mnkl,
+            _buf_strides, tensor_of_strides_abc,
+            _buf_ptrs_abc, tensor_of_ptrs_abc,
+            _buf_ptrs_sfasfb, tensor_of_ptrs_sfasfb,
+        ) = self._inplace_buf[_inplace_key]
+        _buf_mnkl.copy_(torch.tensor(problem_sizes, dtype=torch.int32))
+        _buf_strides.copy_(torch.tensor(strides_abc, dtype=torch.int32))
+        _buf_ptrs_abc.copy_(torch.tensor(ptrs_abc, dtype=torch.int64))
+        _buf_ptrs_sfasfb.copy_(torch.tensor(ptrs_sfasfb, dtype=torch.int64))
 
         def compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn) -> int:
             total = 0

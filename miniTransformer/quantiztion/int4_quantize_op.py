@@ -43,22 +43,7 @@ from typing import List, Optional, Tuple
 
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
-
-# 兼容性处理：旧版 quantization.py 没有 GroupQuantizeResult，自行定义
-try:
-    from miniTransformer.quantiztion.quantization import GroupQuantizeResult, ParamType
-except ImportError:
-    from miniTransformer.quantiztion.quantization import ParamType
-
-    @dataclasses.dataclass
-    class GroupQuantizeResult:
-        """本地定义的 GroupQuantizeResult，兼容旧版 quantization.py。"""
-        data: List[torch.Tensor]
-        scale: List[torch.Tensor]
-        data_t: List[torch.Tensor] = None
-        scale_t: List[torch.Tensor] = None
-        tensor_scale: List[torch.Tensor] = None
-        tensor_scale_t: List[torch.Tensor] = None
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult, ParamType
 
 
 # ── TE 延迟导入（避免循环 import）────────────────────────────────────────

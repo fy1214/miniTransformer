@@ -10,10 +10,16 @@ Quantization sources:
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
+
+# Lightweight timing hook — set by nvfp4_cursor2_op._grouped_gemm_cutedsl_pertoken
+# when it wants a breakdown; zero cost when False.
+_timing_enabled: bool = False
+_last_timing_us: dict = {}
 
 from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
 from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2, cast_to_fp4x2
@@ -33,14 +39,20 @@ class PertokenNvfp4Tensor:
 
     data_uint8: torch.Tensor
     block_scale: torch.Tensor
-    global_scale: torch.Tensor
+    # Per-group slice [m_i] — only needed for reference/dequant paths.
+    # Production forward (grouped_gemm_cutedsl_pertoken) uses global_scale_full instead.
+    global_scale: Optional[torch.Tensor] = None
+    # Full unsplit [M_total] global_scale from the parent quantization call.
+    # When set, grouped_gemm_cutedsl_pertoken uses it directly to build alphas_packed,
+    # avoiding a redundant split→cat round-trip.
+    global_scale_full: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.data_uint8.dtype != torch.uint8:
             raise TypeError("data_uint8 must be torch.uint8 (packed FP4x2).")
         if self.block_scale.ndim != 2:
             raise ValueError("block_scale must be 2D [M, K//16].")
-        if self.global_scale.ndim != 1:
+        if self.global_scale is not None and self.global_scale.ndim != 1:
             raise ValueError("global_scale must be 1D [M].")
 
 
@@ -55,6 +67,7 @@ class TensorGlobalNvfp4Tensor:
     # Set by precompute_cute_tensors(); None until called.
     _cute_fp4: torch.Tensor | None = None   # shape (N, K, 1), int8
     _cute_sfb: torch.Tensor | None = None   # CUTE MMA-permuted scale factor, float8_e4m3fn
+    _alpha_b_cached: float | None = None    # amax / denom, cached to avoid amax.item() each step
 
     def precompute_cute_tensors(self, device: torch.device | None = None) -> "TensorGlobalNvfp4Tensor":
         """Pre-convert weight to CUTE layout so forward passes skip D2H+permute+H2D."""
@@ -91,7 +104,8 @@ def _run_grouped_gemm_cached(
     sfasfb_torch,
     problem_sizes,
     out_dtype: torch.dtype,
-    alphas,
+    alphas=None,
+    alphas_packed=None,
 ) -> list:
     kernel = _get_nvfp4_grouped_kernel()
     return kernel.run_from_grouped_inputs(
@@ -101,6 +115,7 @@ def _run_grouped_gemm_cached(
         out_dtype=out_dtype,
         accumulate=False,
         alphas=alphas,
+        alphas_packed=alphas_packed,
         iterations=0,
         host_problem_shape_available=False,
     )
@@ -119,8 +134,19 @@ def _make_cute_sf(sf_2d: torch.Tensor, mn: int, sf_k: int, l: int = 1) -> torch.
         sf_fp8 = sf_2d[:mn, :sf_k].contiguous().view(torch.float8_e4m3fn)
     else:
         sf_fp8 = sf_2d[:mn, :sf_k]
+    if _timing_enabled:
+        torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
     ref = sf_fp8.cpu().unsqueeze(-1)
-    return create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+    if _timing_enabled:
+        _last_timing_us.setdefault("make_cute_sf_d2h_us", 0.0)
+        _last_timing_us["make_cute_sf_d2h_us"] += (_time.perf_counter() - _t0) * 1e6
+        _t0 = _time.perf_counter()
+    result = create_cute_scale_factor_tensor(l, mn, sf_k, ref)
+    if _timing_enabled:
+        _last_timing_us.setdefault("make_cute_sf_cvt_us", 0.0)
+        _last_timing_us["make_cute_sf_cvt_us"] += (_time.perf_counter() - _t0) * 1e6
+    return result
 
 
 def block_scale_to_sf_fp8(
@@ -326,7 +352,7 @@ def grouped_gemm_cutedsl_te(
         for idx, result in zip(kernel_output_indices, kernel_results):
             outputs[idx] = result
 
-    return torch.cat(outputs, dim=0)
+        return torch.cat(outputs, dim=0)
 
     return torch.cat(
         _run_grouped_gemm_cached(
@@ -338,7 +364,7 @@ def grouped_gemm_cutedsl_te(
 
 def grouped_gemm_cutedsl_pertoken(
     A: List[Union[PertokenNvfp4Tensor, torch.Tensor]],
-    B: List[Union[TensorGlobalNvfp4Tensor, PertokenNvfp4Tensor, object]],
+    B: List[Union[TensorGlobalNvfp4Tensor, object]],
     m_splits: List[int],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -352,69 +378,108 @@ def grouped_gemm_cutedsl_pertoken(
     if len(A) != len(B) or len(A) != len(m_splits):
         raise ValueError("A, B, and m_splits must have the same length.")
 
-    act0 = _resolve_pertoken_activation(A[0])
+    act0 = A[0] if isinstance(A[0], PertokenNvfp4Tensor) else _resolve_pertoken_activation(A[0])
     device = act0.data_uint8.device
     k = act0.data_uint8.shape[1] * 2
     sf_k = k // _NVFP4_SF_VEC_SIZE
 
-    abc_torch, sfasfb_torch, problem_sizes, alphas = [], [], [], []
-    # Track output tensors in original order; empty groups bypass the kernel.
+    abc_torch, sfasfb_torch, problem_sizes = [], [], []
+    alpha_b_per_group: list = []
+    active_acts: list = []
     outputs: list = []
-    kernel_output_indices: list = []  # positions in `outputs` that the kernel fills
+    kernel_output_indices: list = []
+
+    if _timing_enabled:
+        _last_timing_us.clear()
+        _loop_t0 = _time.perf_counter()
+        _last_timing_us["make_fp4_us"] = 0.0
+        _last_timing_us["block_scale_fp8_us"] = 0.0
 
     for i, m_i in enumerate(m_splits):
-        act = _resolve_pertoken_activation(A[i])
-        if isinstance(B[i], (PertokenNvfp4Tensor, TensorGlobalNvfp4Tensor)):
-            n_i = B[i].data_uint8.shape[0]
-        else:
-            n_i = B[i]._rowwise_data.shape[0]
+        act = A[i] if isinstance(A[i], PertokenNvfp4Tensor) else _resolve_pertoken_activation(A[i])
+        b = B[i]
 
-        if isinstance(B[i], PertokenNvfp4Tensor):
+        if isinstance(b, TensorGlobalNvfp4Tensor):
+            n_i = b.data_uint8.shape[0]
+            if m_i == 0:
+                outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+                continue
+            # Cache alpha_b on weight object — amax is fixed between weight updates,
+            # avoids a D2H scalar fetch on every forward pass.
+            if b._alpha_b_cached is None:
+                b._alpha_b_cached = float(b.amax.item()) / _NVFP4_GLOBAL_SCALE_DENOM
+            alpha_b = b._alpha_b_cached
+            if b._cute_fp4 is None:
+                b._cute_fp4 = _make_fp4_tensor_for_cutedsl(b.data_uint8, n_i, k, device)
+                b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
+            b_fp4, sfb = b._cute_fp4, b._cute_sfb
+
+        elif isinstance(b, PertokenNvfp4Tensor):
             raise NotImplementedError(
                 "grouped_gemm_cutedsl_pertoken supports tensor-global B only; "
                 "epilogue alpha is 1D [M] (pertoken A amax × global B amax)."
             )
 
-        if m_i == 0:
-            # No tokens for this expert: skip kernel, contribute empty output directly.
-            outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
-            continue
-
-        b_data, sfb_2d, alpha_b, b_obj = _resolve_group_weight(B[i], n_i, k)
-        a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
-
-        # Lazy CUTE-format weight cache: weights are fixed between forward passes.
-        # First call: convert and store on the weight object (D2H+permute+H2D, once).
-        # Subsequent calls: reuse cached tensors directly (zero overhead).
-        if isinstance(b_obj, TensorGlobalNvfp4Tensor):
-            if b_obj._cute_fp4 is None:
-                b_obj._cute_fp4 = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
-                b_obj._cute_sfb = _make_cute_sf(sfb_2d, n_i, sf_k)
-            b_fp4 = b_obj._cute_fp4
-            sfb = b_obj._cute_sfb
-        elif not hasattr(b_obj, "_cute_fp4_cached"):
-            # TE NVFP4 tensor (from NVFP4Quantizer): set attr lazily, freed with the tensor
-            b_obj._cute_fp4_cached = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
-            b_obj._cute_sfb_cached = _make_cute_sf(sfb_2d, n_i, sf_k)
-            b_fp4 = b_obj._cute_fp4_cached
-            sfb = b_obj._cute_sfb_cached
         else:
-            b_fp4 = b_obj._cute_fp4_cached
-            sfb = b_obj._cute_sfb_cached
+            # TE NVFP4 tensor fallback
+            n_i = b._rowwise_data.shape[0]
+            if m_i == 0:
+                outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+                continue
+            b_data, sfb_2d, alpha_b, b_obj = _resolve_group_weight(b, n_i, k)
+            if not hasattr(b_obj, "_cute_fp4_cached"):
+                b_obj._cute_fp4_cached = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
+                b_obj._cute_sfb_cached = _make_cute_sf(sfb_2d, n_i, sf_k)
+            b_fp4, sfb = b_obj._cute_fp4_cached, b_obj._cute_sfb_cached
 
+        if _timing_enabled:
+            torch.cuda.synchronize()
+            _pt = _time.perf_counter()
+        a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
         c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
-        sfa = _make_cute_sf(block_scale_to_sf_fp8(act.block_scale, m_i, k), m_i, sf_k)
+        if _timing_enabled:
+            torch.cuda.synchronize()
+            _last_timing_us["make_fp4_us"] += (_time.perf_counter() - _pt) * 1e6
+            _pt = _time.perf_counter()
+        sf_fp8 = block_scale_to_sf_fp8(act.block_scale, m_i, k)
+        if _timing_enabled:
+            torch.cuda.synchronize()
+            _last_timing_us["block_scale_fp8_us"] += (_time.perf_counter() - _pt) * 1e6
+        sfa = _make_cute_sf(sf_fp8, m_i, sf_k)
+
         abc_torch.append([a_fp4, b_fp4, c_out])
         sfasfb_torch.append([sfa, sfb])
         problem_sizes.append((m_i, n_i, k, 1))
-        alphas.append(build_group_alpha_pertoken(act, B[i], alpha_b, n_i))
+        alpha_b_per_group.append(alpha_b)
+        active_acts.append(act)
         kernel_output_indices.append(len(outputs))
-        outputs.append(None)  # placeholder, filled below
+        outputs.append(None)
 
     if abc_torch:
+        if _timing_enabled:
+            _last_timing_us["loop_us"] = (_time.perf_counter() - _loop_t0) * 1e6
+            _t = _time.perf_counter()
+
+        if active_acts[0].global_scale_full is not None:
+            global_scales = active_acts[0].global_scale_full.float()
+        else:
+            global_scales = torch.cat([a.global_scale for a in active_acts]).float()
+        alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
+        repeats = torch.tensor([ps[0] for ps in problem_sizes], dtype=torch.int64, device=device)
+        alphas_packed = global_scales * alpha_b_vec.repeat_interleave(repeats)
+
+        if _timing_enabled:
+            _last_timing_us["alpha_build_us"] = (_time.perf_counter() - _t) * 1e6
+            _t = _time.perf_counter()
+
         kernel_results = _run_grouped_gemm_cached(
-            abc_torch, sfasfb_torch, problem_sizes, out_dtype, alphas
+            abc_torch, sfasfb_torch, problem_sizes, out_dtype,
+            alphas_packed=alphas_packed,
         )
+
+        if _timing_enabled:
+            _last_timing_us["kernel_dispatch_us"] = (_time.perf_counter() - _t) * 1e6
+
         for idx, result in zip(kernel_output_indices, kernel_results):
             outputs[idx] = result
 
@@ -495,9 +560,10 @@ def dequant_pertoken_nvfp4(
     m, k_half = tensor.data_uint8.shape
     k = k_half * 2
     x = cast_from_fp4x2(tensor.data_uint8, torch.float32)
-    # Match kernel path: activation block scale is consumed as FP8 E4M3 in SFA.
     bs_fp8 = block_scale_to_sf_fp8(tensor.block_scale, m, k)
     bs = bs_fp8[:, : k // _NVFP4_SF_VEC_SIZE].float().repeat_interleave(_NVFP4_SF_VEC_SIZE, dim=1)
+    if tensor.global_scale is None:
+        raise ValueError("dequant_pertoken_nvfp4 requires global_scale; set it when constructing PertokenNvfp4Tensor.")
     gs = tensor.global_scale.reshape(m, 1).float()
     return (x * bs * gs).to(out_dtype)
 

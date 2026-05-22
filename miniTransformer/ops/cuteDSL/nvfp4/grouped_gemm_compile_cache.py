@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -188,6 +189,21 @@ def build_grouped_compile_cache_key(
     )
 
 
+def _format_compile_key(cache_key: Tuple[Any, ...]) -> str:
+    """Human-readable summary of a compile cache key."""
+    try:
+        version, variant, arch, profile_name, profile_cfg_t, num_groups, shape_key, out_dtype, host_shape = cache_key
+        shape_info = f"shape_key={shape_key}" if shape_key else "shape_key=<dynamic>"
+        return (
+            f"profile={profile_name}  variant={variant}  arch={arch}  "
+            f"num_groups={num_groups}  out_dtype={out_dtype}  "
+            f"host_problem_shape_available={host_shape}  "
+            f"{shape_info}  version={version}"
+        )
+    except Exception:
+        return repr(cache_key)
+
+
 def get_or_compile_grouped_gemm(
     cache_key: Tuple[Any, ...],
     compile_fn: Callable[[], Any],
@@ -207,8 +223,28 @@ def get_or_compile_grouped_gemm(
 
         _CACHE_MISSES += 1
         compiled = _try_load_grouped_compiled_from_disk(cache_key)
-        if compiled is None:
+        if compiled is not None:
+            key_hash = persistent_cache_hash(cache_key)
+            cache_dir = get_persistent_cache_dir()
+            disk_path = cache_dir / f"{key_hash}.o"
+            print(
+                f"[CuTeDSL] Grouped GEMM: loaded from disk cache\n"
+                f"  key  : {_format_compile_key(cache_key)}\n"
+                f"  path : {disk_path}"
+            )
+        else:
+            print(
+                f"[CuTeDSL] Grouped GEMM: JIT compiling kernel (first use for this signature)\n"
+                f"  key  : {_format_compile_key(cache_key)}"
+            )
+            if _persistent_cache_enabled():
+                key_hash = persistent_cache_hash(cache_key)
+                cache_dir = get_persistent_cache_dir()
+                print(f"  will save to: {cache_dir / f'{key_hash}.o'}")
+            t0 = _time.perf_counter()
             compiled = compile_fn()
+            elapsed_s = _time.perf_counter() - t0
+            print(f"  compiled in {elapsed_s:.1f}s")
             if _persistent_cache_enabled():
                 try:
                     try_export_compiled_to_disk(

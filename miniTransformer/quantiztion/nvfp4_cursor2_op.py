@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import fp4_gemm
 from typing import Optional, List, Tuple, Union
@@ -18,6 +19,16 @@ nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
 
 use_cpp_allocator = False
+
+# Print a timing breakdown every N grouped-GEMM calls.
+# Set to 0 to disable entirely (zero overhead on non-printing iterations).
+_GEMM_TIMING_INTERVAL: int = 50
+_GEMM_CALL_COUNT: int = 0
+
+# Capture one torch.profiler trace at this call index (0 = first call).
+# Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
+_GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
+_GEMM_PROFILED: bool = False
 
 
 def _is_sm100() -> bool:
@@ -46,8 +57,66 @@ def _grouped_gemm_cutedsl_pertoken(
     from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
         grouped_gemm_cutedsl_pertoken,
     )
+    import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
+    import time
+    global _GEMM_CALL_COUNT, _GEMM_PROFILED
 
-    return grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+    do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
+    do_profile = (
+        not _GEMM_PROFILED
+        and _GEMM_PROFILE_AT >= 0
+        and _GEMM_CALL_COUNT == _GEMM_PROFILE_AT
+    )
+
+    if do_profile:
+        profile_dir = os.environ.get("NVFP4_PROFILE_DIR", "/tmp")
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        trace_path = os.path.join(profile_dir, f"nvfp4_gemm_rank{rank}_call{_GEMM_CALL_COUNT}")
+        print(f"[GEMM #{_GEMM_CALL_COUNT:5d}] capturing torch.profiler trace → {trace_path}")
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            with_stack=True,
+        )
+        prof.__enter__()
+
+    if do_timing:
+        _impl._timing_enabled = True
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    if do_timing:
+        torch.cuda.synchronize()
+        t_us = (time.perf_counter() - t0) * 1e6
+        _impl._timing_enabled = False
+        t = _impl._last_timing_us
+        print(
+            f"[GEMM #{_GEMM_CALL_COUNT:5d}] total={t_us:8.1f} µs\n"
+            f"  loop={t.get('loop_us', float('nan')):8.1f} µs"
+            f"  | make_fp4={t.get('make_fp4_us', float('nan')):7.1f} µs"
+            f"  | block_scale_fp8={t.get('block_scale_fp8_us', float('nan')):7.1f} µs\n"
+            f"  sfa_d2h={t.get('make_cute_sf_d2h_us', float('nan')):7.1f} µs"
+            f"  | sfa_cvt={t.get('make_cute_sf_cvt_us', float('nan')):7.1f} µs"
+            f"  (alloc={t.get('create_sf_alloc_us', float('nan')):6.1f} µs"
+            f"  cvt_jit={t.get('create_sf_cvt_jit_us', float('nan')):6.1f} µs"
+            f"  h2d={t.get('create_sf_h2d_us', float('nan')):6.1f} µs)\n"
+            f"  alpha_build={t.get('alpha_build_us', float('nan')):7.1f} µs"
+            f"  | kernel_dispatch={t.get('kernel_dispatch_us', float('nan')):7.1f} µs"
+        )
+
+    if do_profile:
+        prof.__exit__(None, None, None)
+        prof.export_chrome_trace(trace_path + ".json")
+        print(f"[GEMM #{_GEMM_CALL_COUNT:5d}] trace saved to {trace_path}.json")
+        _GEMM_PROFILED = True
+
+    _GEMM_CALL_COUNT += 1
+    return res
 
 
 class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
@@ -66,6 +135,41 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
         self.should_update_quantize_weights = True
+        # Cached quantizers — rebuilt only when num_gemms or qparams change.
+        self._cached_num_gemms: int = 0
+        self._w_quantizers_fp8: List = []   # rowwise=False, columnwise=True
+        self._x_quantizers: List = []       # rowwise=False, columnwise=True
+        self._dy_quantizers: List = []      # rowwise=True,  columnwise=True
+        self._w_quantizer_fp4: Optional[NVFP4Quantizer] = None
+        self._cached_fp4_key: tuple = ()    # (with_rht, with_2d_quantization, stochastic_rounding)
+
+    def _refresh_quantizer_cache(self, num_gemms: int) -> None:
+        """Rebuild MXFP8 quantizer lists when num_gemms changes."""
+        if self._cached_num_gemms == num_gemms:
+            return
+        self._cached_num_gemms = num_gemms
+        fp8_col = dict(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
+        fp8_both = dict(rowwise=True, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
+        self._w_quantizers_fp8 = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
+        self._x_quantizers = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
+        self._dy_quantizers = [MXFP8Quantizer(**fp8_both) for _ in range(num_gemms)]
+
+    def _get_w_quantizer_fp4(self, qparams) -> NVFP4Quantizer:
+        """Return a cached NVFP4Quantizer, rebuilding only when qparams change."""
+        key = (qparams.with_rht, qparams.with_2d_quantization, qparams.stochastic_rounding)
+        if self._w_quantizer_fp4 is None or self._cached_fp4_key != key:
+            self._cached_fp4_key = key
+            self._w_quantizer_fp4 = NVFP4Quantizer(
+                rowwise=True,
+                columnwise=True,
+                with_amax_reduction=False,
+                amax_reduction_group=None,
+                with_rht=qparams.with_rht,
+                with_post_rht_amax=qparams.with_rht,
+                with_2d_quantization=qparams.with_2d_quantization,
+                stochastic_rounding=qparams.stochastic_rounding,
+            )
+        return self._w_quantizer_fp4
 
     @property
     def supports_allgather(self) -> bool:
@@ -193,25 +297,22 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         )
 
         num_gemms = len(m_splits)
+        self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            quantize_tensor_list = []
-            quantize_tensor_list_transpose = []
-            for i in range(num_gemms):
-                w_quantizer_fp4 = NVFP4Quantizer(
-                    rowwise=True,
-                    columnwise=True,
-                    with_amax_reduction=False,
-                    amax_reduction_group=None,
-                    with_rht=qparams.with_rht,
-                    with_post_rht_amax=qparams.with_rht,
-                    with_2d_quantization=qparams.with_2d_quantization,
-                    stochastic_rounding=qparams.stochastic_rounding,
+            w_quantizer_fp4 = self._get_w_quantizer_fp4(qparams)
+            quantize_tensor_list = [
+                w_quantizer_fp4.quantize(x[i]) for i in range(num_gemms)
+            ]
+            if return_transpose:
+                w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
+                quantize_tensor_list_transpose = tex.split_quantize(
+                    x.reshape(-1, x.shape[-1]),
+                    w_out_splits,
+                    self._w_quantizers_fp8,
                 )
-                quantize_tensor_list.append(w_quantizer_fp4.quantize(x[i]))
-                if return_transpose:
-                    w_quantizer_fp8 = MXFP8Quantizer(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
-                    quantize_tensor_list_transpose.append(w_quantizer_fp8.quantize(x[i]))
+            else:
+                quantize_tensor_list_transpose = []
 
             return GroupQuantizeResult(
                 data=quantize_tensor_list,
@@ -231,28 +332,18 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 PertokenNvfp4Tensor(
                     data_uint8=d,
                     block_scale=bs,
-                    global_scale=gs,
+                    global_scale_full=qresult_full.global_scale,
                 )
-                for d, bs, gs in zip(
+                for d, bs in zip(
                     torch.split(qresult_full.data_uint8, m_splits, dim=0),
                     torch.split(qresult_full.block_scale, m_splits, dim=0),
-                    torch.split(qresult_full.global_scale, m_splits, dim=0),
                 )
             ]
 
-            # Activation: MXFP8 quant for backward
-            quantizers = []
-            for i in range(num_gemms):
-                x_quantizer = MXFP8Quantizer(
-                    rowwise=False,
-                    columnwise=True,
-                    fp8_dtype=tex.DType.kFloat8E4M3
-                )
-                quantizers.append(x_quantizer)
             quantize_tensor_list = tex.split_quantize(
                 x,
                 m_splits,
-                quantizers,
+                self._x_quantizers,
             )
             return GroupQuantizeResult(
                 data=act_list,
@@ -264,18 +355,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         # Dy: MXFP8 quant for backward
-        quantizers = []
-        for i in range(num_gemms):
-            x_quantizer = MXFP8Quantizer(
-                rowwise=True,
-                columnwise=True,
-                fp8_dtype=tex.DType.kFloat8E4M3
-            )
-            quantizers.append(x_quantizer)
         quantize_tensor_list = tex.split_quantize(
             x,
             m_splits,
-            quantizers,
+            self._dy_quantizers,
         )
         return GroupQuantizeResult(
             data=quantize_tensor_list,
@@ -329,10 +412,9 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         if grad:
             if layout == "NN":
-                if is_te_quantized:
-                    n_cols = B[0]._columnwise_data.size(0)
-                else:
-                    n_cols = B[0]._columnwise_data.size(0)
+                # dgrad = dy @ W → in_features = last dim of _columnwise_data.
+                # size(0) is out_features; size(-1) is in_features.
+                n_cols = B[0]._columnwise_data.size(-1)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,

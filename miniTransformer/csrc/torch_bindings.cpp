@@ -35,6 +35,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rtn_fp4_pertoken", &rtn_fp4_pertoken_binding, "RTN FP4 quantization with per-token global scale, swizzled SF layout (CUDA)");
     m.def("four_six_fp4_pertoken_linear", &four_six_fp4_pertoken_linear_binding, "Four-Six FP4 quantization with per-token global scale, linear SF layout (CUDA)");
     m.def("rtn_fp4_pertoken_linear", &rtn_fp4_pertoken_linear_binding, "RTN FP4 quantization with per-token global scale, linear SF layout (CUDA)");
+    m.def("rtn_fp4_group_pertoken", &rtn_fp4_group_pertoken_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "RTN FP4 grouped per-token quantization with per-group swizzled SF layout (CUDA)");
+    m.def("four_six_fp4_group_pertoken", &four_six_fp4_group_pertoken_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "Round-4-or-6 FP4 grouped per-token quantization with per-group swizzled SF layout (CUDA)");
     m.def("eden_fp4", &eden_fp4_binding, "Eden FP4 quantization (CUDA)");
     m.def("group_transform_128_eden", &group_transform_128_eden_binding, "Group Transform 128 Eden (CUDA)");
     m.def("dequant_tp_had_quant", &dequant_tp_had_quant_binding, "Dequant TP Had Quant (CUDA)");

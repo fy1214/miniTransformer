@@ -25,6 +25,9 @@ use_cpp_allocator = False
 _GEMM_TIMING_INTERVAL: int = 50
 _GEMM_CALL_COUNT: int = 0
 
+# Independent debug counter for quant/GEMM prints (not gated by _GEMM_CALL_COUNT).
+_DEBUG_CALL_COUNT: int = 0
+
 # Capture one torch.profiler trace at this call index (0 = first call).
 # Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
 _GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
@@ -88,7 +91,7 @@ def _grouped_gemm_cutedsl_pertoken(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    if _GEMM_CALL_COUNT < 3:
+    if _DEBUG_CALL_COUNT < 3:
         for i, (a, b) in enumerate(zip(A, B)):
             a_data = getattr(a, 'data_uint8', a)
             b_data = getattr(b, 'data_uint8', b)
@@ -101,7 +104,7 @@ def _grouped_gemm_cutedsl_pertoken(
 
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
 
-    if _GEMM_CALL_COUNT < 3:
+    if _DEBUG_CALL_COUNT < 3:
         res_t = res if isinstance(res, torch.Tensor) else res[0] if res else None
         if res_t is not None:
             print(f"[GEMM POST   ] out={res_t.shape} nan={res_t.isnan().any().item()} "
@@ -318,7 +321,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.WEIGHT:
             from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
 
-            if _GEMM_CALL_COUNT < 3:
+            if _DEBUG_CALL_COUNT < 3:
                 for i in range(num_gemms):
                     wi = x[i]
                     print(f"[W-QUANT PRE  g={i}] shape={wi.shape} dtype={wi.dtype} "
@@ -329,7 +332,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
             ]
 
-            if _GEMM_CALL_COUNT < 3:
+            if _DEBUG_CALL_COUNT < 3:
                 for i, t in enumerate(quantize_tensor_list):
                     sfb = t.block_scale_fp8.float()
                     print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
@@ -359,14 +362,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.X:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
 
-            if _GEMM_CALL_COUNT < 3:
+            if _DEBUG_CALL_COUNT < 3:
                 print(f"[X-QUANT PRE ] shape={x.shape} dtype={x.dtype} "
                       f"nan={x.isnan().any().item()} inf={x.isinf().any().item()} "
                       f"max={x.abs().max().item():.4g} m_splits={m_splits}", flush=True)
 
             gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
 
-            if _GEMM_CALL_COUNT < 3:
+            if _DEBUG_CALL_COUNT < 3:
                 sfb = gq.scale_flat.float()
                 print(f"[X-QUANT POST] data={gq.data.shape} "
                       f"gs_nan={gq.global_scale.isnan().any().item()} "
@@ -392,6 +395,8 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 m_splits,
                 self._x_quantizers,
             )
+            global _DEBUG_CALL_COUNT
+            _DEBUG_CALL_COUNT += 1
             return GroupQuantizeResult(
                 data=act_list,
                 scale=[a.block_scale for a in act_list],
@@ -441,6 +446,15 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
+        if _DEBUG_CALL_COUNT <= 3:
+            from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+                PertokenNvfp4Tensor, TensorGlobalNvfp4Tensor,
+            )
+            is_pertoken_path = isinstance(a0, PertokenNvfp4Tensor) and isinstance(B[0], TensorGlobalNvfp4Tensor)
+            print(f"[GROUPED_GEMM ENTER] grad={grad} layout={layout} m_splits={m_splits} "
+                  f"is_pertoken={is_pertoken_path} sm100={_is_sm100()} "
+                  f"A[0] type={type(a0).__name__} B[0] type={type(B[0]).__name__}", flush=True)
 
         if (
             _is_sm100()

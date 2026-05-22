@@ -331,9 +331,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
             if _GEMM_CALL_COUNT < 3:
                 for i, t in enumerate(quantize_tensor_list):
-                    sfb = t.block_scale_fp8
+                    sfb = t.block_scale_fp8.float()
                     print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
                           f"sfb_nan={sfb.isnan().any().item()} sfb_inf={sfb.isinf().any().item()} "
+                          f"sfb_max={sfb.abs().max().item():.4g} "
                           f"alpha_b={t._alpha_b_cached:.4g}", flush=True)
 
             if return_transpose:
@@ -366,13 +367,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
 
             if _GEMM_CALL_COUNT < 3:
+                sfb = gq.scale_flat.float()
                 print(f"[X-QUANT POST] data={gq.data.shape} "
-                      f"data_nan={gq.data.isnan().any().item()} "
                       f"gs_nan={gq.global_scale.isnan().any().item()} "
                       f"gs_inf={gq.global_scale.isinf().any().item()} "
                       f"gs_max={gq.global_scale.abs().max().item():.4g} "
-                      f"sfb_nan={gq.scale_flat.isnan().any().item()} "
-                      f"sfb_inf={gq.scale_flat.isinf().any().item()}", flush=True)
+                      f"sfb_nan={sfb.isnan().any().item()} "
+                      f"sfb_inf={sfb.isinf().any().item()} "
+                      f"sfb_max={sfb.abs().max().item():.4g}", flush=True)
 
             act_list: List[PertokenNvfp4Tensor] = [
                 PertokenNvfp4Tensor(

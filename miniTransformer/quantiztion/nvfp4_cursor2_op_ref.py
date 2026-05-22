@@ -203,7 +203,7 @@ class Nvfp4Cursor2QuantizeOpRef(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.WEIGHT:
             w_quantizer_fp4 = self._get_w_quantizer_fp4(qparams)
             quantize_tensor_list = [
-                w_quantizer_fp4.quantize(x[i]).dquantize() for i in range(num_gemms)
+                w_quantizer_fp4.quantize(x[i]).dequantize() for i in range(num_gemms)
             ]
 
             if return_transpose:

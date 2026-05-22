@@ -330,7 +330,7 @@ def quantize_weight_nvfp4_swizzled(
     gs         = torch.empty(1, dtype=torch.float32, device=device)
 
     fn = fp4_gemm.four_six_fp4 if four_six else fp4_gemm.rtn_fp4
-    fn(data, scale_flat, gs, x, amax, scale_override, n, k)
+    fn(data, scale_flat, gs, x, amax, scale_override)
 
     nMT = n_padded // _MMA_TILE_ROWS
     nKT = k // 64

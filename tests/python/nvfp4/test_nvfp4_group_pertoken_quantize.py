@@ -152,6 +152,7 @@ def _ref_per_group(x: torch.Tensor, m_splits: List[int]):
             scale_i,          # padded buffer: kernel writes up to sf_size-1
             gs_ref[offset:offset + m_i],
             x[offset:offset + m_i].contiguous(),
+            x[offset:offset + m_i].abs().amax(dim=1).to(torch.float32),
             1.0,
         )
         scales_ref.append(scale_i)

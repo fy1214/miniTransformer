@@ -228,7 +228,8 @@ static constexpr int MAX_BLOCKS = 1024;
 static void launch_fp4_pertoken_fused(
     int num_candidates, bool swizzle,
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols,
+    cudaStream_t stream)
 {
     const int nvecs_per_row  = static_cast<int>(cols / 8);
     const int warps_per_row  = (nvecs_per_row + 31) / 32;
@@ -242,19 +243,19 @@ static void launch_fp4_pertoken_fused(
     const int cdiv16         = static_cast<int>(cols / 16);
 
     if (num_candidates == 2 && swizzle)
-        fp4_pertoken_fused_kernel<2, true> <<<grid_dim, block_dim, smem_bytes>>>(
+        fp4_pertoken_fused_kernel<2, true> <<<grid_dim, block_dim, smem_bytes, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             scale_override, nvecs_per_row, cdiv16, rows_per_block, warps_per_row, rows, grid_stride);
     else if (num_candidates == 2 && !swizzle)
-        fp4_pertoken_fused_kernel<2, false><<<grid_dim, block_dim, smem_bytes>>>(
+        fp4_pertoken_fused_kernel<2, false><<<grid_dim, block_dim, smem_bytes, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             scale_override, nvecs_per_row, cdiv16, rows_per_block, warps_per_row, rows, grid_stride);
     else if (num_candidates == 1 && swizzle)
-        fp4_pertoken_fused_kernel<1, true> <<<grid_dim, block_dim, smem_bytes>>>(
+        fp4_pertoken_fused_kernel<1, true> <<<grid_dim, block_dim, smem_bytes, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             scale_override, nvecs_per_row, cdiv16, rows_per_block, warps_per_row, rows, grid_stride);
     else
-        fp4_pertoken_fused_kernel<1, false><<<grid_dim, block_dim, smem_bytes>>>(
+        fp4_pertoken_fused_kernel<1, false><<<grid_dim, block_dim, smem_bytes, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             scale_override, nvecs_per_row, cdiv16, rows_per_block, warps_per_row, rows, grid_stride);
 
@@ -279,7 +280,7 @@ void four_six_fp4_pertoken_fused(
     const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
 {
     check_args_fused("four_six_fp4_pertoken_fused", cols);
-    launch_fp4_pertoken_fused(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    launch_fp4_pertoken_fused(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols, at::cuda::getCurrentCUDAStream());
 }
 
 void rtn_fp4_pertoken_fused(
@@ -287,7 +288,7 @@ void rtn_fp4_pertoken_fused(
     const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
 {
     check_args_fused("rtn_fp4_pertoken_fused", cols);
-    launch_fp4_pertoken_fused(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    launch_fp4_pertoken_fused(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols, at::cuda::getCurrentCUDAStream());
 }
 
 void four_six_fp4_pertoken_linear_fused(
@@ -295,7 +296,7 @@ void four_six_fp4_pertoken_linear_fused(
     const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
 {
     check_args_fused("four_six_fp4_pertoken_linear_fused", cols);
-    launch_fp4_pertoken_fused(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    launch_fp4_pertoken_fused(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols, at::cuda::getCurrentCUDAStream());
 }
 
 void rtn_fp4_pertoken_linear_fused(
@@ -303,7 +304,7 @@ void rtn_fp4_pertoken_linear_fused(
     const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
 {
     check_args_fused("rtn_fp4_pertoken_linear_fused", cols);
-    launch_fp4_pertoken_fused(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    launch_fp4_pertoken_fused(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols, at::cuda::getCurrentCUDAStream());
 }
 
 // ---------------------------------------------------------------------------

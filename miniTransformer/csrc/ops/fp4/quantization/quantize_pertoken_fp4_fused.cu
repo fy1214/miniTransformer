@@ -329,7 +329,8 @@ static void binding_impl_fused(
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
         reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
-        scale_override, inp.size(0), inp.size(1));
+        scale_override, inp.size(0), inp.size(1),
+        at::cuda::getCurrentCUDAStream());
 }
 
 void four_six_fp4_pertoken_fused_binding(

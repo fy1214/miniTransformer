@@ -388,6 +388,17 @@ def group_quantize_nvfp4_pertoken_swizzled(
     total_m, k = x.shape
     device = x.device
 
+    if total_m == 0:
+        nKT = k // 64
+        return GroupQuantizeSwizzledResult(
+            data=torch.empty((0, k // 2), dtype=nvfp4_output_t, device=device),
+            global_scale=torch.empty(0, dtype=torch.float32, device=device),
+            scale_flat=torch.empty(0, dtype=nvfp4_scale_t, device=device),
+            scale_views=[None] * len(m_splits),
+            scale_offsets=[0] * (len(m_splits) + 1),
+            row_offsets=[0] * (len(m_splits) + 1),
+        )
+
     row_offsets: List[int] = [0]
     scale_offsets: List[int] = [0]
     for m_i in m_splits:

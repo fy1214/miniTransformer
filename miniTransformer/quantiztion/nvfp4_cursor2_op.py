@@ -62,7 +62,7 @@ def _grouped_gemm_cutedsl_pertoken(
     )
     import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
     import time
-    global _GEMM_CALL_COUNT, _GEMM_PROFILED
+    global _GEMM_CALL_COUNT, _GEMM_PROFILED, _DEBUG_CALL_COUNT
 
     do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
     do_profile = (
@@ -315,6 +315,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             PertokenNvfp4Tensor,
         )
 
+        global _DEBUG_CALL_COUNT
         num_gemms = len(m_splits)
         self._refresh_quantizer_cache(num_gemms)
 
@@ -395,7 +396,6 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 m_splits,
                 self._x_quantizers,
             )
-            global _DEBUG_CALL_COUNT
             _DEBUG_CALL_COUNT += 1
             return GroupQuantizeResult(
                 data=act_list,
@@ -446,6 +446,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+        global _DEBUG_CALL_COUNT
 
         if _DEBUG_CALL_COUNT <= 3:
             from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (

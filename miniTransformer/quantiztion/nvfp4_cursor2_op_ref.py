@@ -284,7 +284,7 @@ class Nvfp4Cursor2QuantizeOpRef(quantization.QuantizeOpBase):
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].device,
+                    device=B[0]._columnwise_data.device,
                 )
                 out = [out]
         else:

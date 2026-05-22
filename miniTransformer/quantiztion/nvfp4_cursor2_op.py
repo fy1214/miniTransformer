@@ -293,7 +293,6 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         """
         from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
             PertokenNvfp4Tensor,
-            quantize_activation_nvfp4_pertoken
         )
 
         num_gemms = len(m_splits)
@@ -324,20 +323,18 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         if qparams.param_type == qparams.param_type.X:
-            # Per-token quant is row-independent: quantize the full tensor once,
-            # then split the result by m_splits.  This avoids num_gemms kernel
-            # launches and sidesteps zero-chunk issues from empty experts.
-            qresult_full = quantize_activation_nvfp4_pertoken(x)
+            from miniTransformer.ops.nvfp4_quantization import group_quantize_nvfp4_pertoken_swizzled
+
+            gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
             act_list: List[PertokenNvfp4Tensor] = [
                 PertokenNvfp4Tensor(
-                    data_uint8=d,
-                    block_scale=bs,
-                    global_scale_full=qresult_full.global_scale,
+                    data_uint8=gq.data[gq.row_offsets[g]: gq.row_offsets[g + 1]],
+                    block_scale=None,
+                    global_scale=gq.global_scale[gq.row_offsets[g]: gq.row_offsets[g + 1]],
+                    global_scale_full=gq.global_scale,
+                    sfa_swizzled=gq.scale_views[g],
                 )
-                for d, bs in zip(
-                    torch.split(qresult_full.data_uint8, m_splits, dim=0),
-                    torch.split(qresult_full.block_scale, m_splits, dim=0),
-                )
+                for g in range(num_gemms)
             ]
 
             quantize_tensor_list = tex.split_quantize(
@@ -418,7 +415,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].device,
+                    device=B[0]._columnwise_data.device,
                 )
                 out = [out]
         else:

@@ -30,6 +30,16 @@ def _fp4_grid(device_str: str) -> torch.Tensor:
     return _FP4_GRID.to(torch.device(device_str))
 
 
+def _get_fp4_grid(device: torch.device) -> torch.Tensor:
+    # Normalize to "cuda:N" so lru_cache always hits after first call.
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        key = f"cuda:{idx}"
+    else:
+        key = str(device)
+    return _fp4_grid(key)
+
+
 def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
     """Unpack uint8 [m, n//2] → int32 [m, n] nibble indices 0–15."""
     p = packed.to(torch.int32)
@@ -232,7 +242,7 @@ def dequantize_nvfp4_pertoken(result: quantization.QuantizeResult) -> torch.Tens
     scale = result.scale
     global_scale = result.tensor_scale
 
-    grid = _fp4_grid(str(data.device))
+    grid = _get_fp4_grid(data.device)
     fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)           # [m, n]
     scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)               # [m, 1]
@@ -258,7 +268,7 @@ def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> t
     n = nhalf * 2
 
     scale_rm = _unswizzle_scale(result.scale.to(torch.float32), m, n)  # [m, n//16]
-    grid = _fp4_grid(str(data.device))
+    grid = _get_fp4_grid(data.device)
     fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)               # [m, n]
     scale_expanded = scale_rm.repeat_interleave(16, dim=1)             # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)                   # [m, 1]

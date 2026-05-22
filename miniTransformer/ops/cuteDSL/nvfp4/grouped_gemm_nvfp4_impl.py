@@ -414,7 +414,8 @@ def grouped_gemm_cutedsl_pertoken(
             alpha_b = b._alpha_b_cached
             if b._cute_fp4 is None:
                 b._cute_fp4 = _make_fp4_tensor_for_cutedsl(b.data_uint8, n_i, k, device)
-                b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
+                if b._cute_sfb is None:
+                    b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
             b_fp4, sfb = b._cute_fp4, b._cute_sfb
 
         elif isinstance(b, PertokenNvfp4Tensor):

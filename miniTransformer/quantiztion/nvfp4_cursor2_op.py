@@ -299,9 +299,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            w_quantizer_fp4 = self._get_w_quantizer_fp4(qparams)
+            from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
+
             quantize_tensor_list = [
-                w_quantizer_fp4.quantize(x[i]) for i in range(num_gemms)
+                quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
             ]
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]

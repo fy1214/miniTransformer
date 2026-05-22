@@ -294,6 +294,64 @@ class GroupQuantizeSwizzledResult:
 _SCALE_VIEW_PERM = (3, 4, 1, 5, 2, 0)   # matches mma_permute_order in nvfp4_qgemm.py
 
 
+def quantize_weight_nvfp4_swizzled(
+    x: torch.Tensor,
+    *,
+    four_six: bool = False,
+    scale_override: float = 1.0,
+) -> "TensorGlobalNvfp4Tensor":
+    """Quantize weight [N, K] to NVFP4 and build CUTE-layout tensors fully on GPU.
+
+    Replaces the ``quantize_weight_nvfp4_tensor_global`` + ``_make_cute_sf`` path:
+    ``rtn_fp4`` / ``four_six_fp4`` already writes tcgen05 swizzled scale in the
+    kernel, so no D2H → CPU CuTeDSL → H2D is needed.
+
+    The returned ``TensorGlobalNvfp4Tensor`` has ``_cute_fp4`` and ``_cute_sfb``
+    pre-populated so ``grouped_gemm_cutedsl_pertoken`` never calls ``_make_cute_sf``.
+    """
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        TensorGlobalNvfp4Tensor,
+        _make_fp4_tensor_for_cutedsl,
+    )
+
+    assert x.is_cuda, "quantize_weight_nvfp4_swizzled requires a CUDA tensor."
+    assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES, "Unsupported input dtype."
+    assert x.ndim == 2, "x must be 2-D [N, K]."
+    n, k = x.shape
+    assert k % 128 == 0, "K must be divisible by 128."
+    assert k // 8 <= 512, "K must be <= 4096."
+    device = x.device
+
+    amax = x.abs().max().to(torch.float32).view(1).contiguous()
+
+    data       = torch.empty((n, k // 2), dtype=nvfp4_output_t, device=device)
+    n_padded   = ((n + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    scale_flat = torch.zeros(n_padded * (k // 16), dtype=nvfp4_scale_t, device=device)
+    gs         = torch.empty(1, dtype=torch.float32, device=device)
+
+    fn = fp4_gemm.four_six_fp4 if four_six else fp4_gemm.rtn_fp4
+    fn(data, scale_flat, gs, x, amax, scale_override, n, k)
+
+    nMT = n_padded // _MMA_TILE_ROWS
+    nKT = k // 64
+    cute_sfb = (
+        scale_flat.view(1, nMT, nKT, 32, 4, 4)
+        .permute(*_SCALE_VIEW_PERM)
+        .contiguous()
+    )
+    cute_fp4 = _make_fp4_tensor_for_cutedsl(data, n, k, device)
+
+    t = TensorGlobalNvfp4Tensor(
+        data_uint8=data,
+        block_scale_fp8=scale_flat,
+        amax=amax,
+    )
+    t._alpha_b_cached = float(amax.item()) / (448.0 * 6.0)
+    t._cute_fp4 = cute_fp4
+    t._cute_sfb = cute_sfb
+    return t
+
+
 def group_quantize_nvfp4_pertoken_swizzled(
     x: torch.Tensor,
     m_splits: List[int],

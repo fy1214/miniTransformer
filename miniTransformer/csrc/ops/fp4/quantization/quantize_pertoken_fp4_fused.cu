@@ -63,12 +63,11 @@ struct QuantResultPT {
 
 __device__ __forceinline__ QuantResultPT quantize_pt(float abs_max, float inv_val_max, float scale, bf16x8& x) {
     float s_group     = abs_max * inv_val_max;
-    float inv_scale   = reciprocal_approximate_ftz(scale);
-    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(s_group * inv_scale);
+    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(s_group / scale);
     float s_round_fp8 = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
-    float factor   = reciprocal_approximate_ftz(s_round_fp8 * scale);
+    float factor   = 1.0f / (s_round_fp8 * scale);
     float2 factor2 = {factor, factor};
     fp4x8 result;
     for (int k = 0; k < bf16x8::size; k += 2) {

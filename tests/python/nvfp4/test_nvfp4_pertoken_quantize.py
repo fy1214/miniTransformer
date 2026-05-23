@@ -26,7 +26,7 @@ try:
 except ImportError:
     fp4_gemm = None
 
-from miniTransformer.ops.nvfp4_quantization import (
+from miniTransformer.ops.nvfp4_quantize import (
     quantize_nvfp4_pertoken,
     quantize_nvfp4_pertoken_swizzled,
 )

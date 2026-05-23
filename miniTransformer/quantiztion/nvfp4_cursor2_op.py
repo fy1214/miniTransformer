@@ -25,6 +25,9 @@ use_cpp_allocator = False
 _GEMM_TIMING_INTERVAL: int = 50
 _GEMM_CALL_COUNT: int = 0
 
+# Independent debug counter for quant/GEMM prints (not gated by _GEMM_CALL_COUNT).
+_DEBUG_CALL_COUNT: int = 0
+
 # Capture one torch.profiler trace at this call index (0 = first call).
 # Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
 _GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
@@ -59,7 +62,7 @@ def _grouped_gemm_cutedsl_pertoken(
     )
     import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
     import time
-    global _GEMM_CALL_COUNT, _GEMM_PROFILED
+    global _GEMM_CALL_COUNT, _GEMM_PROFILED, _DEBUG_CALL_COUNT
 
     do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
     do_profile = (
@@ -88,7 +91,25 @@ def _grouped_gemm_cutedsl_pertoken(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
+    if _DEBUG_CALL_COUNT < 3:
+        for i, (a, b) in enumerate(zip(A, B)):
+            a_data = getattr(a, 'data_uint8', a)
+            b_data = getattr(b, 'data_uint8', b)
+            a_gs   = getattr(a, 'global_scale', None)
+            b_alpha = getattr(b, '_alpha_b_cached', None)
+            gs_str    = f"{a_gs.abs().max().item():.4g}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
+            alpha_str = f"{b_alpha:.4g}" if b_alpha is not None else "N/A"
+            gs_nan_str = f"{a_gs.isnan().any().item()}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
+            print(f"[GEMM PRE g={i}] A.data={a_data.shape} B.data={b_data.shape} "
+                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} B.alpha_b={alpha_str}", flush=True)
+
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    if _DEBUG_CALL_COUNT < 3:
+        res_t = res if isinstance(res, torch.Tensor) else res[0] if res else None
+        if res_t is not None:
+            print(f"[GEMM POST   ] out={res_t.shape} nan={res_t.isnan().any().item()} "
+                  f"inf={res_t.isinf().any().item()} max={res_t.abs().max().item():.4g}", flush=True)
 
     if do_timing:
         torch.cuda.synchronize()
@@ -293,17 +314,34 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         """
         from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
             PertokenNvfp4Tensor,
-            quantize_activation_nvfp4_pertoken
         )
 
+        global _DEBUG_CALL_COUNT
         num_gemms = len(m_splits)
         self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            w_quantizer_fp4 = self._get_w_quantizer_fp4(qparams)
+            from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
+
+            if _DEBUG_CALL_COUNT < 3:
+                for i in range(num_gemms):
+                    wi = x[i]
+                    print(f"[W-QUANT PRE  g={i}] shape={wi.shape} dtype={wi.dtype} "
+                          f"nan={wi.isnan().any().item()} inf={wi.isinf().any().item()} "
+                          f"max={wi.abs().max().item():.4g}", flush=True)
+
             quantize_tensor_list = [
-                w_quantizer_fp4.quantize(x[i]) for i in range(num_gemms)
+                quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
             ]
+
+            if _DEBUG_CALL_COUNT < 3:
+                for i, t in enumerate(quantize_tensor_list):
+                    sfb = t.block_scale_fp8.float()
+                    print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
+                          f"sfb_nan={sfb.isnan().any().item()} sfb_inf={sfb.isinf().any().item()} "
+                          f"sfb_max={sfb.abs().max().item():.4g} "
+                          f"alpha_b={t._alpha_b_cached:.4g}", flush=True)
+
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
                 quantize_tensor_list_transpose = tex.split_quantize(
@@ -324,20 +362,34 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         if qparams.param_type == qparams.param_type.X:
-            # Per-token quant is row-independent: quantize the full tensor once,
-            # then split the result by m_splits.  This avoids num_gemms kernel
-            # launches and sidesteps zero-chunk issues from empty experts.
-            qresult_full = quantize_activation_nvfp4_pertoken(x)
+            from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
+
+            if _DEBUG_CALL_COUNT < 3:
+                print(f"[X-QUANT PRE ] shape={x.shape} dtype={x.dtype} "
+                      f"nan={x.isnan().any().item()} inf={x.isinf().any().item()} "
+                      f"max={x.abs().max().item():.4g} m_splits={m_splits}", flush=True)
+
+            gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+
+            if _DEBUG_CALL_COUNT < 3:
+                sfb = gq.scale_flat.float()
+                print(f"[X-QUANT POST] data={gq.data.shape} "
+                      f"gs_nan={gq.global_scale.isnan().any().item()} "
+                      f"gs_inf={gq.global_scale.isinf().any().item()} "
+                      f"gs_max={gq.global_scale.abs().max().item():.4g} "
+                      f"sfb_nan={sfb.isnan().any().item()} "
+                      f"sfb_inf={sfb.isinf().any().item()} "
+                      f"sfb_max={sfb.abs().max().item():.4g}", flush=True)
+
             act_list: List[PertokenNvfp4Tensor] = [
                 PertokenNvfp4Tensor(
-                    data_uint8=d,
-                    block_scale=bs,
-                    global_scale_full=qresult_full.global_scale,
+                    data_uint8=gq.data[gq.row_offsets[g]: gq.row_offsets[g + 1]],
+                    block_scale=None,
+                    global_scale=gq.global_scale[gq.row_offsets[g]: gq.row_offsets[g + 1]],
+                    global_scale_full=gq.global_scale,
+                    sfa_swizzled=gq.scale_views[g],
                 )
-                for d, bs in zip(
-                    torch.split(qresult_full.data_uint8, m_splits, dim=0),
-                    torch.split(qresult_full.block_scale, m_splits, dim=0),
-                )
+                for g in range(num_gemms)
             ]
 
             quantize_tensor_list = tex.split_quantize(
@@ -345,6 +397,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 m_splits,
                 self._x_quantizers,
             )
+            _DEBUG_CALL_COUNT += 1
             return GroupQuantizeResult(
                 data=act_list,
                 scale=[a.block_scale for a in act_list],
@@ -394,6 +447,16 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+        global _DEBUG_CALL_COUNT
+
+        if _DEBUG_CALL_COUNT <= 3:
+            from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+                PertokenNvfp4Tensor, TensorGlobalNvfp4Tensor,
+            )
+            is_pertoken_path = isinstance(a0, PertokenNvfp4Tensor) and isinstance(B[0], TensorGlobalNvfp4Tensor)
+            print(f"[GROUPED_GEMM ENTER] grad={grad} layout={layout} m_splits={m_splits} "
+                  f"is_pertoken={is_pertoken_path} sm100={_is_sm100()} "
+                  f"A[0] type={type(a0).__name__} B[0] type={type(B[0]).__name__}", flush=True)
 
         if (
             _is_sm100()
@@ -418,7 +481,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].device,
+                    device=B[0]._columnwise_data.device,
                 )
                 out = [out]
         else:

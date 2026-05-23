@@ -5,7 +5,7 @@ import time
 import pytest
 import torch
 
-import miniTransformer.ops.quartet_quant as quartet2
+import miniTransformer.ops.nvfp4_quartet_quantize as quartet2
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.quantization import QParams, ParamType
 

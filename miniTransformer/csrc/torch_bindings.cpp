@@ -31,10 +31,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // quarter quantization
     m.def("four_six_fp4", &four_six_fp4_binding, "Four-Six FP4 quantization (CUDA)");
     m.def("rtn_fp4", &rtn_fp4_binding, "RTN FP4 quantization (CUDA)");
-    m.def("four_six_fp4_pertoken", &four_six_fp4_pertoken_binding, "Four-Six FP4 quantization with per-token global scale, swizzled SF layout (CUDA)");
-    m.def("rtn_fp4_pertoken", &rtn_fp4_pertoken_binding, "RTN FP4 quantization with per-token global scale, swizzled SF layout (CUDA)");
-    m.def("four_six_fp4_pertoken_linear", &four_six_fp4_pertoken_linear_binding, "Four-Six FP4 quantization with per-token global scale, linear SF layout (CUDA)");
-    m.def("rtn_fp4_pertoken_linear", &rtn_fp4_pertoken_linear_binding, "RTN FP4 quantization with per-token global scale, linear SF layout (CUDA)");
+    // two-pass variants (caller supplies amax_per_row)
+    m.def("four_six_fp4_pertoken", &four_six_fp4_pertoken_binding, "Four-Six FP4 per-token, swizzled SF, caller-supplied amax (CUDA)");
+    m.def("rtn_fp4_pertoken", &rtn_fp4_pertoken_binding, "RTN FP4 per-token, swizzled SF, caller-supplied amax (CUDA)");
+    m.def("four_six_fp4_pertoken_linear", &four_six_fp4_pertoken_linear_binding, "Four-Six FP4 per-token, linear SF, caller-supplied amax (CUDA)");
+    m.def("rtn_fp4_pertoken_linear", &rtn_fp4_pertoken_linear_binding, "RTN FP4 per-token, linear SF, caller-supplied amax (CUDA)");
+    // fused variants (amax computed inside kernel, cols <= 8192)
+    m.def("four_six_fp4_pertoken_fused", &four_six_fp4_pertoken_fused_binding, "Four-Six FP4 per-token fused amax+quant, swizzled SF (CUDA)");
+    m.def("rtn_fp4_pertoken_fused", &rtn_fp4_pertoken_fused_binding, "RTN FP4 per-token fused amax+quant, swizzled SF (CUDA)");
+    m.def("four_six_fp4_pertoken_linear_fused", &four_six_fp4_pertoken_linear_fused_binding, "Four-Six FP4 per-token fused amax+quant, linear SF (CUDA)");
+    m.def("rtn_fp4_pertoken_linear_fused", &rtn_fp4_pertoken_linear_fused_binding, "RTN FP4 per-token fused amax+quant, linear SF (CUDA)");
     m.def("rtn_fp4_group_pertoken", &rtn_fp4_group_pertoken_binding,
           pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),

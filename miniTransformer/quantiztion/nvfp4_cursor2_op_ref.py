@@ -4,7 +4,7 @@ import torch
 import fp4_gemm
 from typing import Optional, List, Tuple
 
-from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_pertoken, dequantize_nvfp4_pertoken
+from miniTransformer.ops.nvfp4_quantize import quantize_nvfp4_pertoken, dequantize_nvfp4_pertoken
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
@@ -284,7 +284,7 @@ class Nvfp4Cursor2QuantizeOpRef(quantization.QuantizeOpBase):
                 out = torch.empty(
                     [sum(m_splits), n_cols],
                     dtype=activation_dtype,
-                    device=B[0].device,
+                    device=B[0]._columnwise_data.device,
                 )
                 out = [out]
         else:

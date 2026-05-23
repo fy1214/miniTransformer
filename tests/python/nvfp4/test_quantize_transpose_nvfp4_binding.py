@@ -8,7 +8,7 @@ device capability is below 10.0.
 
 import pytest
 import torch
-from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
+from miniTransformer.ops.nvfp4_quantize import quantize_nvfp4_cuda
 
 try:
     import fp4_gemm

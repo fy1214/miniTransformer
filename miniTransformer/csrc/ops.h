@@ -80,6 +80,7 @@ void four_six_fp4_pertoken_binding(
     at::Tensor& scales,
     at::Tensor& global_scale,
     const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
     float scale_override
 );
 
@@ -88,6 +89,7 @@ void rtn_fp4_pertoken_binding(
     at::Tensor& scales,
     at::Tensor& global_scale,
     const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
     float scale_override
 );
 
@@ -96,10 +98,46 @@ void four_six_fp4_pertoken_linear_binding(
     at::Tensor& scales,
     at::Tensor& global_scale,
     const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
     float scale_override
 );
 
 void rtn_fp4_pertoken_linear_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
+    float scale_override
+);
+
+// Fused variants: compute per-row amax inside the kernel (no external amax needed).
+// Supported for cols <= 8192. Falls back to two-pass for larger cols.
+void four_six_fp4_pertoken_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void rtn_fp4_pertoken_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void four_six_fp4_pertoken_linear_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override
+);
+
+void rtn_fp4_pertoken_linear_fused_binding(
     at::Tensor& out,
     at::Tensor& scales,
     at::Tensor& global_scale,

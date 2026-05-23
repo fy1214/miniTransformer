@@ -31,6 +31,7 @@ from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
     warmup_grouped_gemm_cutedsl_pertoken,
     warmup_grouped_gemm_cutedsl_te,
 )
+from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
 
 # Backward-compatible alias: TE tensor-global path
 grouped_gemm_cutedsl = grouped_gemm_cutedsl_te
@@ -53,6 +54,7 @@ __all__ = [
     "pertoken_scales_to_sfa_2d",
     "quantize_activation_nvfp4_pertoken",
     "quantize_weight_nvfp4_tensor_global",
+    "quantize_weight_nvfp4_swizzled",
     "reference_grouped_gemm_pertoken",
     "warmup_grouped_gemm_cutedsl_pertoken",
     "warmup_grouped_gemm_cutedsl_te",

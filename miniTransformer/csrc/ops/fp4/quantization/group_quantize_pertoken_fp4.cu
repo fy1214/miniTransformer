@@ -111,8 +111,15 @@ __global__ void fp4_group_pertoken_kernel(
     }
 
     if (tid == 0) {
-        nv_bfloat162 last     = __habs2(make_bfloat162(smem[0], smem[1]));
-        float        row_amax = static_cast<float>(__hmax(last.x, last.y));
+        // For non-power-of-2 nvecs_per_row (e.g. 96 for k=768), the stride loop exits
+        // with `last_stride` unmerged elements in smem[0..last_stride-1].
+        // For power-of-2 this is always 2 (smem[0,1]), matching the original behaviour.
+        int last_stride = nvecs_per_row / 2;
+        while (last_stride / 2 >= 2) last_stride /= 2;
+        nv_bfloat16 amax_bf = __habs(smem[0]);
+        for (int j = 1; j < last_stride; j++)
+            amax_bf = __hmax(amax_bf, __habs(smem[j]));
+        float        row_amax = static_cast<float>(amax_bf);
 
         constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
         constexpr float one_over_six   = 1.f / 6.f;

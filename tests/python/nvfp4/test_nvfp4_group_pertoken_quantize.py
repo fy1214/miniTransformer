@@ -55,7 +55,7 @@ pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or
 # ---------------------------------------------------------------------------
 
 try:
-    from miniTransformer.ops.nvfp4_quantization import (
+    from miniTransformer.ops.nvfp4_quantize import (
         GroupQuantizeSwizzledResult,
         group_quantize_nvfp4_pertoken_swizzled,
     )
@@ -104,9 +104,9 @@ def _dequant_swizzled_group(
     """Dequantize one group using the scale_view tensor from GroupQuantizeSwizzledResult."""
     nMT = (m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS
     nKT = k // 64
-    # Inverse-permute (3,4,1,5,2,0)^-1 = (5,2,4,0,3,1) to get back (1,nMT,nKT,32,4,4)
+    # Inverse-permute (3,4,1,5,2,0)^-1 = (5,2,4,0,1,3) to get back (1,nMT,nKT,32,4,4)
     # Simpler: just flatten to the raw swizzled buffer and unswizzle.
-    flat = scale_view.permute(5, 2, 0, 4, 1, 3).reshape(-1).to(torch.float32)
+    flat = scale_view.permute(5, 2, 4, 0, 1, 3).reshape(-1).to(torch.float32)
     # flat is now [nMT*nKT*32*4*4] = [nMT*128*nKT*4] in swizzled order
     scale_rm = _unswizzle_scale(flat, nMT * _MMA_TILE_ROWS, k)[:m_i]  # [m_i, k//16]
     grid = _fp4_grid(data.device)
@@ -152,6 +152,7 @@ def _ref_per_group(x: torch.Tensor, m_splits: List[int]):
             scale_i,          # padded buffer: kernel writes up to sf_size-1
             gs_ref[offset:offset + m_i],
             x[offset:offset + m_i].contiguous(),
+            x[offset:offset + m_i].abs().amax(dim=1).to(torch.float32),
             1.0,
         )
         scales_ref.append(scale_i)
@@ -225,7 +226,7 @@ def test_scale_matches_reference(num_groups: int, m_per_group: int, k: int):
         m_i  = m_splits[g]
         m_pad = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
         # Extract flat swizzled data from scale_view and compare to reference
-        flat_ours = sv.permute(5, 2, 0, 4, 1, 3).reshape(-1)
+        flat_ours = sv.permute(5, 2, 4, 0, 1, 3).reshape(-1)
         torch.testing.assert_close(
             flat_ours.view(torch.uint8),
             sr[:m_pad * k // 16].view(torch.uint8),

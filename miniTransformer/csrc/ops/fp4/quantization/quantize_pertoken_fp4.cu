@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Per-token NV FP4 quantization (RTN and Round-4-or-6 variants).
-// Computes one per-row global scale (shape [rows]) on-the-fly; no amax_ptr input.
-// Grid: one block per row. blockDim.x = cols/8 (requires cols divisible by 128, cols <= 4096).
+// amax_per_row: per-row abs_max supplied by the caller (shape [rows]).
+// Grid: ceil(rows * cols/8 / 256) blocks, blockDim.x = 256 (fixed).
 //
-// Two scale-factor output layouts are provided via the Swizzle template parameter:
+// Correctness of __shfl_xor_sync(mask, v, 1) across the flat layout:
+//   cols % 128 == 0  =>  nvecs_per_row = cols/8 is divisible by 16
+//   => row boundaries always land on even flat indices
+//   => every (even, odd) thread pair produced by shfl_xor(1) is within the same row.
+//
+// Two scale-factor output layouts via the Swizzle template parameter:
 //   Swizzle=true  : tcgen05 MMA swizzled layout via cvt_quant_to_fp4_get_sf_out_offset
 //   Swizzle=false : plain row-major layout  scale_ptr[row * (cols/16) + group_col]
 
@@ -67,7 +72,7 @@ __forceinline__ __device__ float quant_error_pt(bf16x8 x, const QuantResultPT& q
     return local_error;
 }
 
-// NumCandidates=1 : RTN (max FP4 value = 6 only)
+// NumCandidates=1 : RTN
 // NumCandidates=2 : Round-4-or-6 (tries max=6 and max=4, picks lower L2 error)
 // Swizzle=true    : scale_ptr written in tcgen05 swizzled layout
 // Swizzle=false   : scale_ptr written in plain row-major layout
@@ -77,62 +82,38 @@ __global__ void fp4_pertoken_kernel(
     __nv_fp8_e4m3*   __restrict__ scale_ptr,
     float*           __restrict__ global_scale_ptr,
     const nv_bfloat16* __restrict__ x_ptr,
+    const float* __restrict__ amax_per_row,
     float scale_override,
-    int cols_div16)   // cols / 16
+    int nvecs_per_row,  // cols / 8
+    int cols_div16,     // cols / 16
+    int total_vecs)     // rows * cols / 8
 {
-    extern __shared__ nv_bfloat16 smem[];   // blockDim.x + 1 bf16 slots (extra OOB guard)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_vecs) return;
 
-    const int row           = blockIdx.x;
-    const int tid           = threadIdx.x;
-    const int nvecs_per_row = blockDim.x;   // cols / 8
+    const int row        = idx / nvecs_per_row;
+    const int col_in_row = idx % nvecs_per_row;
 
-    bf16x8 x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
+    bf16x8 x = bf16x8::load(x_ptr + 8 * idx);
 
-    // ---- Step 1: per-row abs-max via shared-memory tree reduce ----
-    nv_bfloat16 local_abs_max = vecReduceAbsMax(x);
-    smem[tid] = local_abs_max;
-    // Guard: the pairwise reduction reads smem[tid+stride+1]; when tid==stride-1
-    // that is smem[nvecs_per_row], one past the end.  Zero is safe for a max-reduce.
-    if (tid == nvecs_per_row - 1) smem[nvecs_per_row] = __float2bfloat16(0.0f);
-    __syncthreads();
-
-    for (int stride = nvecs_per_row / 2; stride >= 2; stride /= 2) {
-        if (tid < stride) {
-            nv_bfloat162 a = make_bfloat162(smem[tid],          smem[tid + 1]);
-            nv_bfloat162 b = make_bfloat162(smem[tid + stride], smem[tid + stride + 1]);
-            nv_bfloat162 m;
-            __asm__ volatile(
-                "max.xorsign.abs.bf16x2 %0, %1, %2;"
-                : "=r"(reinterpret_cast<int&>(m))
-                : "r"(reinterpret_cast<int&>(a)), "r"(reinterpret_cast<int&>(b))
-            );
-            smem[tid]     = m.x;
-            smem[tid + 1] = m.y;
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        nv_bfloat162 last = __habs2(make_bfloat162(smem[0], smem[1]));
-        float row_abs_max = static_cast<float>(__hmax(last.x, last.y));
-
-        constexpr float inv_scales_max = NumCandidates > 1 ? 1.f / 256.f : 1.f / 448.f;
-        constexpr float one_over_six   = 1.f / 6.f;
-        float scale = row_abs_max == 0.f
-                    ? 1.f
-                    : row_abs_max * inv_scales_max * (scale_override * one_over_six);
+    // Token-level global scale from externally supplied per-row amax.
+    float row_abs_max = amax_per_row[row];
+    constexpr float inv_scales_max = NumCandidates > 1 ? 1.f / 256.f : 1.f / 448.f;
+    constexpr float one_over_six   = 1.f / 6.f;
+    float scale = row_abs_max == 0.f
+                ? 1.f
+                : row_abs_max * inv_scales_max * (scale_override * one_over_six);
+    if (col_in_row == 0)
         global_scale_ptr[row] = scale;
 
-        *reinterpret_cast<float*>(smem) = scale;
-    }
-    __syncthreads();
-    float scale = *reinterpret_cast<float*>(smem);
-
-    // ---- Step 2: per-group abs-max (16-element group spans 2 adjacent threads) ----
+    // Per-group abs-max: group = 16 elements = 2 consecutive threads.
+    // nvecs_per_row is always divisible by 16, so row boundaries always land
+    // on even flat indices — shfl_xor(1) pairs are always within the same row.
+    nv_bfloat16 local_abs_max = vecReduceAbsMax(x);
     nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
     float full_abs_max = static_cast<float>(__hmax(__habs(local_abs_max), __habs(other_abs_max)));
 
-    // ---- Step 3: quantize ----
+    // Quantize
     float candidates[] = {6.f, 4.f};
     QuantResultPT results[NumCandidates];
     float scores[NumCandidates];
@@ -142,19 +123,15 @@ __global__ void fp4_pertoken_kernel(
         float inv_val = 1.f / candidates[i];
         results[i]    = quantize_pt(full_abs_max, inv_val * scale_override, scale, x);
         scores[i]     = quant_error_pt(x, results[i], scale);
-        if (scores[i] < best) {
-            best = scores[i];
-            res  = results[i];
-        }
+        if (scores[i] < best) { best = scores[i]; res = results[i]; }
     }
 
-    // ---- Step 4: store FP4 values ----
-    int global_vec_idx = row * nvecs_per_row + tid;
-    res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
+    // Store FP4
+    res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * idx);
 
-    // ---- Step 5: store per-group FP8 scale (even threads only) ----
-    if (tid % 2 == 0) {
-        int col = tid / 2;
+    // Store per-group FP8 scale (even col_in_row only)
+    if (col_in_row % 2 == 0) {
+        int col = col_in_row / 2;
         if constexpr (Swizzle) {
             auto tgt = cvt_quant_to_fp4_get_sf_out_offset(row, col, cols_div16 / 4);
             scale_ptr[tgt] = res.fp8s;
@@ -164,66 +141,69 @@ __global__ void fp4_pertoken_kernel(
     }
 }
 
-// ---- Launch helpers ----
+// ---- Launch helper ----
 
 static void launch_fp4_pertoken(
     int num_candidates, bool swizzle,
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, const float* amax_per_row,
+    float scale_override, long rows, long cols)
 {
-    int threads = static_cast<int>(cols / 8);
-    size_t smem = (static_cast<size_t>(threads) + 1) * sizeof(nv_bfloat16);
-    int cdiv16  = static_cast<int>(cols / 16);
+    int nvecs_per_row = static_cast<int>(cols / 8);
+    int total_vecs    = static_cast<int>(rows) * nvecs_per_row;
+    int cdiv16        = static_cast<int>(cols / 16);
+    constexpr int BLOCK = 256;
+    int n_blocks = (total_vecs + BLOCK - 1) / BLOCK;
 
     if (num_candidates == 2 && swizzle)
-        fp4_pertoken_kernel<2, true> <<<rows, threads, smem>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, cdiv16);
+        fp4_pertoken_kernel<2, true> <<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else if (num_candidates == 2 && !swizzle)
-        fp4_pertoken_kernel<2, false><<<rows, threads, smem>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, cdiv16);
+        fp4_pertoken_kernel<2, false><<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else if (num_candidates == 1 && swizzle)
-        fp4_pertoken_kernel<1, true> <<<rows, threads, smem>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, cdiv16);
+        fp4_pertoken_kernel<1, true> <<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else
-        fp4_pertoken_kernel<1, false><<<rows, threads, smem>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, cdiv16);
+        fp4_pertoken_kernel<1, false><<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
 
     CUDA_CHECK(cudaGetLastError());
 }
 
-static void check_args(const char* name, long cols, long rows_out, long rows_in) {
+static void check_args(const char* name, long cols) {
     if (cols % 128 != 0)
         throw std::runtime_error(std::string(name) + ": cols must be divisible by 128");
-    if (cols / 8 > 512)
-        throw std::runtime_error(std::string(name) + ": cols must be <= 4096");
 }
+
+// ---- C entry points ----
 
 void four_six_fp4_pertoken(
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
-    check_args("four_six_fp4_pertoken", cols, rows, rows);
-    launch_fp4_pertoken(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    check_args("four_six_fp4_pertoken", cols);
+    launch_fp4_pertoken(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
 }
 
 void rtn_fp4_pertoken(
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
-    check_args("rtn_fp4_pertoken", cols, rows, rows);
-    launch_fp4_pertoken(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    check_args("rtn_fp4_pertoken", cols);
+    launch_fp4_pertoken(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
 }
 
 void four_six_fp4_pertoken_linear(
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
-    check_args("four_six_fp4_pertoken_linear", cols, rows, rows);
-    launch_fp4_pertoken(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    check_args("four_six_fp4_pertoken_linear", cols);
+    launch_fp4_pertoken(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
 }
 
 void rtn_fp4_pertoken_linear(
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
-    const nv_bfloat16* x_ptr, float scale_override, long rows, long cols)
+    const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
-    check_args("rtn_fp4_pertoken_linear", cols, rows, rows);
-    launch_fp4_pertoken(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, scale_override, rows, cols);
+    check_args("rtn_fp4_pertoken_linear", cols);
+    launch_fp4_pertoken(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
 }
 
 // ---- PyTorch bindings ----
@@ -231,17 +211,13 @@ void rtn_fp4_pertoken_linear(
 static void binding_impl(
     int num_candidates, bool swizzle,
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
-    const at::Tensor& inp, float scale_override)
+    const at::Tensor& inp, const at::Tensor& amax_per_row, float scale_override)
 {
     TORCH_CHECK(out.size(0) == inp.size(0), "Output and input must have the same number of rows");
     TORCH_CHECK(inp.dtype() == at::kBFloat16, "Input must be bfloat16");
-    TORCH_CHECK(global_scale.numel() == inp.size(0), "global_scale must have shape [rows]");
-
-    int threads = static_cast<int>(inp.size(1) / 8);
-    if (inp.size(1) % 128 != 0)
-        throw std::runtime_error("cols must be divisible by 128");
-    if (threads > 512)
-        throw std::runtime_error("cols must be <= 4096");
+    TORCH_CHECK(amax_per_row.numel() == inp.size(0), "amax_per_row must have shape [rows]");
+    TORCH_CHECK(amax_per_row.dtype() == at::kFloat, "amax_per_row must be float32");
+    TORCH_CHECK(inp.size(1) % 128 == 0, "cols must be divisible by 128");
 
     launch_fp4_pertoken(
         num_candidates, swizzle,
@@ -249,33 +225,34 @@ static void binding_impl(
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
         reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        reinterpret_cast<const float*>(amax_per_row.data_ptr()),
         scale_override, inp.size(0), inp.size(1));
 }
 
 void four_six_fp4_pertoken_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
-    const at::Tensor& inp, float scale_override)
+    const at::Tensor& inp, const at::Tensor& amax_per_row, float scale_override)
 {
-    binding_impl(2, true, out, scales, global_scale, inp, scale_override);
+    binding_impl(2, true, out, scales, global_scale, inp, amax_per_row, scale_override);
 }
 
 void rtn_fp4_pertoken_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
-    const at::Tensor& inp, float scale_override)
+    const at::Tensor& inp, const at::Tensor& amax_per_row, float scale_override)
 {
-    binding_impl(1, true, out, scales, global_scale, inp, scale_override);
+    binding_impl(1, true, out, scales, global_scale, inp, amax_per_row, scale_override);
 }
 
 void four_six_fp4_pertoken_linear_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
-    const at::Tensor& inp, float scale_override)
+    const at::Tensor& inp, const at::Tensor& amax_per_row, float scale_override)
 {
-    binding_impl(2, false, out, scales, global_scale, inp, scale_override);
+    binding_impl(2, false, out, scales, global_scale, inp, amax_per_row, scale_override);
 }
 
 void rtn_fp4_pertoken_linear_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
-    const at::Tensor& inp, float scale_override)
+    const at::Tensor& inp, const at::Tensor& amax_per_row, float scale_override)
 {
-    binding_impl(1, false, out, scales, global_scale, inp, scale_override);
+    binding_impl(1, false, out, scales, global_scale, inp, amax_per_row, scale_override);
 }

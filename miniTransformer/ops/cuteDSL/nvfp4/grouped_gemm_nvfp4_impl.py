@@ -38,7 +38,7 @@ class PertokenNvfp4Tensor:
     """Per-token NVFP4 activation/weight: packed FP4 + block/global scales."""
 
     data_uint8: torch.Tensor
-    block_scale: torch.Tensor
+    block_scale: Optional[torch.Tensor]
     # Per-group slice [m_i] — only needed for reference/dequant paths.
     # Production forward (grouped_gemm_cutedsl_pertoken) uses global_scale_full instead.
     global_scale: Optional[torch.Tensor] = None
@@ -46,11 +46,14 @@ class PertokenNvfp4Tensor:
     # When set, grouped_gemm_cutedsl_pertoken uses it directly to build alphas_packed,
     # avoiding a redundant split→cat round-trip.
     global_scale_full: Optional[torch.Tensor] = None
+    # Pre-computed CUTE-format SFA tensor from group_quantize_nvfp4_pertoken_swizzled.
+    # When set, grouped_gemm_cutedsl_pertoken skips the D2H+_make_cute_sf path entirely.
+    sfa_swizzled: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.data_uint8.dtype != torch.uint8:
             raise TypeError("data_uint8 must be torch.uint8 (packed FP4x2).")
-        if self.block_scale.ndim != 2:
+        if self.block_scale is not None and self.block_scale.ndim != 2:
             raise ValueError("block_scale must be 2D [M, K//16].")
         if self.global_scale is not None and self.global_scale.ndim != 1:
             raise ValueError("global_scale must be 1D [M].")
@@ -228,7 +231,7 @@ def _pad_2d_to_multiples_of_32(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int
 
 def quantize_weight_nvfp4_tensor_global(x: torch.Tensor) -> TensorGlobalNvfp4Tensor:
     # Tensor-global amax: CUDA fp4_gemm path.
-    from miniTransformer.ops.nvfp4_quantization import quantize_nvfp4_cuda
+    from miniTransformer.ops.nvfp4_quantize import quantize_nvfp4_cuda
 
     assert x.ndim == 2
     assert x.is_cuda, "quantize_weight_nvfp4_tensor_global requires a CUDA tensor."
@@ -411,7 +414,8 @@ def grouped_gemm_cutedsl_pertoken(
             alpha_b = b._alpha_b_cached
             if b._cute_fp4 is None:
                 b._cute_fp4 = _make_fp4_tensor_for_cutedsl(b.data_uint8, n_i, k, device)
-                b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
+                if b._cute_sfb is None:
+                    b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
             b_fp4, sfb = b._cute_fp4, b._cute_sfb
 
         elif isinstance(b, PertokenNvfp4Tensor):
@@ -441,11 +445,14 @@ def grouped_gemm_cutedsl_pertoken(
             torch.cuda.synchronize()
             _last_timing_us["make_fp4_us"] += (_time.perf_counter() - _pt) * 1e6
             _pt = _time.perf_counter()
-        sf_fp8 = block_scale_to_sf_fp8(act.block_scale, m_i, k)
-        if _timing_enabled:
-            torch.cuda.synchronize()
-            _last_timing_us["block_scale_fp8_us"] += (_time.perf_counter() - _pt) * 1e6
-        sfa = _make_cute_sf(sf_fp8, m_i, sf_k)
+        if act.sfa_swizzled is not None:
+            sfa = act.sfa_swizzled
+        else:
+            sf_fp8 = block_scale_to_sf_fp8(act.block_scale, m_i, k)
+            if _timing_enabled:
+                torch.cuda.synchronize()
+                _last_timing_us["block_scale_fp8_us"] += (_time.perf_counter() - _pt) * 1e6
+            sfa = _make_cute_sf(sf_fp8, m_i, sf_k)
 
         abc_torch.append([a_fp4, b_fp4, c_out])
         sfasfb_torch.append([sfa, sfb])

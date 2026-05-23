@@ -30,6 +30,16 @@ def _fp4_grid(device_str: str) -> torch.Tensor:
     return _FP4_GRID.to(torch.device(device_str))
 
 
+def _get_fp4_grid(device: torch.device) -> torch.Tensor:
+    # Normalize to "cuda:N" so lru_cache always hits after first call.
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        key = f"cuda:{idx}"
+    else:
+        key = str(device)
+    return _fp4_grid(key)
+
+
 def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
     """Unpack uint8 [m, n//2] → int32 [m, n] nibble indices 0–15."""
     p = packed.to(torch.int32)
@@ -152,8 +162,13 @@ def quantize_nvfp4_pertoken(
     scale = torch.empty((rows, cols // 16), dtype=nvfp4_scale_t, device=x.device)
     global_scale = torch.empty(rows, dtype=torch.float32, device=x.device)
 
-    fn = fp4_gemm.four_six_fp4_pertoken_linear if four_six else fp4_gemm.rtn_fp4_pertoken_linear
-    fn(out, scale, global_scale, x_c, scale_override)
+    if cols <= 8192:
+        fn = fp4_gemm.four_six_fp4_pertoken_linear_fused if four_six else fp4_gemm.rtn_fp4_pertoken_linear_fused
+        fn(out, scale, global_scale, x_c, scale_override)
+    else:
+        amax_per_row = x_c.abs().amax(dim=1).to(torch.float32)
+        fn = fp4_gemm.four_six_fp4_pertoken_linear if four_six else fp4_gemm.rtn_fp4_pertoken_linear
+        fn(out, scale, global_scale, x_c, amax_per_row, scale_override)
 
     return quantization.QuantizeResult(
         data=out,
@@ -196,8 +211,13 @@ def quantize_nvfp4_pertoken_swizzled(
     scale = torch.empty(rows * cols // 16, dtype=nvfp4_scale_t, device=x.device)
     global_scale = torch.empty(rows, dtype=torch.float32, device=x.device)
 
-    fn = fp4_gemm.four_six_fp4_pertoken if four_six else fp4_gemm.rtn_fp4_pertoken
-    fn(out, scale, global_scale, x_c, scale_override)
+    if cols <= 8192:
+        fn = fp4_gemm.four_six_fp4_pertoken_fused if four_six else fp4_gemm.rtn_fp4_pertoken_fused
+        fn(out, scale, global_scale, x_c, scale_override)
+    else:
+        amax_per_row = x_c.abs().amax(dim=1).to(torch.float32)
+        fn = fp4_gemm.four_six_fp4_pertoken if four_six else fp4_gemm.rtn_fp4_pertoken
+        fn(out, scale, global_scale, x_c, amax_per_row, scale_override)
 
     return quantization.QuantizeResult(
         data=out,
@@ -222,7 +242,7 @@ def dequantize_nvfp4_pertoken(result: quantization.QuantizeResult) -> torch.Tens
     scale = result.scale
     global_scale = result.tensor_scale
 
-    grid = _fp4_grid(str(data.device))
+    grid = _get_fp4_grid(data.device)
     fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)           # [m, n]
     scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)               # [m, 1]
@@ -248,7 +268,7 @@ def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> t
     n = nhalf * 2
 
     scale_rm = _unswizzle_scale(result.scale.to(torch.float32), m, n)  # [m, n//16]
-    grid = _fp4_grid(str(data.device))
+    grid = _get_fp4_grid(data.device)
     fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)               # [m, n]
     scale_expanded = scale_rm.repeat_interleave(16, dim=1)             # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)                   # [m, 1]
@@ -282,6 +302,62 @@ class GroupQuantizeSwizzledResult:
 
 
 _SCALE_VIEW_PERM = (3, 4, 1, 5, 2, 0)   # matches mma_permute_order in nvfp4_qgemm.py
+
+
+def quantize_weight_nvfp4_swizzled(
+    x: torch.Tensor,
+    *,
+    four_six: bool = False,
+    scale_override: float = 1.0,
+) -> "TensorGlobalNvfp4Tensor":
+    """Quantize weight [N, K] to NVFP4 and build CUTE-layout tensors fully on GPU.
+
+    Replaces the ``quantize_weight_nvfp4_tensor_global`` + ``_make_cute_sf`` path:
+    ``rtn_fp4`` / ``four_six_fp4`` already writes tcgen05 swizzled scale in the
+    kernel, so no D2H → CPU CuTeDSL → H2D is needed.
+
+    The returned ``TensorGlobalNvfp4Tensor`` has ``_cute_fp4`` and ``_cute_sfb``
+    pre-populated so ``grouped_gemm_cutedsl_pertoken`` never calls ``_make_cute_sf``.
+    """
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        TensorGlobalNvfp4Tensor,
+        _make_fp4_tensor_for_cutedsl,
+    )
+
+    assert x.is_cuda, "quantize_weight_nvfp4_swizzled requires a CUDA tensor."
+    assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES, "Unsupported input dtype."
+    assert x.ndim == 2, "x must be 2-D [N, K]."
+    n, k = x.shape
+    assert k % 128 == 0, "K must be divisible by 128."
+    assert k // 8 <= 512, "K must be <= 4096."
+    device = x.device
+
+    amax = x.abs().max().to(torch.float32).view(1).contiguous()
+
+    data       = torch.empty((n, k // 2), dtype=nvfp4_output_t, device=device)
+    n_padded   = ((n + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    scale_flat = torch.zeros(n_padded * (k // 16), dtype=nvfp4_scale_t, device=device)
+    gs         = torch.empty(1, dtype=torch.float32, device=device)
+
+    fn = fp4_gemm.four_six_fp4 if four_six else fp4_gemm.rtn_fp4
+    fn(data, scale_flat, gs, x, amax, scale_override)
+
+    nMT = n_padded // _MMA_TILE_ROWS
+    nKT = k // 64
+    cute_sfb = scale_flat.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
+    # Non-contiguous intentionally: strides must match create_cute_scale_factor_tensor output
+    # (physical (1,nMT,nKT,32,4,4) C-order) so the CuTe kernel stub sees identical strides.
+    cute_fp4 = _make_fp4_tensor_for_cutedsl(data, n, k, device)
+
+    t = TensorGlobalNvfp4Tensor(
+        data_uint8=data,
+        block_scale_fp8=scale_flat,
+        amax=amax,
+    )
+    t._alpha_b_cached = float(amax.item()) / (448.0 * 6.0)
+    t._cute_fp4 = cute_fp4
+    t._cute_sfb = cute_sfb
+    return t
 
 
 def group_quantize_nvfp4_pertoken_swizzled(
@@ -319,6 +395,17 @@ def group_quantize_nvfp4_pertoken_swizzled(
 
     total_m, k = x.shape
     device = x.device
+
+    if total_m == 0:
+        nKT = k // 64
+        return GroupQuantizeSwizzledResult(
+            data=torch.empty((0, k // 2), dtype=nvfp4_output_t, device=device),
+            global_scale=torch.empty(0, dtype=torch.float32, device=device),
+            scale_flat=torch.empty(0, dtype=nvfp4_scale_t, device=device),
+            scale_views=[None] * len(m_splits),
+            scale_offsets=[0] * (len(m_splits) + 1),
+            row_offsets=[0] * (len(m_splits) + 1),
+        )
 
     row_offsets: List[int] = [0]
     scale_offsets: List[int] = [0]

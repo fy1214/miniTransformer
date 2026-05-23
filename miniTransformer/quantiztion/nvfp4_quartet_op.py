@@ -7,7 +7,7 @@ from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend
-from miniTransformer.ops.quartet_quant import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
+from miniTransformer.ops.nvfp4_quartet_quantize import quant_fp4, rht128_quant_eden, rht128_requant, NVFP4QuantMode
 from miniTransformer.quantiztion import quantization
 from miniTransformer.utils import utils
 

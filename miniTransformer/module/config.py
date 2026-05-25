@@ -20,9 +20,8 @@ logger = logging.getLogger(__name__)
 
 @enum.unique
 class QuantizeType(enum.Enum):
-    """quantization type for linear layers."""
+    """Quantization format for linear layers."""
 
-    # Non-quantize
     NONE = "none"
     FP8 = "fp8"
     MXFP8 = "mxfp8"
@@ -95,7 +94,6 @@ class QLinearParams:
 class QuantizeRecipe(enum.Enum):
     """Pre-defined quantization recipes for linear layers."""
 
-    # Non-quantize
     NON_QUANTIZE = "non_quantize"
     BF16_REF = "bf16_ref"
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
@@ -109,7 +107,6 @@ class QuantizeRecipe(enum.Enum):
 def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     """Get quantization parameters for linear layer based on recipe."""
     if recipe == QuantizeRecipe.NON_QUANTIZE:
-        # Non-quantize (bf16)
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
     elif recipe == QuantizeRecipe.BF16_REF:
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
@@ -317,17 +314,14 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
     if qat_params_idx == 1:
         return get_qlinear_params_from_predefined(QuantizeRecipe.NON_QUANTIZE)
     if qat_params_idx == 2:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.INT4_SUB_CHANNEL
         )
     if qat_params_idx == 3:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_REF
         )
     if qat_params_idx == 4:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL
         )

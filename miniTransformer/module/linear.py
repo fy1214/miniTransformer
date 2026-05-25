@@ -79,22 +79,15 @@ class _NonQuantizedLinear(torch.autograd.Function):
         x = cast_if_needed(x, activation_dtype)
         use_bias = bias is not None
         if use_bias:
-            # Make mypy happy with assert on Noneness.
             assert bias is not None
             bias = cast_if_needed(bias, activation_dtype)
 
-        # AllGather for column and sequence parallel
         if parallel_mode == "column" and sequence_parallel:
             assert tp_group is not None
             x, _ = gather_along_first_dim(x, tp_group)
 
-        # Forward pass GEMM
-        # y = torch.matmul(x, w.t())
-        # if use_bias and bias.numel():
-        #     y = y + bias
         y = torch.nn.functional.linear(x, w, bias)
 
-        # Save context for backward pass
         if is_grad_enabled:
             ctx.use_bias = use_bias
             ctx.sequence_parallel = sequence_parallel
@@ -111,11 +104,9 @@ class _NonQuantizedLinear(torch.autograd.Function):
                 w,
             )
 
-        # Reduce scatter for row and sequence parallel
         if parallel_mode == "row" and sequence_parallel:
             assert tp_group is not None
             y, _ = reduce_scatter_along_first_dim(y, tp_group)
-        # Allreduce for rowwise parallel
         elif parallel_mode == "row" and tp_size > 1:
             y, _ = allreduce(y, tp_group)
 
@@ -123,27 +114,22 @@ class _NonQuantizedLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *dy_tup: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
-        # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
         (x, w) = ctx.saved_tensors
         assert x is not None and w is not None
 
-        # Set dtypes, shapes
         dy = dy.contiguous()
         dy = dy.view(-1, dy.shape[-1])
 
-        # Bias gradient
         b_grad = torch.sum(dy, dim=0) if ctx.use_bias else None
 
-        # AllGather for row and sequence parallel
         if ctx.parallel_mode == "row" and ctx.sequence_parallel:
             dy, _ = gather_along_first_dim(dy, ctx.tp_group)
 
-        # GEMM dgrad
         dgrad = torch.matmul(dy, w)
 
-        # ReduceScatter / Allreduce for column parallel (Overlap with wgrad)
+        # Overlap dgrad communication with wgrad GEMM
         if ctx.parallel_mode == "column" and ctx.sequence_parallel:
             dgrad, handle = reduce_scatter_along_first_dim(dgrad, ctx.tp_group, True)
         elif ctx.parallel_mode == "column" and ctx.tp_size > 1:
@@ -151,8 +137,6 @@ class _NonQuantizedLinear(torch.autograd.Function):
         else:
             handle = None
 
-        # GEMM wgrad
-        # TODO need to support wgrad accumulation
         if ctx.is_first_microbatch is not None:
             accumulate_wgrad_into_param_main_grad = (
                 ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
@@ -160,7 +144,6 @@ class _NonQuantizedLinear(torch.autograd.Function):
         else:
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
-        # For wgrad, we will set the dtype to float32
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
 
         wgrad = torch.matmul(dy.t(), x)
@@ -170,10 +153,8 @@ class _NonQuantizedLinear(torch.autograd.Function):
                 w.main_grad.add_(wgrad)
                 wgrad = w.main_grad
 
-        # Handle wgrad accumulation for mcore if needed
         wgrad = _QuantizedLinear.reset_wgrad_if_needed(ctx, w, wgrad)
 
-        # Wait for communication to finish
         if handle is not None:
             handle.wait()
 
@@ -233,11 +214,9 @@ class _QuantizedLinear(torch.autograd.Function):
         disable_backward_quant: bool
     ) -> torch.Tensor:
 
-        # Get quantization op
         assert qlinear_params.quantize_op is not None
         quantize_op: quantization.QuantizeOpBase = qlinear_params.quantize_op
 
-        # Set dtypes, shapes and bias
         x_shape = x.shape
         out_dtype = (
             x.dtype
@@ -251,8 +230,7 @@ class _QuantizedLinear(torch.autograd.Function):
             assert bias is not None
             bias = cast_if_needed(bias, activation_dtype)
 
-        # Quantize x (with optional transpose).
-        # Will also perform AllGather if needed.
+        # Quantize x; also performs AllGather when sequence_parallel + column_parallel
         gather_required = parallel_mode == "column" and sequence_parallel
         qresult_x = _QuantizedLinear.quantize_optionally_allgather(
             quantize_op,
@@ -266,7 +244,6 @@ class _QuantizedLinear(torch.autograd.Function):
 
         qx, sx, qx_global_amax_row = qresult_x.data, qresult_x.scale, qresult_x.tensor_scale
 
-        # Quantize w only for is_first_microbatch is True or None
         update_quantize_weights = is_first_microbatch or is_first_microbatch is None
         if quantize_op.should_update_quantize_weights:
             # Quantize w (with optional transpose)
@@ -291,7 +268,6 @@ class _QuantizedLinear(torch.autograd.Function):
             qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
             assert qw is not None, "quantized weight cache should not be None"
 
-        # Forward pass GEMM
         y = quantize_op.qgemm(
             qx,
             qw,
@@ -307,7 +283,6 @@ class _QuantizedLinear(torch.autograd.Function):
             qparams_w=qlinear_params.w_params,
         )
 
-        # Save context for backward pass
         if is_grad_enabled:
             ctx.use_bias = use_bias
             ctx.sequence_parallel = sequence_parallel
@@ -336,8 +311,8 @@ class _QuantizedLinear(torch.autograd.Function):
             # If memory saving is enabled, we only save a shard of the qx_t tensor.
             # The full tensor will need to be AllGathered in the backward pass.
             if qlinear_params.memory_saving and gather_required:
-                # we need an explicit clone here, otherwise PyTorch is not able to free
-                # the original full qx_t tensor because of reference counting
+                # Clone to free the original full qx_t tensor; PyTorch won't release it otherwise
+                # due to reference counting when the full gather result is still reachable.
                 qx_t = torch.chunk(qx_t, tp_size, dim=0)[ctx.tp_rank].detach().clone()
 
             if disable_backward_quant:
@@ -394,9 +369,8 @@ class _QuantizedLinear(torch.autograd.Function):
         # Bias gradient
         b_grad = torch.sum(dy, dim=0) if ctx.use_bias else None
 
-        # Quantize dy (with transpose)
-        # Will also perform AllGather if needed
-        # TODO: we can overlap the x allgather to w quant
+        # Quantize dy; also performs AllGather when sequence_parallel + row_parallel
+        # TODO: overlap x allgather with w quantization
         gather_required = ctx.parallel_mode == "row" and ctx.sequence_parallel
         qresult_dy = _QuantizedLinear.quantize_optionally_allgather(
             ctx.quantize_op,
@@ -416,8 +390,6 @@ class _QuantizedLinear(torch.autograd.Function):
             qresult_dy.tensor_scale_t,
         )
 
-        # If memory saving is enabled, we need to AllGather the full
-        # qx_t tensor for wgrad GEMM. This is overlapped with dgrad GEMM.
         qx_t_handle = None
         if ctx.qlinear_params.memory_saving and ctx.x_gather_required:
             assert ctx.tp_group is not None
@@ -425,7 +397,6 @@ class _QuantizedLinear(torch.autograd.Function):
                 qx_t, ctx.tp_group, async_op=True
             )
 
-        # GEMM dgrad
         if ctx.disable_backward_quant:
             dq_w_t = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
             dgrad = dy @ dq_w_t
@@ -448,10 +419,9 @@ class _QuantizedLinear(torch.autograd.Function):
                 qparams_w=ctx.qlinear_params.w_params,
             )
 
-        # If memory saving is enabled and we have a qx_t handle, Wait for qx_t AllGather to finish
         if qx_t_handle is not None:
             qx_t_handle.wait()
-        # ReduceScatter / Allreduce for column parallel (Overlap with wgrad)
+        # Overlap dgrad communication with wgrad GEMM
         if ctx.parallel_mode == "column" and ctx.sequence_parallel:
             dgrad, handle = reduce_scatter_along_first_dim(dgrad, ctx.tp_group, True)
         elif ctx.parallel_mode == "column" and ctx.tp_size > 1:
@@ -466,7 +436,6 @@ class _QuantizedLinear(torch.autograd.Function):
         else:
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
-        # For wgrad, we will set the dtype to float32
         out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
         # GEMM wgrad nt.
         if ctx.disable_backward_quant:
@@ -733,14 +702,11 @@ class Linear(LayerLinearBaseModule):
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
         self.save_original_input = save_original_input
-        # JQ: hybrid addtional
         self.layer_name = ub_name
         self.layer_number = layer_number
 
         self.disable_backward_quant = should_keep_backward_in_bf16()
 
-        # JQ: just set hybrid recipe
-        # Set quantization parameters
         self.qlinear_params = self.set_qlinear_params(
             qlinear_params=qlinear_params,
             layer_number=self.layer_number,
@@ -769,16 +735,9 @@ class Linear(LayerLinearBaseModule):
         elif self.parallel_mode == "row":
             self.in_features = divide(self.in_features, self.tp_size)
 
-        # JQ: not supported for now
         with_fp8_params = False
-        # Initialize params in FP8
-        # with_fp8_params = FP8GlobalStateManager.is_fp8_params_enabled()
-        # self.fp8 = FP8GlobalStateManager.is_fp8_enabled()
-        # assert self.fp8, "FP8 must be enabled for Linear module"
         assert with_fp8_params is False, "FP8 only parameters are not supported yet"
-        # assert self.fsdp_group is None, "FSDP sharding is not supported yet"
 
-        # Contiguous buffers for params
         weight_tensor = torch.empty(
             self.out_features,
             self.in_features,
@@ -793,25 +752,21 @@ class Linear(LayerLinearBaseModule):
                 dtype=params_dtype,
             )
 
-        # Configure parameter splits
         self.weight_names = []
         self.bias_names = []
         self.parameter_split_sizes = []
         if parameters_split is None:
-            # Split into a single parameter by default
             self.weight_names = ["weight"]
             self.bias_names = ["bias"]
             self.parameter_split_sizes = [out_features]
         elif not parameters_split:
             raise ValueError("Cannot split weight buffer into 0 parameters")
         elif isinstance(parameters_split, dict):
-            # Split parameters with provided sizes
             for name, split_size in parameters_split.items():
                 self.weight_names.append(f"{name.rstrip('_')}_weight")
                 self.bias_names.append(f"{name.rstrip('_')}_bias")
                 self.parameter_split_sizes.append(split_size)
         elif all(isinstance(name, str) for name in parameters_split):
-            # Split parameters evenly
             split_size = out_features // len(parameters_split)
             assert out_features % len(parameters_split) == 0, "Invalid split size"
             for name in parameters_split:
@@ -821,14 +776,12 @@ class Linear(LayerLinearBaseModule):
         else:
             raise TypeError("Invalid configuration for parameters split")
 
-        # Make sure parameter splits are valid
         if sum(self.parameter_split_sizes) != out_features:
             raise ValueError(
                 f"Trying to split weight buffer ({out_features=}) "
                 f"with split sizes {self.parameter_split_sizes}"
             )
 
-        # Adjust parameter splits for tensor-parallel distribution
         if self.parallel_mode == "column":
             for i, size in enumerate(self.parameter_split_sizes):
                 if size % self.tp_size != 0:
@@ -838,25 +791,19 @@ class Linear(LayerLinearBaseModule):
                     )
                 self.parameter_split_sizes[i] = size // self.tp_size
 
-        # Construct weight parameters
-        # Note: Register weights together so that they are adjacent to
-        # each other in Linear.parameters(). This makes it more likely
-        # that they will stay contiguous if the weights are
-        # manipulated externally, e.g. by FSDP.
+        # Register weights contiguously so FSDP external manipulation is less likely to break contiguity.
         offset = 0
         for i, split_size in enumerate(self.parameter_split_sizes):
             split_start = offset
             offset += split_size
             split_end = offset
 
-            # Check if parameters are subviews of buffers
             is_subview = (split_start, split_end) != (0, self.out_features)
             if is_subview and with_fp8_params:
                 raise RuntimeError(
                     "Splitting Float8Tensor into multiple params is not supported"
                 )
 
-            # Construct weight parameter
             self.register_parameter(
                 self.weight_names[i],
                 torch.nn.Parameter(weight_tensor[split_start:split_end]),
@@ -864,7 +811,6 @@ class Linear(LayerLinearBaseModule):
                 get_rng_state_tracker=get_rng_state_tracker,
             )
 
-        # Construct bias parameters if needed
         if self.use_bias:
             assert bias_tensor is not None
             offset = 0
@@ -885,13 +831,11 @@ class Linear(LayerLinearBaseModule):
 
         self.reset_parameters(defer_init=(device == "meta"))
 
-        # quantized weight cache between microbatches
         self.weight_qresult_cache = quantization.QuantizeResultCache(
             data=None, scale=None, data_t=None, scale_t=None
         )
 
-        # For RPL, bias has to be added after TP collectives
-        # So it cannot be fused with the GEMM
+        # For row parallel linear, bias must be added after TP collectives and cannot be fused into GEMM.
         if self.parallel_mode == "row" and self.apply_bias:
             self.gemm_bias_unfused_add = True
         else:
@@ -901,7 +845,6 @@ class Linear(LayerLinearBaseModule):
         super().reset_parameters(defer_init=defer_init)
 
         if not defer_init:
-            # Set parallelism attributes for linear weights
             for weight in self.weight_names:
                 set_tensor_model_parallel_attributes(
                     tensor=getattr(self, weight),
@@ -910,7 +853,6 @@ class Linear(LayerLinearBaseModule):
                     stride=1,
                 )
 
-            # Set parallelism attributes for linear biases
             if self.use_bias:
                 for bias in self.bias_names:
                     if self.parallel_mode == "row":
@@ -956,7 +898,6 @@ class Linear(LayerLinearBaseModule):
 
         self.set_activation_dtype(inp)
         inp = inp.contiguous()
-        # Sanity checks
         assert self.tp_group_initialized, "TP group not initialized"
         input_dtypes = (torch.float, torch.float16, torch.bfloat16, torch.float32)
         assert inp.dtype in input_dtypes, f"Input dtype {inp.dtype} not supported"
@@ -975,7 +916,6 @@ class Linear(LayerLinearBaseModule):
         else:
             bias_tensor = getattr(self, self.bias_names[0])  # Unused
 
-        # Choose the appropriate linear function
         LinearFunction = (
             _QuantizedLinear if self.qlinear_params.quantize else _NonQuantizedLinear
         )

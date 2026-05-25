@@ -10,9 +10,8 @@ from ..utils import utils
 
 @enum.unique
 class ParamType(enum.Enum):
-    """quantization type for linear layers."""
+    """Parameter role for quantization dispatch (activation, weight, or gradient)."""
 
-    # Non-quantize
     X = "x"
     WEIGHT = "weight"
     Y = "y"
@@ -143,7 +142,10 @@ class QuantizeInputMetaBase:
 class QuantizeOpBase:
 
     """
-    Check QuantizeOp whether you could save weight quantize result for the microbatch
+    Base class for quantization operators.
+
+    Subclasses implement quantize() and qgemm() to define quantized training behavior.
+    Set should_update_quantize_weights=True to cache and reuse weight quantization across microbatches.
     """
     should_update_quantize_weights: bool = False
 
@@ -258,10 +260,9 @@ def _scale_from_amax_tensor(
     """
     assert amax.dtype == torch.float, "amax must be a float tensor."
     fp8_max = torch.finfo(quant_dtype).max
-    # Clamping amax to avoid division by small numbers
+    # Clamp to avoid division by near-zero amax
     amax = torch.max(amax, torch.tensor(eps))
 
-    # Compute scale factor
     scale = torch.div(fp8_max, amax)
     # Note frexp doesn't give back inf for exponent with an inf input
     # We take care of inf before pow_2_scales
@@ -288,10 +289,9 @@ def _scale_from_amax_tensor(
         # calculation.
         scale = torch.where(amax == float("inf"), 0.0, scale)
 
-    # Handle overflow cases for amax zero causing NaN
+    # Handle amax==0 edge case (would cause NaN in division)
     scale = torch.where(amax == 0, 1.0, scale)
 
-    # Compute scale_inv
     scale_inv = torch.reciprocal(scale)
 
     return scale, scale_inv, amax
@@ -328,10 +328,8 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         ), f"Unsupported input dtype, {x.dtype}"
         assert not reduce_amax
         if qparams.quant_dtype is None:
-            # If qparams is None, use the input tensor as is
             qx = x
         else:
-            # Otherwise, cast the input tensor to quant_dtype
             assert (
                 qparams.scaling_type in self.supported_scaling_types
             ), f"Unsupported scaling type"
@@ -378,7 +376,6 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         ), f"Unsupported weight dtype, {qw.dtype}"
 
         if bias is not None and bias.numel():
-            # fused matmul + bias
             y = torch.nn.functional.linear(qx, qw, bias=bias)
         else:
             y = torch.matmul(qx, qw.t())

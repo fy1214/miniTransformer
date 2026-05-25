@@ -233,7 +233,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
 
-        # 判断输入是量化 tensor 还是 BF16 plain tensor
+        # Determine whether input is a quantized tensor or BF16 plain tensor
         a0 = A[0]
         is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
 
@@ -261,7 +261,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
                 if is_quantized:
                     n_cols = B[0]._rowwise_data.size(1) * 2
                 else:
-                    # BF16: B[i] shape [n, k]，dgrad shape [m_sum, k]
+                    # BF16: B[i] shape [n, k], dgrad shape [m_sum, k]
                     n_cols = B[0].size(1)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
@@ -273,7 +273,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
             if is_quantized:
                 n_cols = B[0]._rowwise_data.size(0)
             else:
-                # BF16 fprop: B[i] shape [n, k]，output shape [m_sum, n]
+                # BF16 fprop: B[i] shape [n, k], output shape [m_sum, n]
                 n_cols = B[0].size(0)
             out = torch.empty(
                 [sum(m_splits), n_cols],

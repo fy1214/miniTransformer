@@ -223,7 +223,6 @@ class LayerNormLinear(Linear):
             qlinear_params=qlinear_params,
         )
 
-        # userbuffer checks
         if any([ub_bulk_wgrad, ub_bulk_dgrad, ub_overlap_ag, ub_overlap_rs_dgrad]):
             assert ub_name is not None, "Userbuffer name [string] is not set."
         assert not (
@@ -238,14 +237,12 @@ class LayerNormLinear(Linear):
             not self.return_layernorm_output_gathered
         ), "return_layernorm_output_gathered is not supported yet."
 
-        # Setup normalization
         assert normalization in [
             "LayerNorm",
             "RMSNorm",
         ], "Unsupported normalization type!"
         self.normalization = normalization
 
-        # use_te_norm is None by default, and will be set to True if we should switch to hybrid linear
         if use_te_norm is None:
             use_te_norm = should_switch_to_hybrid_linear()
 
@@ -270,18 +267,16 @@ class LayerNormLinear(Linear):
                 device=device,
             )
 
-        # 把 gamma/beta 直接注册为当前模块的参数，与 TE 对齐：
-        #   TE  : layer_norm_weight  (nn.Parameter)
-        #   mini: layer_norm_weight  (nn.Parameter)  ← 不再是 layer_norm_weight.weight
-        # 同时把 _norm 存为普通 Python 属性（绕过 nn.Module.__setattr__），
-        # 避免它作为子模块出现在 state_dict 里
+        # Register gamma/beta directly on this module to match TE's state_dict layout:
+        #   TE: layer_norm_weight (nn.Parameter)  ← not layer_norm.weight
+        # Storing _norm as a plain attribute (bypassing nn.Module.__setattr__) prevents it
+        # from appearing as a submodule in state_dict.
         self.register_parameter("layer_norm_weight", _norm._parameters.pop("weight", None))
         if normalization == "LayerNorm":
             self.register_parameter("layer_norm_bias", _norm._parameters.pop("bias", None))
         else:
             self.layer_norm_bias = None
 
-        # 保存 norm 所需的元信息，forward 时用 F.layer_norm / F.rms_norm 直接调用
         self._layer_norm_eps = _norm.eps
         self._layer_norm_normalized_shape = getattr(_norm, "normalized_shape", (in_features,))
 
@@ -315,7 +310,6 @@ class LayerNormLinear(Linear):
         """
         inp = inp.contiguous()
 
-        # 用 F.layer_norm / F.rms_norm 直接计算，避免引入带参数的子模块
         if self.normalization == "LayerNorm":
             ln_out = F.layer_norm(
                 inp,
@@ -333,7 +327,6 @@ class LayerNormLinear(Linear):
             )
         input_meta = None
 
-        # Run the linear layer by calling parent's forward
         out = super().forward(ln_out, is_first_microbatch, fp8_output, input_meta)
 
         if self.return_bias:

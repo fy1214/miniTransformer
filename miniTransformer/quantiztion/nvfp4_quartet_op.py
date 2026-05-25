@@ -291,11 +291,6 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
 
-        # forward qx qw  [m, k] [n, k] TN   => out [m, n]
-        # dgrad qdy qw_t [m, n] [k, n] NN   => out [m, k]
-        # wgrad qdy_t qx_t [n, m] [k, m] NT => out [n, k]
-
-        #alpha = global_amax_qx * global_amax_qw
         alpha = 1.0 * global_amax_qw
         backend = dispatch_gemm_backend(custom_gemm_backend, "nvfp4")
         out = backend.gemm(

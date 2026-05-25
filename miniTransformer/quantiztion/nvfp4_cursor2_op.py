@@ -27,6 +27,8 @@ _GEMM_CALL_COUNT: int = 0
 
 # Independent debug counter for quant/GEMM prints (not gated by _GEMM_CALL_COUNT).
 _DEBUG_CALL_COUNT: int = 0
+# Separate counter for backward GEMM prints (reset independently).
+_DEBUG_BGRAD_COUNT: int = 0
 
 # Capture one torch.profiler trace at this call index (0 = first call).
 # Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
@@ -97,11 +99,16 @@ def _grouped_gemm_cutedsl_pertoken(
             b_data = getattr(b, 'data_uint8', b)
             a_gs   = getattr(a, 'global_scale', None)
             b_alpha = getattr(b, '_alpha_b_cached', None)
-            gs_str    = f"{a_gs.abs().max().item():.4g}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
+            if a_gs is not None and a_gs.numel() > 0:
+                gs_str     = f"{a_gs.abs().max().item():.4g}"
+                gs_nan_str = f"{a_gs.isnan().any().item()}"
+                gs_large   = (a_gs > 1.0).sum().item()
+                gs_large_str = f"{gs_large}/{a_gs.numel()}"
+            else:
+                gs_str = gs_nan_str = gs_large_str = "N/A"
             alpha_str = f"{b_alpha:.4g}" if b_alpha is not None else "N/A"
-            gs_nan_str = f"{a_gs.isnan().any().item()}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
             print(f"[GEMM PRE g={i}] A.data={a_data.shape} B.data={b_data.shape} "
-                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} B.alpha_b={alpha_str}", flush=True)
+                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} A.gs>1={gs_large_str} B.alpha_b={alpha_str}", flush=True)
 
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
 
@@ -373,10 +380,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
             if _DEBUG_CALL_COUNT < 3:
                 sfb = gq.scale_flat.float()
+                gs = gq.global_scale
+                gs_large = (gs > 1.0).sum().item()
                 print(f"[X-QUANT POST] data={gq.data.shape} "
-                      f"gs_nan={gq.global_scale.isnan().any().item()} "
-                      f"gs_inf={gq.global_scale.isinf().any().item()} "
-                      f"gs_max={gq.global_scale.abs().max().item():.4g} "
+                      f"gs_nan={gs.isnan().any().item()} "
+                      f"gs_inf={gs.isinf().any().item()} "
+                      f"gs_max={gs.abs().max().item():.4g} "
+                      f"gs_mean={gs.mean().item():.4g} "
+                      f"gs>1={gs_large}/{gs.numel()} "
                       f"sfb_nan={sfb.isnan().any().item()} "
                       f"sfb_inf={sfb.isinf().any().item()} "
                       f"sfb_max={sfb.abs().max().item():.4g}", flush=True)
@@ -447,7 +458,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
-        global _DEBUG_CALL_COUNT
+        global _DEBUG_CALL_COUNT, _DEBUG_BGRAD_COUNT
 
         if _DEBUG_CALL_COUNT <= 3:
             from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
@@ -473,7 +484,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "set disable_backward_quant and use Nvfp4Cursor2QuantizeOp."
                 ) from exc
 
-        if _DEBUG_CALL_COUNT <= 3 and grad:
+        if _DEBUG_BGRAD_COUNT < 3 and grad:
             for i, (a, b) in enumerate(zip(A, B)):
                 def _tstat(t, name):
                     if not hasattr(t, 'shape'):
@@ -526,7 +537,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             accumulate=accumulate
         )
 
-        if _DEBUG_CALL_COUNT <= 3 and grad:
+        if _DEBUG_BGRAD_COUNT < 3 and grad:
             out_tensors = out if isinstance(out, list) else [out]
             for i, ot in enumerate(out_tensors):
                 if ot is None:
@@ -537,6 +548,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                           f"max={ot.abs().max().item():.4g}", flush=True)
                 except Exception as e:
                     print(f"[BGRAD POST i={i}] stat-err={e}", flush=True)
+            _DEBUG_BGRAD_COUNT += 1
 
         if grad and layout == "NT":
             return out

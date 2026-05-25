@@ -41,12 +41,11 @@ __device__ __forceinline__ QuantResultGP
 quantize_gp(float abs_max, float inv_val_max, float scale, bf16x8& x)
 {
     float s_group      = abs_max * inv_val_max;
-    float inv_scale    = reciprocal_approximate_ftz(scale);
-    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(s_group * inv_scale);
+    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(s_group / scale);
     float s_round_fp8  = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
-    float factor   = reciprocal_approximate_ftz(s_round_fp8 * scale);
+    float factor   = 1.0f / (s_round_fp8 * scale);
     float2 factor2 = {factor, factor};
     fp4x8 result;
     for (int k = 0; k < bf16x8::size; k += 2) {
@@ -192,18 +191,19 @@ static void launch_fp4_group_pertoken(
     float  scale_override,
     long   total_rows,
     long   cols,
-    int    num_groups)
+    int    num_groups,
+    cudaStream_t stream)
 {
     int    threads = static_cast<int>(cols / 8);
     size_t smem    = (static_cast<size_t>(threads) + 1) * sizeof(nv_bfloat16);
     int    cdiv16  = static_cast<int>(cols / 16);
 
     if (num_candidates == 2)
-        fp4_group_pertoken_kernel<2><<<total_rows, threads, smem>>>(
+        fp4_group_pertoken_kernel<2><<<total_rows, threads, smem, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, scale_override, cdiv16, num_groups);
     else
-        fp4_group_pertoken_kernel<1><<<total_rows, threads, smem>>>(
+        fp4_group_pertoken_kernel<1><<<total_rows, threads, smem, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, scale_override, cdiv16, num_groups);
 
@@ -243,7 +243,8 @@ void rtn_fp4_group_pertoken_binding(
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
-        scale_override, total_m, cols, ngroups);
+        scale_override, total_m, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
 }
 
 void four_six_fp4_group_pertoken_binding(
@@ -277,5 +278,6 @@ void four_six_fp4_group_pertoken_binding(
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
-        scale_override, total_m, cols, ngroups);
+        scale_override, total_m, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
 }

@@ -473,6 +473,21 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "set disable_backward_quant and use Nvfp4Cursor2QuantizeOp."
                 ) from exc
 
+        if _DEBUG_CALL_COUNT <= 3 and grad:
+            for i, (a, b) in enumerate(zip(A, B)):
+                def _tstat(t, name):
+                    if not hasattr(t, 'shape'):
+                        return f"{name}=<no-tensor>"
+                    data = getattr(t, '_rowwise_data', getattr(t, 'data_uint8', t))
+                    try:
+                        f = data.float() if data.dtype not in (torch.float32, torch.bfloat16, torch.float16) else data
+                        return (f"{name}.shape={data.shape} nan={f.isnan().any().item()} "
+                                f"inf={f.isinf().any().item()} max={f.abs().max().item():.4g}")
+                    except Exception as e:
+                        return f"{name}.shape={data.shape} stat-err={e}"
+                print(f"[BGRAD PRE g={i}] layout={layout} "
+                      f"{_tstat(a, 'A')} | {_tstat(b, 'B')}", flush=True)
+
         if grad:
             if layout == "NN":
                 # dgrad = dy @ W → in_features = last dim of _columnwise_data.
@@ -510,6 +525,18 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             use_split_accumulator=False,
             accumulate=accumulate
         )
+
+        if _DEBUG_CALL_COUNT <= 3 and grad:
+            out_tensors = out if isinstance(out, list) else [out]
+            for i, ot in enumerate(out_tensors):
+                if ot is None:
+                    continue
+                try:
+                    print(f"[BGRAD POST i={i}] layout={layout} shape={ot.shape} "
+                          f"nan={ot.isnan().any().item()} inf={ot.isinf().any().item()} "
+                          f"max={ot.abs().max().item():.4g}", flush=True)
+                except Exception as e:
+                    print(f"[BGRAD POST i={i}] stat-err={e}", flush=True)
 
         if grad and layout == "NT":
             return out

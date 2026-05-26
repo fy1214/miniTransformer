@@ -25,16 +25,6 @@ from miniTransformer.ops.nvfp4_grouped_cutlass_gemm import (
 )
 from miniTransformer.ops.nvfp4_qgemm import swizzle_scale
 
-try:
-    from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
-        GroupedBlockScaledProfile,
-        Sm100GroupedBlockScaledGemmKernel,
-        generate_grouped_blockscaled_inputs,
-    )
-    _CUTEDSL_AVAILABLE = True
-except ImportError:
-    _CUTEDSL_AVAILABLE = False
-
 
 _QPARAMS = quantization.QParams(
     scaling_dtype=torch.float8_e4m3fn,
@@ -541,22 +531,52 @@ class TestGroupedCutlassGemmBenchmark:
 
 
 # ---------------------------------------------------------------------------
-# Benchmark vs CuteDSL
+# Benchmark vs TE general_grouped_gemm
 # ---------------------------------------------------------------------------
 
 
-class TestGroupedCutlassGemmVsCuteDSL:
-    """Compare latency of CUTLASS C++ kernel vs CuteDSL Python-DSL kernel."""
+def _make_te_quantizer(columnwise=False):
+    from transformer_engine.pytorch import NVFP4Quantizer
+    return NVFP4Quantizer(
+        rowwise=True,
+        columnwise=columnwise,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        stochastic_rounding=False,
+    )
+
+
+def _build_te_inputs(shapes, seed=42):
+    """Build TE-quantized inputs for general_grouped_gemm (layout='TN': A=weight, B=act)."""
+    q_x = _make_te_quantizer(columnwise=False)
+    q_w = _make_te_quantizer(columnwise=False)
+    a_list, b_list, out_list, m_splits = [], [], [], []
+    for i, (m, n, k) in enumerate(shapes):
+        torch.manual_seed(seed + i)
+        torch.cuda.manual_seed(seed + i)
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)
+        torch.nn.init.normal_(w, std=0.023)
+        x_t = q_x.make_empty(x.shape, dtype=x.dtype, device=x.device, requires_grad=False)
+        w_t = q_w.make_empty(w.shape, dtype=w.dtype, device=w.device, requires_grad=False)
+        a_list.append(q_w.update_quantized(w, w_t))   # A = weight (transposed in TN layout)
+        b_list.append(q_x.update_quantized(x, x_t))   # B = activation
+        out_list.append(torch.empty(m, n, dtype=torch.bfloat16, device="cuda"))
+        m_splits.append(m)
+    return a_list, b_list, out_list, m_splits
+
+
+class TestGroupedCutlassGemmVsTE:
+    """Compare latency of CUTLASS C++ kernel vs TE general_grouped_gemm."""
 
     @pytest.mark.parametrize("shapes", _BENCH_CONFIGS)
-    def test_benchmark_vs_cutedsl(self, shapes):
+    def test_benchmark_vs_te(self, shapes):
         _require_sm100()
-        if not _CUTEDSL_AVAILABLE:
-            pytest.skip("CuteDSL grouped GEMM not available")
-
-        m_list = [s[0] for s in shapes]
-        n_list = [s[1] for s in shapes]
-        k_list = [s[2] for s in shapes]
+        pytest.importorskip("transformer_engine")
+        from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
 
         # ---- CUTLASS C++ inputs ----
         cutlass_inputs = TestGroupedCutlassGemmBenchmark._build_inputs(shapes)
@@ -575,43 +595,41 @@ class TestGroupedCutlassGemmVsCuteDSL:
                 tensor_scale_b_list=ts_b_list,
             )
 
-        # ---- CuteDSL inputs ----
-        abc, sfasfb, problem_sizes = generate_grouped_blockscaled_inputs(
-            m_list=m_list, n_list=n_list, k_list=k_list,
-            profile=GroupedBlockScaledProfile.NVFP4,
-            device="cuda", out_dtype=torch.bfloat16,
-        )
-        device = abc["torch"][0][0].device
-        alphas_packed = torch.ones(sum(m_list), device=device, dtype=torch.float32)
+        # ---- TE inputs ----
+        te_a, te_b, te_out, m_splits = _build_te_inputs(shapes)
 
-        kernel = Sm100GroupedBlockScaledGemmKernel(profile=GroupedBlockScaledProfile.NVFP4)
-
-        def fn_cutedsl():
-            kernel.run_from_grouped_inputs(
-                abc_tensors=abc,
-                sfasfb_tensors=sfasfb,
-                problem_sizes=problem_sizes,
+        def fn_te():
+            general_grouped_gemm(
+                A=te_a,
+                B=te_b,
+                out=te_out,
                 out_dtype=torch.bfloat16,
-                alphas_packed=alphas_packed,
+                layout="TN",
+                m_splits=m_splits,
+                single_output=False,
+                grad=False,
+                bias=None,
+                use_bias=False,
+                use_split_accumulator=False,
+                accumulate=False,
             )
 
-        # Warm up both (CuteDSL needs JIT compile on first call)
-        fn_cutedsl()
         fn_cutlass()
+        fn_te()
 
         ms_cutlass = _cuda_time_ms(fn_cutlass, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
-        ms_cutedsl = _cuda_time_ms(fn_cutedsl, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        ms_te      = _cuda_time_ms(fn_te,      warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
 
         tf_cutlass = _tflops(shapes, ms_cutlass)
-        tf_cutedsl = _tflops(shapes, ms_cutedsl)
-        speedup = ms_cutedsl / ms_cutlass
+        tf_te      = _tflops(shapes, ms_te)
+        speedup    = ms_te / ms_cutlass
 
         print(
             f"\n  groups={len(shapes)}  shapes={shapes[0]}{'...' if len(shapes) > 1 else ''}\n"
             f"  {'':20s} {'Latency µs':>12}  {'TFLOPS':>9}\n"
             f"  {'CUTLASS C++':20s} {ms_cutlass*1e3:>12.1f}  {tf_cutlass:>9.2f}\n"
-            f"  {'CuteDSL':20s} {ms_cutedsl*1e3:>12.1f}  {tf_cutedsl:>9.2f}\n"
-            f"  speedup (cutlass/cutedsl): {speedup:.2f}x"
+            f"  {'TE general_grouped':20s} {ms_te*1e3:>12.1f}  {tf_te:>9.2f}\n"
+            f"  speedup (cutlass/te): {speedup:.2f}x"
         )
 
 

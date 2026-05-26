@@ -429,5 +429,111 @@ class TestGroupedCutlassGemmPerTokenScale:
             )
 
 
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
+_BENCH_CONFIGS = [
+    pytest.param([(128, 4096, 7168)] * 8, id="moe_8x128_4096_7168"),
+    pytest.param([(128, 7168, 4096)] * 8, id="moe_8x128_7168_4096"),
+    pytest.param([(256, 4096, 7168)] * 8, id="moe_8x256_4096_7168"),
+    pytest.param([(512, 4096, 7168)] * 4, id="moe_4x512_4096_7168"),
+    pytest.param([(128, 128, 128)],        id="single_128_128_128"),
+    pytest.param([(128, 7168, 4096)],      id="single_128_7168_4096"),
+]
+
+_BENCH_WARMUP = 5
+_BENCH_ITERS  = 20
+
+
+def _cuda_time_ms(fn, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def _tflops(shapes, elapsed_ms: float) -> float:
+    flops = sum(2 * m * n * k for m, n, k in shapes)
+    return flops / (elapsed_ms * 1e-3) / 1e12
+
+
+class TestGroupedCutlassGemmBenchmark:
+    @staticmethod
+    def _build_inputs(shapes, seed=42):
+        device = "cuda"
+        quantize_op = Nvfp4TiledQuantizeRefOp()
+        a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list = [], [], [], [], [], [], []
+
+        for i, (m, n, k) in enumerate(shapes):
+            torch.manual_seed(seed + i)
+            torch.cuda.manual_seed(seed + i)
+
+            x = torch.randn(m, k, device=device, dtype=torch.float32)
+            w = torch.empty(n, k, device=device, dtype=torch.float32)
+            torch.nn.init.normal_(w, mean=0.0, std=0.023)
+
+            qres_x = quantize_op.quantize(x, _QPARAMS, return_transpose=False)
+            qres_w = quantize_op.quantize(w, _QPARAMS, return_transpose=False)
+
+            sx_4d = swizzle_scale(qres_x.scale.float(), m, k).to(torch.float8_e4m3fn)
+            sw_4d = swizzle_scale(qres_w.scale.float(), n, k).to(torch.float8_e4m3fn)
+
+            ts_a = qres_x.tensor_scale
+            ts_b = qres_w.tensor_scale_t
+            if ts_a is None:
+                ts_a = x.abs().max().float().view(1)
+            if ts_b is None:
+                ts_b = w.abs().max().float().view(1)
+            if ts_a.numel() > 1:
+                ts_a = ts_a.max().view(1)
+            if ts_b.numel() > 1:
+                ts_b = ts_b.max().view(1)
+
+            a_list.append(qres_x.data)
+            b_list.append(qres_w.data)
+            a_sf_list.append(sx_4d)
+            b_sf_list.append(sw_4d)
+            pts_list.append(torch.ones(m, device=device, dtype=torch.float32))
+            ts_a_list.append(ts_a)
+            ts_b_list.append(ts_b)
+
+        return a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list
+
+    @pytest.mark.parametrize("shapes", _BENCH_CONFIGS)
+    def test_benchmark(self, shapes):
+        _require_sm100()
+        a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list = (
+            self._build_inputs(shapes)
+        )
+
+        def fn():
+            grouped_nvfp4_cutlass_gemm_per_token_scale(
+                a_list=a_list,
+                b_list=b_list,
+                a_sf_list=a_sf_list,
+                b_sf_list=b_sf_list,
+                per_token_scale_list=pts_list,
+                out_dtype=torch.bfloat16,
+                sf_is_swizzled=True,
+                tensor_scale_a_list=ts_a_list,
+                tensor_scale_b_list=ts_b_list,
+            )
+
+        elapsed_ms = _cuda_time_ms(fn, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        tf = _tflops(shapes, elapsed_ms)
+        print(
+            f"\n  groups={len(shapes)}  shapes={shapes[0]}{'...' if len(shapes) > 1 else ''}"
+            f"  latency={elapsed_ms*1e3:.1f} µs  TFLOPS={tf:.2f}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

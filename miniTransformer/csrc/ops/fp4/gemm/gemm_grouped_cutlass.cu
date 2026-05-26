@@ -131,6 +131,10 @@ using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutS
 using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
 using Sm1xxBlkScaledConfig =
     typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+// For nv_float4_t inputs, ArrayElementA/B is the inner type (float_e2m1_t),
+// not the nv_float4_t wrapper — required for the ptr-array Arguments struct.
+using ArrayElementA = typename CollectiveMainloop::ArrayElementA;
+using ArrayElementB = typename CollectiveMainloop::ArrayElementB;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -165,8 +169,8 @@ void grouped_cutlass_gemm_with_per_token_scale(
     std::vector<StrideC>   stride_C_host(groups);
     std::vector<StrideD>   stride_D_host(groups);
 
-    std::vector<const ElementA*>  ptr_A_host(groups);
-    std::vector<const ElementB*>  ptr_B_host(groups);
+    std::vector<const ArrayElementA*>  ptr_A_host(groups);
+    std::vector<const ArrayElementB*>  ptr_B_host(groups);
     std::vector<const ElementSF*> ptr_SFA_host(groups);
     std::vector<const ElementSF*> ptr_SFB_host(groups);
     std::vector<const ElementC*>  ptr_C_host(groups);
@@ -195,8 +199,8 @@ void grouped_cutlass_gemm_with_per_token_scale(
         layout_SFB_host.push_back(
             Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1)));
 
-        ptr_A_host[i]   = static_cast<const ElementA*>(A_list[i].data_ptr());
-        ptr_B_host[i]   = static_cast<const ElementB*>(B_list[i].data_ptr());
+        ptr_A_host[i]   = static_cast<const ArrayElementA*>(A_list[i].data_ptr());
+        ptr_B_host[i]   = static_cast<const ArrayElementB*>(B_list[i].data_ptr());
         ptr_SFA_host[i] = static_cast<const ElementSF*>(A_sf_list[i].data_ptr());
         ptr_SFB_host[i] = static_cast<const ElementSF*>(B_sf_list[i].data_ptr());
         ptr_C_host[i]   = static_cast<const ElementC*>(D_list[i].data_ptr());
@@ -223,8 +227,8 @@ void grouped_cutlass_gemm_with_per_token_scale(
     stride_C_dev.copy_from_host(stride_C_host.data());
     stride_D_dev.copy_from_host(stride_D_host.data());
 
-    cutlass::DeviceAllocation<const ElementA*>  ptr_A_dev(groups);
-    cutlass::DeviceAllocation<const ElementB*>  ptr_B_dev(groups);
+    cutlass::DeviceAllocation<const ArrayElementA*>  ptr_A_dev(groups);
+    cutlass::DeviceAllocation<const ArrayElementB*>  ptr_B_dev(groups);
     cutlass::DeviceAllocation<const ElementSF*> ptr_SFA_dev(groups);
     cutlass::DeviceAllocation<const ElementSF*> ptr_SFB_dev(groups);
     cutlass::DeviceAllocation<const ElementC*>  ptr_C_dev(groups);

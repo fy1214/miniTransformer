@@ -55,6 +55,15 @@ void cutlass_gemm(
   const at::Tensor& alpha
 );
 
+void grouped_cutlass_gemm_with_per_token_scale(
+    std::vector<at::Tensor>& D_list,
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& A_sf_list,
+    const std::vector<at::Tensor>& B_sf_list,
+    const std::vector<at::Tensor>& per_token_scale_list
+);
+
 
 // quarter quantization
 void four_six_fp4_binding(

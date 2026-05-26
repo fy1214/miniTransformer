@@ -26,6 +26,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cublas_gemm", &cublas_gemm, "FP4 GEMM with cuBLASLt (CUDA)");
     m.def("block_scaled_matmul_nvfp4", &block_scaled_matmul_nvfp4, "Block-scaled matmul for NVFP4 (CUDA)");
     m.def("cutlass_gemm", &cutlass_gemm, "Block-scaled matmul for NVFP4 (CUDA)-cutlass api");
+    m.def("grouped_cutlass_gemm_with_per_token_scale",
+          &grouped_cutlass_gemm_with_per_token_scale,
+          "FP4 grouped GEMM (CUTLASS SM100) + per-token output scale (CUDA)");
 
 
     // quarter quantization

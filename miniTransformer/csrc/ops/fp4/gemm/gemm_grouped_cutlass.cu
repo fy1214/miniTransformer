@@ -35,8 +35,7 @@ using namespace cute;
 
 // ---------------------------------------------------------------------------
 // Per-token scale kernel: D[m][n] *= scale[m]
-// One CTA per row: threads stride through N elements (coalesced access).
-// scale[m] is broadcast within the warp — loaded once per CTA.
+// One CTA per row; threads stride through N columns.
 // ---------------------------------------------------------------------------
 template <typename ElementD>
 __global__ void per_token_scale_kernel(
@@ -47,19 +46,15 @@ __global__ void per_token_scale_kernel(
     int m = blockIdx.x;
     float s = scale[m];
     ElementD* row = D + (int64_t)m * N;
-    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+    for (int n = threadIdx.x; n < N; n += blockDim.x)
         row[n] = static_cast<ElementD>(static_cast<float>(row[n]) * s);
-    }
 }
 
 template <typename ElementD>
 static void launch_per_token_scale(
-    ElementD* D_ptr,
-    const float* scale_ptr,
-    int M, int N,
-    cudaStream_t stream)
+    ElementD* D_ptr, const float* scale_ptr,
+    int M, int N, cudaStream_t stream)
 {
-    // 128 threads per block; each block handles one row
     const int threads = std::min(N, 128);
     per_token_scale_kernel<ElementD><<<M, threads, 0, stream>>>(D_ptr, scale_ptr, N);
 }
@@ -74,10 +69,11 @@ using ElementC           = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 using OperatorClass      = cutlass::arch::OpClassBlockScaledTensorOp;
 using ArchTag            = cutlass::arch::Sm100;
-using LayoutATag         = cutlass::layout::RowMajor;
-using LayoutBTag         = cutlass::layout::ColumnMajor;
-using LayoutCTag         = cutlass::layout::RowMajor;
-using LayoutDTag         = cutlass::layout::RowMajor;
+// Pointer-to-layout tags are required for the grouped (ptr-array) kernel path
+using LayoutATag         = cutlass::layout::RowMajor *;
+using LayoutBTag         = cutlass::layout::ColumnMajor *;
+using LayoutCTag         = cutlass::layout::RowMajor *;
+using LayoutDTag         = cutlass::layout::RowMajor *;
 using ElementSF          = cutlass::float_ue4m3_t;
 
 static constexpr int AlignmentA = 32;
@@ -88,12 +84,11 @@ static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 using MmaTileShape  = Shape<_128, _128, _256>;
-using ClusterShape  = Shape<_1, _1, _1>;
+// Runtime cluster shape (required for grouped GEMM hw_info path)
+using ClusterShape  = Shape<int32_t, int32_t, _1>;
 
-// Explicit PtrArray schedule for grouped GEMM on SM100 with FP4 block-scaled inputs.
-// KernelScheduleAuto would select the non-array (single-GEMM) dispatch path because
-// IsArrayOfPointersGemm is false for KernelScheduleAuto — we must be explicit here.
-using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmBlockScaledSm100;
+using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100;
+using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
 
 using CollectiveEpilogue =
     typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -103,7 +98,7 @@ using CollectiveEpilogue =
         ElementAccumulator, ElementAccumulator,
         ElementC, LayoutCTag, AlignmentC,
         ElementD, LayoutDTag, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto
+        EpilogueSchedule
     >::CollectiveOp;
 
 using CollectiveMainloop =
@@ -127,32 +122,18 @@ using GemmKernel =
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-using StrideA  = typename Gemm::GemmKernel::StrideA;
-using StrideB  = typename Gemm::GemmKernel::StrideB;
-using StrideC  = typename Gemm::GemmKernel::StrideC;
-using StrideD  = typename Gemm::GemmKernel::StrideD;
+// Use InternalStride* types (required for grouped ptr-array kernels)
+using StrideA   = typename Gemm::GemmKernel::InternalStrideA;
+using StrideB   = typename Gemm::GemmKernel::InternalStrideB;
+using StrideC   = typename Gemm::GemmKernel::InternalStrideC;
+using StrideD   = typename Gemm::GemmKernel::InternalStrideD;
+using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
 using Sm1xxBlkScaledConfig =
     typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
-using LayoutSFA = decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
-    cute::make_shape(0, 0, 0, 0)));
-using LayoutSFB = decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-    cute::make_shape(0, 0, 0, 0)));
 
 // ---------------------------------------------------------------------------
 // Public entry point
-//
-// grouped_cutlass_gemm_with_per_token_scale
-//
-// Args (all lists have length == num_groups):
-//   D_list        : output tensors, (M_i, N_i) bfloat16
-//   A_list        : (M_i, K_i//2) uint8 packed FP4, row-major
-//   B_list        : (N_i, K_i//2) uint8 packed FP4, col-major (already transposed)
-//   A_sf_list     : FP8-E4M3 scale factors for A, CUTLASS swizzled layout
-//   B_sf_list     : FP8-E4M3 scale factors for B, CUTLASS swizzled layout
-//   per_token_scale_list : (M_i,) float32, one scale per output row
-//
-// per_token_scale is applied after GEMM as a separate kernel:
-//   D[m][n] *= per_token_scale[m]
 // ---------------------------------------------------------------------------
 void grouped_cutlass_gemm_with_per_token_scale(
     std::vector<at::Tensor>& D_list,
@@ -177,23 +158,23 @@ void grouped_cutlass_gemm_with_per_token_scale(
     // Build host-side problem shapes and pointer/stride arrays
     // ------------------------------------------------------------------
     std::vector<typename ProblemShape::UnderlyingProblemShape> problem_sizes_host(groups);
-    std::vector<StrideA>  stride_A_host(groups);
-    std::vector<StrideB>  stride_B_host(groups);
+    std::vector<StrideA>   stride_A_host(groups);
+    std::vector<StrideB>   stride_B_host(groups);
     std::vector<LayoutSFA> layout_SFA_host;
     std::vector<LayoutSFB> layout_SFB_host;
-    std::vector<StrideC>  stride_C_host(groups);
-    std::vector<StrideD>  stride_D_host(groups);
+    std::vector<StrideC>   stride_C_host(groups);
+    std::vector<StrideD>   stride_D_host(groups);
 
-    std::vector<const ElementA*> ptr_A_host(groups);
-    std::vector<const ElementB*> ptr_B_host(groups);
+    std::vector<const ElementA*>  ptr_A_host(groups);
+    std::vector<const ElementB*>  ptr_B_host(groups);
     std::vector<const ElementSF*> ptr_SFA_host(groups);
     std::vector<const ElementSF*> ptr_SFB_host(groups);
-    std::vector<const ElementC*> ptr_C_host(groups);
-    std::vector<ElementD*>       ptr_D_host(groups);
+    std::vector<const ElementC*>  ptr_C_host(groups);
+    std::vector<ElementD*>        ptr_D_host(groups);
 
     for (int i = 0; i < groups; ++i) {
         int M = static_cast<int>(A_list[i].size(0));
-        int K = static_cast<int>(A_list[i].size(1)) * 2;  // packed FP4: 2 elems/byte
+        int K = static_cast<int>(A_list[i].size(1)) * 2;  // packed FP4
         int N = static_cast<int>(B_list[i].size(0));
 
         TORCH_CHECK(B_list[i].size(1) * 2 == K, "group ", i, ": K mismatch");
@@ -204,10 +185,10 @@ void grouped_cutlass_gemm_with_per_token_scale(
 
         problem_sizes_host[i] = cute::make_shape(M, N, K);
 
-        stride_A_host[i] = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-        stride_B_host[i] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-        stride_C_host[i] = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-        stride_D_host[i] = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+        stride_A_host[i]  = cutlass::make_cute_packed_stride(StrideA{},  {M, K, 1});
+        stride_B_host[i]  = cutlass::make_cute_packed_stride(StrideB{},  {N, K, 1});
+        stride_C_host[i]  = cutlass::make_cute_packed_stride(StrideC{},  {M, N, 1});
+        stride_D_host[i]  = cutlass::make_cute_packed_stride(StrideD{},  {M, N, 1});
 
         layout_SFA_host.push_back(
             Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1)));
@@ -218,7 +199,7 @@ void grouped_cutlass_gemm_with_per_token_scale(
         ptr_B_host[i]   = static_cast<const ElementB*>(B_list[i].data_ptr());
         ptr_SFA_host[i] = static_cast<const ElementSF*>(A_sf_list[i].data_ptr());
         ptr_SFB_host[i] = static_cast<const ElementSF*>(B_sf_list[i].data_ptr());
-        ptr_C_host[i]   = static_cast<const ElementC*>(D_list[i].data_ptr());  // C = D (beta=0)
+        ptr_C_host[i]   = static_cast<const ElementC*>(D_list[i].data_ptr());
         ptr_D_host[i]   = static_cast<ElementD*>(D_list[i].data_ptr());
     }
 
@@ -228,12 +209,12 @@ void grouped_cutlass_gemm_with_per_token_scale(
     cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape> problem_sizes_dev(groups);
     problem_sizes_dev.copy_from_host(problem_sizes_host.data());
 
-    cutlass::DeviceAllocation<StrideA>  stride_A_dev(groups);
-    cutlass::DeviceAllocation<StrideB>  stride_B_dev(groups);
+    cutlass::DeviceAllocation<StrideA>   stride_A_dev(groups);
+    cutlass::DeviceAllocation<StrideB>   stride_B_dev(groups);
     cutlass::DeviceAllocation<LayoutSFA> layout_SFA_dev(groups);
     cutlass::DeviceAllocation<LayoutSFB> layout_SFB_dev(groups);
-    cutlass::DeviceAllocation<StrideC>  stride_C_dev(groups);
-    cutlass::DeviceAllocation<StrideD>  stride_D_dev(groups);
+    cutlass::DeviceAllocation<StrideC>   stride_C_dev(groups);
+    cutlass::DeviceAllocation<StrideD>   stride_D_dev(groups);
 
     stride_A_dev.copy_from_host(stride_A_host.data());
     stride_B_dev.copy_from_host(stride_B_host.data());
@@ -257,6 +238,15 @@ void grouped_cutlass_gemm_with_per_token_scale(
     ptr_D_dev.copy_from_host(ptr_D_host.data());
 
     // ------------------------------------------------------------------
+    // Hardware info (required when ClusterShape has runtime dimensions)
+    // ------------------------------------------------------------------
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = A_list[0].device().index();
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+    hw_info.cluster_shape          = dim3(1, 1, 1);
+    hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+
+    // ------------------------------------------------------------------
     // Build CUTLASS Arguments and run Grouped GEMM
     // ------------------------------------------------------------------
     typename Gemm::Arguments arguments{
@@ -269,12 +259,12 @@ void grouped_cutlass_gemm_with_per_token_scale(
             ptr_SFB_dev.get(), layout_SFB_dev.get()
         },
         {
-            {},                         // thread fusion args (alpha=1, beta=0 defaults)
+            {},                         // fusion args (alpha=1, beta=0 defaults)
             ptr_C_dev.get(), stride_C_dev.get(),
             ptr_D_dev.get(), stride_D_dev.get()
-        }
+        },
+        hw_info
     };
-    // alpha=1, beta=0: D = 1 * acc + 0 * C
     arguments.epilogue.thread.alpha = ElementAccumulator(1);
     arguments.epilogue.thread.beta  = ElementAccumulator(0);
 
@@ -288,13 +278,13 @@ void grouped_cutlass_gemm_with_per_token_scale(
     CUTLASS_CHECK(gemm.run(arguments, workspace.get(), stream));
 
     // ------------------------------------------------------------------
-    // Apply per-token scale per group (separate kernel, same stream)
+    // Apply per-token scale per group (same stream)
     // ------------------------------------------------------------------
     for (int i = 0; i < groups; ++i) {
         int M = static_cast<int>(A_list[i].size(0));
         int N = static_cast<int>(B_list[i].size(0));
-        ElementD* D_ptr     = static_cast<ElementD*>(D_list[i].data_ptr());
-        const float* s_ptr  = static_cast<const float*>(per_token_scale_list[i].data_ptr());
+        ElementD* D_ptr    = static_cast<ElementD*>(D_list[i].data_ptr());
+        const float* s_ptr = static_cast<const float*>(per_token_scale_list[i].data_ptr());
         launch_per_token_scale(D_ptr, s_ptr, M, N, stream);
     }
 }

@@ -29,11 +29,17 @@ _GEMM_CALL_COUNT: int = 0
 _DEBUG_CALL_COUNT: int = 0
 # Separate counter for backward GEMM prints (reset independently).
 _DEBUG_BGRAD_COUNT: int = 0
+_DEBUG_BGRAD_LIMIT: int = 5   # show first 5 backward calls (catches both zero and NaN)
 
 # Capture one torch.profiler trace at this call index (0 = first call).
 # Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
 _GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
 _GEMM_PROFILED: bool = False
+
+# Forward NaN detection: print on first occurrence, -1 = not yet detected.
+_XQUANT_NAN_CALL: int = -1   # X-quant first NaN (gs or sfb)
+_WQUANT_NAN_CALL: int = -1   # W-quant first NaN (sfb or alpha_b)
+_GEMM_NAN_CALL:   int = -1   # forward GEMM output first NaN
 
 
 def _is_sm100() -> bool:
@@ -65,6 +71,7 @@ def _grouped_gemm_cutedsl_pertoken(
     import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
     import time
     global _GEMM_CALL_COUNT, _GEMM_PROFILED, _DEBUG_CALL_COUNT
+    global _GEMM_NAN_CALL
 
     do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
     do_profile = (
@@ -111,6 +118,30 @@ def _grouped_gemm_cutedsl_pertoken(
                   f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} A.gs>1={gs_large_str} B.alpha_b={alpha_str}", flush=True)
 
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    # Always check for first NaN in forward GEMM output.
+    if _GEMM_NAN_CALL < 0:
+        res_t = res if isinstance(res, torch.Tensor) else (res[0] if res else None)
+        if res_t is not None and res_t.numel() > 0 and res_t.isnan().any():
+            _GEMM_NAN_CALL = _GEMM_CALL_COUNT
+            nan_cnt = res_t.isnan().sum().item()
+            print(f"[GEMM NAN! call={_GEMM_CALL_COUNT}] out={res_t.shape} "
+                  f"nan_cnt={nan_cnt}/{res_t.numel()}", flush=True)
+            for i, (a, b) in enumerate(zip(A, B)):
+                a_gs    = getattr(a, 'global_scale', None)
+                b_alpha = getattr(b, '_alpha_b_cached', None)
+                a_data  = getattr(a, 'data_uint8', a)
+                if a_gs is not None and a_gs.numel() > 0:
+                    gs_nan   = a_gs.isnan().any().item()
+                    gs_inf   = a_gs.isinf().any().item()
+                    gs_max   = a_gs.abs().max().item()
+                    gs_large = (a_gs > 1.0).sum().item()
+                else:
+                    gs_nan = gs_inf = gs_max = gs_large = "N/A"
+                alpha_s = f"{b_alpha:.6g}" if b_alpha is not None else "N/A"
+                print(f"  g={i}: rows={a_data.shape[0] if hasattr(a_data,'shape') else '?'} "
+                      f"gs_nan={gs_nan} gs_inf={gs_inf} gs_max={gs_max} gs>1={gs_large} "
+                      f"alpha_b={alpha_s}", flush=True)
 
     if _DEBUG_CALL_COUNT < 3:
         res_t = res if isinstance(res, torch.Tensor) else res[0] if res else None
@@ -419,6 +450,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         # Dy: MXFP8 quant for backward
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT:
+            dy_nan = x.isnan().any().item()
+            dy_inf = x.isinf().any().item()
+            dy_max = x.abs().max().item() if x.numel() > 0 else 0.0
+            dy_nan_cnt = x.isnan().sum().item() if dy_nan else 0
+            print(f"[DY-QUANT PRE] dy.shape={x.shape} dtype={x.dtype} "
+                  f"nan={dy_nan}(cnt={dy_nan_cnt}) inf={dy_inf} "
+                  f"max={dy_max:.4g} m_splits={m_splits}", flush=True)
         quantize_tensor_list = tex.split_quantize(
             x,
             m_splits,
@@ -460,6 +499,11 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
         global _DEBUG_CALL_COUNT, _DEBUG_BGRAD_COUNT
 
+        # Unconditional entry log — confirms whether grad=True path is ever reached.
+        if grad and _DEBUG_BGRAD_COUNT < 5:
+            print(f"[GROUPED_GEMM GRAD=TRUE ENTRY] layout={layout} m_splits_sum={sum(m_splits)} "
+                  f"_DEBUG_BGRAD_COUNT={_DEBUG_BGRAD_COUNT}", flush=True)
+
         if _DEBUG_CALL_COUNT <= 3:
             from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
                 PertokenNvfp4Tensor, TensorGlobalNvfp4Tensor,
@@ -484,18 +528,45 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "set disable_backward_quant and use Nvfp4Cursor2QuantizeOp."
                 ) from exc
 
-        if _DEBUG_BGRAD_COUNT < 3 and grad:
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT and grad:
             for i, (a, b) in enumerate(zip(A, B)):
                 def _tstat(t, name):
-                    if not hasattr(t, 'shape'):
-                        return f"{name}=<no-tensor>"
-                    data = getattr(t, '_rowwise_data', getattr(t, 'data_uint8', t))
                     try:
-                        f = data.float() if data.dtype not in (torch.float32, torch.bfloat16, torch.float16) else data
-                        return (f"{name}.shape={data.shape} nan={f.isnan().any().item()} "
-                                f"inf={f.isinf().any().item()} max={f.abs().max().item():.4g}")
+                        # TE QuantizedTensor: has _rowwise_data
+                        if hasattr(t, '_rowwise_data') and t._rowwise_data is not None:
+                            rw = t._rowwise_data
+                            amax = getattr(t, '_amax_rowwise', None)
+                            amax_s = f"amax={amax.float().item():.4g}" if (amax is not None and amax.numel() > 0) else ""
+                            # FP8 E4M3 NaN = byte 0x7F(+) or 0xFF(-): (byte & 0x7F)==0x7F
+                            if rw.dtype == torch.uint8:
+                                fp8_nan = ((rw & 0x7F) == 0x7F).any().item()
+                                fp8_cnt = ((rw & 0x7F) == 0x7F).sum().item()
+                                nan_s = f"fp8_nan={fp8_nan}(cnt={fp8_cnt})"
+                            else:
+                                f = rw.float()
+                                nan_s = f"nan={f.isnan().any().item()} inf={f.isinf().any().item()}"
+                            return f"{name}.rw={rw.shape} {nan_s} {amax_s}"
+                        # TE QuantizedTensor: columnwise only
+                        if hasattr(t, '_columnwise_data') and t._columnwise_data is not None:
+                            cw = t._columnwise_data
+                            if cw.dtype == torch.uint8:
+                                fp8_nan = ((cw & 0x7F) == 0x7F).any().item()
+                                fp8_cnt = ((cw & 0x7F) == 0x7F).sum().item()
+                                nan_s = f"fp8_nan={fp8_nan}(cnt={fp8_cnt})"
+                            else:
+                                f = cw.float()
+                                nan_s = f"nan={f.isnan().any().item()} inf={f.isinf().any().item()}"
+                            return f"{name}.cw={cw.shape} {nan_s}"
+                        # Plain or FP4 tensor
+                        if isinstance(t, torch.Tensor):
+                            if t.numel() == 0:
+                                return f"{name}={t.shape}(empty)"
+                            f = t.float() if t.dtype not in (torch.float32, torch.bfloat16, torch.float16) else t
+                            return (f"{name}.shape={t.shape} nan={f.isnan().any().item()} "
+                                    f"inf={f.isinf().any().item()} max={f.abs().max().item():.4g}")
+                        return f"{name}=type:{type(t).__name__}"
                     except Exception as e:
-                        return f"{name}.shape={data.shape} stat-err={e}"
+                        return f"{name}=stat-err:{e}"
                 print(f"[BGRAD PRE g={i}] layout={layout} "
                       f"{_tstat(a, 'A')} | {_tstat(b, 'B')}", flush=True)
 
@@ -537,12 +608,15 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             accumulate=accumulate
         )
 
-        if _DEBUG_BGRAD_COUNT < 3 and grad:
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT and grad:
             out_tensors = out if isinstance(out, list) else [out]
             for i, ot in enumerate(out_tensors):
                 if ot is None:
                     continue
                 try:
+                    if ot.numel() == 0:
+                        print(f"[BGRAD POST i={i}] layout={layout} shape={ot.shape} (empty)", flush=True)
+                        continue
                     print(f"[BGRAD POST i={i}] layout={layout} shape={ot.shape} "
                           f"nan={ot.isnan().any().item()} inf={ot.isinf().any().item()} "
                           f"max={ot.abs().max().item():.4g}", flush=True)

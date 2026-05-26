@@ -1,4 +1,5 @@
 import logging
+import os
 import torch
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -59,6 +60,14 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         )
         x = x.view(-1, x.shape[-1])  # to 2D
         x = cast_if_needed(x, activation_dtype)
+
+        # ── DUMP: save first forward call's raw bf16 x/w/y for offline analysis ──
+        _dump_dir = os.environ.get("NVFP4_DUMP_DIR", "")
+        _dump_call_limit = int(os.environ.get("NVFP4_DUMP_CALLS", "0"))
+        _dump_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        if not hasattr(_QuantizedGroupedLinear, "_dump_count"):
+            _QuantizedGroupedLinear._dump_count = 0
+        _do_dump = _dump_dir and _dump_rank == 0 and _QuantizedGroupedLinear._dump_count < _dump_call_limit
 
         # disable_backward_quant skips columnwise quantization since x_t is unused in BF16 backward
         qresult_x_list = quantize_op.group_quantize(
@@ -130,6 +139,25 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             qparams_w=qlinear_params.w_params
         )
         logger.debug(f"[Hybrid] After Grouped QGEMM, y shape [m, n]: {list(y.shape)}")
+
+        # ── DUMP: save x / w(stacked) / y / m_splits for offline single-op replay ──
+        if _do_dump:
+            os.makedirs(_dump_dir, exist_ok=True)
+            save_path = os.path.join(_dump_dir, f"gemm_call_{_QuantizedGroupedLinear._dump_count:03d}.pt")
+            # w may be None when using cached weight (is_first_microbatch=False); skip those
+            w_save = w.detach().cpu() if w is not None else None
+            torch.save({
+                "x": x.detach().cpu(),       # bf16 [total_m, k]
+                "w": w_save,                 # bf16 [num_gemms, n, k] or None
+                "m_splits": m_splits,
+                "y_fp4": y.detach().cpu(),   # FP4 GEMM output [total_m, n]
+                "out_dtype": str(out_dtype),
+            }, save_path)
+            print(f"[DUMP] call={_QuantizedGroupedLinear._dump_count}  saved={save_path}  "
+                  f"x={tuple(x.shape)}  m_splits={m_splits}  "
+                  f"w={'x'.join(str(d) for d in w_save.shape) if w_save is not None else 'cached'}  "
+                  f"y={tuple(y.shape)}", flush=True)
+            _QuantizedGroupedLinear._dump_count += 1
 
         # Save context for backward pass
         if is_grad_enabled:

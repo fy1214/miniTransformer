@@ -29,7 +29,8 @@ NO_CACHE: bool = False
 # Module-level GPU buffer caches — avoid repeated large mallocs on the hot path.
 # Keys are (size_or_shape, device_str); values are reusable tensors.
 _a_fp4_buf_cache: dict = {}   # (total_active_m * k, device) → int8 flat tensor
-_c_out_buf_cache: dict = {}   # (total_m, n, dtype_str, device) → out tensor
+# c_out is NOT cached across calls: each fc output is ~500-600 MB and holding it
+# permanently causes OOM when other large buffers (e.g. logits) are allocated later.
 _alpha_b_buf_cache: dict = {} # (max_groups, device) → float32 GPU tensor
 
 from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
@@ -455,13 +456,9 @@ def grouped_gemm_cutedsl_pertoken(
         _afp4_buf[:_afp4_size // 2].copy_(_act_data_full.reshape(-1).view(torch.int8))
         _a_fp4_full = _afp4_buf.view(_total_active_m, k, 1)
 
-    # ── c_out_full: one alloc for all active experts, slice per expert, no final cat ──
-    _c_out_key = (total_m_all, n_i_first, str(out_dtype), str(device))
-    if NO_CACHE or _c_out_key not in _c_out_buf_cache:
-        _c_out_buf_cache[_c_out_key] = torch.empty(
-            (total_m_all, n_i_first), dtype=out_dtype, device=device
-        )
-    c_out_full = _c_out_buf_cache[_c_out_key]
+    # ── c_out_full: one alloc for all experts (replaces 64 small allocs + final cat) ──
+    # Not cached across calls to avoid permanently pinning ~500-600 MB output buffers.
+    c_out_full = torch.empty((total_m_all, n_i_first), dtype=out_dtype, device=device)
     _c_out_offset = 0
 
     for i, m_i in enumerate(m_splits):

@@ -641,6 +641,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """Python implementation of microblock FP4 GEMM."""
         assert bias is None, "Bias is implemented for FP4 GEMM."
@@ -797,6 +799,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
 
         num_gemms = len(m_splits)

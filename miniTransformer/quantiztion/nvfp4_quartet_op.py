@@ -320,6 +320,8 @@ class Nvfp4QuartetQuantizeOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
 

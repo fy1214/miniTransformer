@@ -90,6 +90,7 @@ class GroupQuantizeResult:
     scale_t: List[torch.Tensor] | None = None
     tensor_scale: List[torch.Tensor] | None = None
     tensor_scale_t: List[torch.Tensor] | None = None
+    extra_info: dict | None = None
 
 
 @dataclasses.dataclass
@@ -129,6 +130,7 @@ class GroupQuantizeResultCache:
     scale_t: Optional[List[torch.Tensor]] = None
     global_amax_row: Optional[List[torch.Tensor]] = None
     global_amax_col: Optional[List[torch.Tensor]] = None
+    extra_info: dict | None = None
 
 
 @dataclasses.dataclass

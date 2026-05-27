@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 import fp4_gemm
+from dataclasses import dataclass
 from typing import List, Optional
 
 
@@ -75,41 +76,10 @@ def grouped_nvfp4_cutlass_gemm_per_token_scale(
     tensor_scale_a_list: Optional[List[Optional[torch.Tensor]]] = None,
     tensor_scale_b_list: Optional[List[Optional[torch.Tensor]]] = None,
 ) -> List[torch.Tensor]:
-    """CUTLASS SM100 FP4 Grouped GEMM with per-token output scale.
-
-    The final per-element scale applied to output row m of group i is::
-
-        final_scale[m] = per_token_scale[i][m] * global_alpha[i]
-
-    where ``global_alpha[i] = amax_A[i] * amax_B[i] / (6*6*448*448)`` when
-    ``tensor_scale_a_list`` and ``tensor_scale_b_list`` are provided, else 1.0.
-
-    Args:
-        a_list: Packed FP4 activation tensors, each (M_i, K//2) uint8, row-major.
-        b_list: Packed FP4 weight tensors, each (N_i, K//2) uint8, col-major
-                (i.e., already transposed so B layout is N×K).
-        a_sf_list: Scale factors for A, each float8_e4m3fn.
-                   If ``sf_is_swizzled=True``: shape (M_i//128, K//64, 32, 16).
-                   If ``sf_is_swizzled=False``: shape (M_i, K//16), auto-converted.
-        b_sf_list: Scale factors for B, same convention as a_sf_list but for N_i.
-        per_token_scale_list: Per-token output scales, each (M_i,) float32.
-                              Applied after GEMM: D[m, :] *= final_scale[m].
-        out_dtype: Output dtype. Default: bfloat16.
-        out_list: Optional pre-allocated output tensors, each (M_i, N_i) out_dtype.
-        sf_is_swizzled: Whether scale factors are already in 4D swizzled layout.
-                        Set False to auto-convert from 2D (MN, K//16) layout.
-        tensor_scale_a_list: Global amax per group for A (scalar tensors or None).
-                             None entries are treated as 1.0.
-        tensor_scale_b_list: Global amax per group for B (scalar tensors or None).
-                             None entries are treated as 1.0.
-
-    Returns:
-        List of output tensors D_i, each (M_i, N_i) in out_dtype.
-    """
+    """CUTLASS SM100 FP4 Grouped GEMM (2SM) with per-token output scale."""
     num_groups = len(a_list)
     if num_groups == 0:
         return []
-
     if len(b_list) != num_groups:
         raise ValueError(f"b_list length {len(b_list)} != num_groups {num_groups}")
     if len(a_sf_list) != num_groups:
@@ -158,15 +128,12 @@ def grouped_nvfp4_cutlass_gemm_per_token_scale(
         if pts.dtype != torch.float32:
             raise ValueError(f"group {i}: per_token_scale must be float32, got {pts.dtype}.")
 
-        # Fold global alpha (amax_A * amax_B / factor) into per_token_scale.
-        # This avoids an extra scalar-mul kernel and keeps C++ simple (alpha=1 always).
         ts_a = tensor_scale_a_list[i] if tensor_scale_a_list is not None else None
         ts_b = tensor_scale_b_list[i] if tensor_scale_b_list is not None else None
         if ts_a is not None and ts_b is not None:
             global_alpha = (ts_a.float() * ts_b.float()).squeeze() / _NVFP4_FACTOR
             pts = pts * global_alpha
 
-        # Prepare output tensor
         if out_list is not None:
             out = out_list[i]
             if out.shape != (m, n) or out.dtype != out_dtype:
@@ -183,12 +150,105 @@ def grouped_nvfp4_cutlass_gemm_per_token_scale(
         scale_prepared.append(pts.contiguous())
 
     fp4_gemm.grouped_cutlass_gemm_with_per_token_scale(
-        d_list,
-        a_list,
-        b_list,
-        a_sf_prepared,
-        b_sf_prepared,
-        scale_prepared,
+        d_list, a_list, b_list, a_sf_prepared, b_sf_prepared, scale_prepared,
     )
-
     return d_list
+
+
+# ---------------------------------------------------------------------------
+# v2: zero-overhead grouped GEMM with contiguous packed buffers
+#
+# Differences from v1 (grouped_nvfp4_cutlass_gemm_per_token_scale):
+#   - Activations and weights are pre-packed into contiguous flat buffers by
+#     group_quantize_nvfp4_pertoken_swizzled / group_quantize_nvfp4_tensor_global_packed.
+#   - The GPU micro-kernel fills CUTLASS metadata on-device; no host-side
+#     pointer-list construction per call.
+#   - Per-token scale is pts_eff[i] = act_ts[i] * wgt_ts[group(i)] / _NVFP4_FACTOR,
+#     applied row-wise inside the kernel.
+#   - Persistent buffers (pointers, strides, layouts, workspace) are allocated
+#     once per (num_groups, device) and reused across calls.
+# ---------------------------------------------------------------------------
+
+# Persistent buffers keyed by (max_groups, device).
+_v2_buf_cache: dict = {}
+
+
+def _get_v2_buffers(max_groups: int, device):
+    """Return (or allocate) persistent CUTLASS v2 metadata buffers."""
+    key = (max_groups, str(device))
+    if key not in _v2_buf_cache:
+        ptrs_b, strides_b, layouts_b = fp4_gemm.grouped_cutlass_gemm_v2_buffer_sizes(max_groups)
+        _v2_buf_cache[key] = (
+            torch.empty(ptrs_b,          dtype=torch.uint8, device=device),  # pointer table
+            torch.empty(strides_b,       dtype=torch.uint8, device=device),  # stride table
+            torch.empty(layouts_b,       dtype=torch.uint8, device=device),  # layout table
+            torch.empty(max_groups * 3,  dtype=torch.int32, device=device),  # problem sizes (device)
+            torch.empty(4 * 1024 * 1024, dtype=torch.uint8, device=device),  # workspace
+        )
+    return _v2_buf_cache[key]
+
+
+@dataclass
+class V2GemmInputs:
+    """
+    Pre-packed inputs for grouped_cutlass_gemm_v2.
+
+    Built once per quantize call; fields map directly to C++ kernel arguments
+    so no per-call tensor construction is needed at GEMM time.
+    """
+    # Activation side — produced by group_quantize_nvfp4_pertoken_swizzled
+    act_data:      torch.Tensor   # [total_m, k//2] uint8,  all groups row-packed
+    act_sf:        torch.Tensor   # flat fp8,                all groups concatenated
+    act_ts:        torch.Tensor   # [total_m] float32,       per-row global scale
+    a_rows:        torch.Tensor   # [ng+1] int32 device,     row offsets into act_data
+    a_sf_offsets:  torch.Tensor   # [ng+1] int64 device,     element offsets into act_sf
+
+    # Weight side — produced by group_quantize_nvfp4_tensor_global_packed
+    wgt_data:      torch.Tensor   # [total_n, k//2] uint8,  all experts row-packed
+    wgt_sf:        torch.Tensor   # flat fp8,                all experts packed
+    wgt_ts:        torch.Tensor   # [num_experts] float32,   per-expert global scale
+    b_rows:        torch.Tensor   # [ng+1] int32 device,     row offsets into wgt_data
+    b_sf_offsets:  torch.Tensor   # [ng+1] int64 device,     element offsets into wgt_sf
+
+    # Problem shape — m_g varies per call; n and k are fixed for a given weight
+    prob_host:     torch.Tensor   # [ng*3] int32 CPU,        (m_g, n, k) per group
+    m_splits:      List[int]
+
+
+def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> torch.Tensor:
+    """
+    CUTLASS SM100 grouped FP4 GEMM (v2) with fused per-token output scale.
+
+    Per-token effective scale is computed as:
+        pts_eff[i] = act_ts[i] * wgt_ts[group(i)] / _NVFP4_FACTOR
+
+    where act_ts is per-row and wgt_ts is per-expert (expanded via repeat_interleave).
+    The kernel applies pts_eff row-wise to the raw GEMM output before writing D.
+    """
+    ng     = len(inputs.m_splits)
+    device = inputs.act_data.device
+
+    # Expand per-expert weight scale to per-row, then fold in activation scale.
+    ts_b    = torch.repeat_interleave(
+        inputs.wgt_ts,
+        torch.tensor(inputs.m_splits, device=device),
+    )
+    pts_eff = (inputs.act_ts * ts_b / _NVFP4_FACTOR).contiguous()
+
+    total_m = inputs.act_data.shape[0]
+    n       = inputs.wgt_data.shape[0] // ng
+    D       = torch.empty(total_m, n, dtype=out_dtype, device=device)
+
+    buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = _get_v2_buffers(ng, device)
+
+    fp4_gemm.grouped_cutlass_gemm_v2(
+        D,
+        inputs.act_data, inputs.wgt_data,
+        inputs.act_sf,   inputs.wgt_sf,
+        inputs.a_rows,   inputs.b_rows,
+        inputs.a_sf_offsets, inputs.b_sf_offsets,
+        ng,
+        buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+        inputs.prob_host, workspace, pts_eff,
+    )
+    return D

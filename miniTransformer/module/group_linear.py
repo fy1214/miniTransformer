@@ -114,6 +114,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             sw_t = weight_qresult_cache.scale_t = qresult_w_list.scale_t
             tw = weight_qresult_cache.global_amax_row = qresult_w_list.tensor_scale
             tw_t = weight_qresult_cache.global_amax_col = qresult_w_list.tensor_scale_t
+            weight_qresult_cache.extra_info = qresult_w_list.extra_info
         else:
             w = None
             qw, sw, tw, qw_t, sw_t, tw_t  = (weight_qresult_cache.data,
@@ -122,6 +123,11 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                                              weight_qresult_cache.data_t,
                                              weight_qresult_cache.scale_t,
                                              weight_qresult_cache.global_amax_col)
+            qresult_w_list = quantization.GroupQuantizeResult(
+                data=qw, scale=sw, data_t=qw_t, scale_t=sw_t,
+                tensor_scale=tw, tensor_scale_t=tw_t,
+                extra_info=weight_qresult_cache.extra_info,
+            )
 
         assert qw is not None, "FP8 weight cache should not be None"
 
@@ -136,7 +142,9 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             out_dtype=out_dtype,
             m_splits=m_splits,
             qparams_x=qlinear_params.x_params,
-            qparams_w=qlinear_params.w_params
+            qparams_w=qlinear_params.w_params,
+            extra_info_A=qresult_x_list.extra_info,
+            extra_info_B=qresult_w_list.extra_info
         )
         logger.debug(f"[Hybrid] After Grouped QGEMM, y shape [m, n]: {list(y.shape)}")
 

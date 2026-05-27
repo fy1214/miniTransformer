@@ -293,6 +293,8 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         BF16 grouped GEMM corresponding to group_linear.py's quantize_op.grouped_gemm call.

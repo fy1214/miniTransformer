@@ -460,7 +460,146 @@ def _tflops(shapes, elapsed_ms: float) -> float:
     return flops / (elapsed_ms * 1e-3) / 1e12
 
 
-class TestGroupedCutlassGemmBenchmark:
+# ---------------------------------------------------------------------------
+# Correctness tests for grouped_cutlass_gemm_v2
+# ---------------------------------------------------------------------------
+
+class TestGroupedCutlassGemmV2Correctness:
+    """Verify v2 GEMM: raw output matches v1 bit-exact; scaled output matches quantized reference."""
+
+    def _build_v2_tensors(self, a_list, b_list, a_sf_list, b_sf_list, m_splits, n, k, ng, device):
+        A    = torch.cat(a_list, dim=0).contiguous()
+        B    = torch.cat(b_list, dim=0).contiguous()
+        A_sf = torch.cat([sf.reshape(-1) for sf in a_sf_list]).contiguous()
+        B_sf = torch.cat([sf.reshape(-1) for sf in b_sf_list]).contiguous()
+
+        a_rows  = torch.zeros(ng + 1, dtype=torch.int32, device=device)
+        b_rows  = torch.zeros(ng + 1, dtype=torch.int32, device=device)
+        a_sf_off = torch.zeros(ng + 1, dtype=torch.int64, device=device)
+        b_sf_off = torch.zeros(ng + 1, dtype=torch.int64, device=device)
+        for i, m in enumerate(m_splits):
+            a_rows[i + 1]   = a_rows[i]   + m
+            b_rows[i + 1]   = b_rows[i]   + n
+            a_sf_off[i + 1] = a_sf_off[i] + a_sf_list[i].numel()
+            b_sf_off[i + 1] = b_sf_off[i] + b_sf_list[i].numel()
+
+        prob_host = torch.zeros(ng * 3, dtype=torch.int32)
+        for i, m in enumerate(m_splits):
+            prob_host[i*3+0] = m;  prob_host[i*3+1] = n;  prob_host[i*3+2] = k
+
+        return A, B, A_sf, B_sf, a_rows, b_rows, a_sf_off, b_sf_off, prob_host
+
+    @pytest.mark.parametrize("m_splits, n, k", GROUPED_CASES)
+    @pytest.mark.parametrize("seed", [42, 7])
+    def test_v2_matches_v1_and_quantized_ref(self, m_splits, n, k, seed):
+        _require_sm100()
+        device = "cuda"
+
+        a_list, b_list, a_sf_list, b_sf_list = [], [], [], []
+        pts_list, ts_a_list, ts_b_list = [], [], []
+        sx_2d_list, sw_2d_list = [], []
+        x_fp32_list, w_fp32_list = [], []
+
+        for i, m in enumerate(m_splits):
+            x_fp32, w_fp32, qx, qw, sx_2d, sw_2d, sx_4d, sw_4d, ts_a, ts_b = (
+                _build_group(m, n, k, device=device, seed=seed + i)
+            )
+            per_token_scale = torch.rand(m, device=device, dtype=torch.float32) * 0.5 + 0.5
+
+            a_list.append(qx);  b_list.append(qw)
+            a_sf_list.append(sx_4d);  b_sf_list.append(sw_4d)
+            pts_list.append(per_token_scale)
+            ts_a_list.append(ts_a);  ts_b_list.append(ts_b)
+            sx_2d_list.append(sx_2d);  sw_2d_list.append(sw_2d)
+            x_fp32_list.append(x_fp32);  w_fp32_list.append(w_fp32)
+
+        # v1 reference: the v1 C++ kernel does NOT apply per-token scale;
+        # it returns raw GEMM output regardless of pts/tensor_scale args.
+        d_v1_list = grouped_nvfp4_cutlass_gemm_per_token_scale(
+            a_list=a_list, b_list=b_list,
+            a_sf_list=a_sf_list, b_sf_list=b_sf_list,
+            per_token_scale_list=pts_list,
+            out_dtype=torch.bfloat16, sf_is_swizzled=True,
+            tensor_scale_a_list=ts_a_list, tensor_scale_b_list=ts_b_list,
+        )
+
+        ng = len(m_splits)
+        total_m = sum(m_splits)
+        A, B, A_sf, B_sf, a_rows, b_rows, a_sf_off, b_sf_off, prob_host = (
+            self._build_v2_tensors(a_list, b_list, a_sf_list, b_sf_list, m_splits, n, k, ng, device)
+        )
+        buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = _alloc_v2_buffers(ng)
+
+        # --- Part 1: regression — v2 raw must be bit-exact with v1 ---
+        _NVFP4_FACTOR = 6.0 * 6.0 * 448.0 * 448.0
+        D_v2_raw = torch.empty(total_m, n, dtype=torch.bfloat16, device=device)
+        _fp4_gemm.grouped_cutlass_gemm_v2(
+            D_v2_raw, A, B, A_sf, B_sf,
+            a_rows, b_rows, a_sf_off, b_sf_off, ng,
+            buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+            prob_host, workspace,
+            torch.empty(0, dtype=torch.float32, device=device),
+        )
+        torch.cuda.synchronize()
+
+        for i, m in enumerate(m_splits):
+            row_start = int(a_rows[i].item())
+            row_end   = int(a_rows[i + 1].item())
+            got_raw = D_v2_raw[row_start:row_end]
+            m_reg = _error_metrics(got_raw, d_v1_list[i])
+            assert m_reg["max_abs"] == 0.0, (
+                f"group {i} v2_raw vs v1 not bit-exact: max_abs={m_reg['max_abs']}"
+            )
+
+        # --- Part 2: golden — v2 with pts_eff must match quantized reference and fp32 GT ---
+        # pts_eff = pts × (ts_a × ts_b / _NVFP4_FACTOR) converts raw GEMM output to actual
+        # float scale; this simultaneously validates both the GEMM values and the per-token
+        # scale kernel.
+        pts_v2_list = [
+            pts * (ts_a.float() * ts_b.float()).squeeze() / _NVFP4_FACTOR
+            for pts, ts_a, ts_b in zip(pts_list, ts_a_list, ts_b_list)
+        ]
+        pts_flat = torch.cat(pts_v2_list).contiguous()
+
+        D_v2_scaled = torch.empty(total_m, n, dtype=torch.bfloat16, device=device)
+        _fp4_gemm.grouped_cutlass_gemm_v2(
+            D_v2_scaled, A, B, A_sf, B_sf,
+            a_rows, b_rows, a_sf_off, b_sf_off, ng,
+            buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+            prob_host, workspace, pts_flat,
+        )
+        torch.cuda.synchronize()
+
+        for i, m in enumerate(m_splits):
+            row_start = int(a_rows[i].item())
+            row_end   = int(a_rows[i + 1].item())
+            got  = D_v2_scaled[row_start:row_end]
+            ref_q   = _quantized_reference(
+                a_list[i], b_list[i],
+                sx_2d_list[i], sw_2d_list[i],
+                ts_a_list[i], ts_b_list[i],
+                pts_list[i],
+            )
+            ref_fp32 = _fp32_ground_truth(x_fp32_list[i], w_fp32_list[i], pts_list[i])
+
+            assert not torch.isnan(got).any(), f"group {i} NaN in v2_scaled"
+            assert not torch.isinf(got).any(), f"group {i} Inf in v2_scaled"
+
+            m_q = _error_metrics(got, ref_q)
+            m_fp32 = _error_metrics(got, ref_fp32)
+            _print_metrics("  v2_scaled_vs_qref  ", m_q)
+            _print_metrics("  v2_scaled_vs_fp32  ", m_fp32)
+
+            assert m_q["max_abs"]    < 0.15, f"group {i} v2_scaled vs qref max_abs={m_q['max_abs']:.6f}"
+            assert m_q["mean_abs"]   < 0.03, f"group {i} v2_scaled vs qref mean_abs={m_q['mean_abs']:.6f}"
+            assert m_fp32["norm_rmse"] < 0.20, f"group {i} v2_scaled vs fp32 norm_rmse={m_fp32['norm_rmse']:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (original v1 only)
+# ---------------------------------------------------------------------------
+
+
     @staticmethod
     def _build_inputs(shapes, seed=42):
         device = "cuda"
@@ -617,19 +756,197 @@ class TestGroupedCutlassGemmVsTE:
         fn_cutlass()
         fn_te()
 
-        ms_cutlass = _cuda_time_ms(fn_cutlass, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
-        ms_te      = _cuda_time_ms(fn_te,      warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        # ---- v2 inputs ----
+        A, B, A_sf, B_sf, a_rows, b_rows, a_sf_offs, b_sf_offs, prob_host, ng = (
+            _build_v2_inputs(shapes)
+        )
+        total_m = sum(s[0] for s in shapes)
+        n_dim   = shapes[0][1]
+        D_v2    = torch.empty(total_m, n_dim, dtype=torch.bfloat16, device="cuda")
+        buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = _alloc_v2_buffers(ng)
+        pts_v2  = torch.ones(total_m, dtype=torch.float32, device="cuda")   # per-token scale
+        no_pts  = torch.empty(0, dtype=torch.float32, device="cuda")        # empty = skip scale
 
-        tf_cutlass = _tflops(shapes, ms_cutlass)
-        tf_te      = _tflops(shapes, ms_te)
-        speedup    = ms_te / ms_cutlass
+        def fn_v2():
+            _fp4_gemm.grouped_cutlass_gemm_v2(
+                D_v2, A, B, A_sf, B_sf,
+                a_rows, b_rows, a_sf_offs, b_sf_offs,
+                ng,
+                buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+                prob_host, workspace, no_pts,
+            )
+
+        def fn_v2_scale():
+            _fp4_gemm.grouped_cutlass_gemm_v2(
+                D_v2, A, B, A_sf, B_sf,
+                a_rows, b_rows, a_sf_offs, b_sf_offs,
+                ng,
+                buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+                prob_host, workspace, pts_v2,
+            )
+
+        fn_cutlass(); fn_te(); fn_v2(); fn_v2_scale()
+        torch.cuda.synchronize()
+
+        ms_cutlass  = _cuda_time_ms(fn_cutlass,   warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        ms_te       = _cuda_time_ms(fn_te,        warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        ms_v2       = _cuda_time_ms(fn_v2,        warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        ms_v2_scale = _cuda_time_ms(fn_v2_scale,  warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+
+        tf_cutlass  = _tflops(shapes, ms_cutlass)
+        tf_te       = _tflops(shapes, ms_te)
+        tf_v2       = _tflops(shapes, ms_v2)
+        tf_v2_scale = _tflops(shapes, ms_v2_scale)
 
         print(
             f"\n  groups={len(shapes)}  shapes={shapes[0]}{'...' if len(shapes) > 1 else ''}\n"
+            f"  {'':25s} {'Latency µs':>12}  {'TFLOPS':>9}\n"
+            f"  {'CUTLASS v1':25s} {ms_cutlass*1e3:>12.1f}  {tf_cutlass:>9.2f}\n"
+            f"  {'CUTLASS v2':25s} {ms_v2*1e3:>12.1f}  {tf_v2:>9.2f}\n"
+            f"  {'CUTLASS v2+scale':25s} {ms_v2_scale*1e3:>12.1f}  {tf_v2_scale:>9.2f}\n"
+            f"  {'TE general_grouped':25s} {ms_te*1e3:>12.1f}  {tf_te:>9.2f}\n"
+            f"  v2+scale vs TE: {ms_te/ms_v2_scale:.2f}x"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Benchmark v2 (zero-overhead grouped GEMM)
+# ---------------------------------------------------------------------------
+
+import fp4_gemm as _fp4_gemm
+
+
+def _build_v2_inputs(shapes, seed=42):
+    """Build contiguous tensors + offset arrays required by grouped_cutlass_gemm_v2."""
+    device = "cuda"
+    quantize_op = Nvfp4TiledQuantizeRefOp()
+    a_list, b_list, a_sf_list, b_sf_list = [], [], [], []
+
+    for i, (m, n, k) in enumerate(shapes):
+        torch.manual_seed(seed + i)
+        torch.cuda.manual_seed(seed + i)
+        x = torch.randn(m, k, device=device, dtype=torch.float32)
+        w = torch.empty(n, k, device=device, dtype=torch.float32)
+        torch.nn.init.normal_(w, std=0.023)
+        qres_x = quantize_op.quantize(x, _QPARAMS, return_transpose=False)
+        qres_w = quantize_op.quantize(w, _QPARAMS, return_transpose=False)
+        sx_4d = swizzle_scale(qres_x.scale.float(), m, k).to(torch.float8_e4m3fn)
+        sw_4d = swizzle_scale(qres_w.scale.float(), n, k).to(torch.float8_e4m3fn)
+        a_list.append(qres_x.data)   # [m, k//2] uint8
+        b_list.append(qres_w.data)   # [n, k//2] uint8
+        a_sf_list.append(sx_4d)
+        b_sf_list.append(sw_4d)
+
+    # Contiguous A / B
+    A = torch.cat(a_list, dim=0).contiguous()   # [total_M, K//2]
+    B = torch.cat(b_list, dim=0).contiguous()   # [total_N, K//2]
+
+    # Scale factors: flatten each group's 4D tensor, then cat
+    A_sf = torch.cat([sf.reshape(-1) for sf in a_sf_list]).contiguous()
+    B_sf = torch.cat([sf.reshape(-1) for sf in b_sf_list]).contiguous()
+
+    ng = len(shapes)
+
+    # Row offsets (device int32)
+    a_rows = torch.zeros(ng + 1, dtype=torch.int32, device=device)
+    b_rows = torch.zeros(ng + 1, dtype=torch.int32, device=device)
+    for i, (m, n, _) in enumerate(shapes):
+        a_rows[i + 1] = a_rows[i] + m
+        b_rows[i + 1] = b_rows[i] + n
+
+    # SF element offsets (device int64)
+    a_sf_offs = torch.zeros(ng + 1, dtype=torch.int64, device=device)
+    b_sf_offs = torch.zeros(ng + 1, dtype=torch.int64, device=device)
+    for i in range(ng):
+        a_sf_offs[i + 1] = a_sf_offs[i] + a_sf_list[i].numel()
+        b_sf_offs[i + 1] = b_sf_offs[i] + b_sf_list[i].numel()
+
+    # Problem sizes on CPU (required by CUTLASS TMA initialize)
+    prob_host = torch.zeros(ng * 3, dtype=torch.int32)
+    for i, (m, n, k) in enumerate(shapes):
+        prob_host[i * 3 + 0] = m
+        prob_host[i * 3 + 1] = n
+        prob_host[i * 3 + 2] = k  # actual K (FP4 elements)
+
+    return A, B, A_sf, B_sf, a_rows, b_rows, a_sf_offs, b_sf_offs, prob_host, ng
+
+
+def _alloc_v2_buffers(max_groups: int, device="cuda"):
+    """Pre-allocate all persistent buffers required by grouped_cutlass_gemm_v2."""
+    ptrs_b, strides_b, layouts_b = _fp4_gemm.grouped_cutlass_gemm_v2_buffer_sizes(max_groups)
+    buf_ptrs    = torch.empty(ptrs_b,                  dtype=torch.uint8, device=device)
+    buf_strides = torch.empty(strides_b,               dtype=torch.uint8, device=device)
+    buf_layouts = torch.empty(layouts_b,               dtype=torch.uint8, device=device)
+    buf_psizes  = torch.empty(max_groups * 3,          dtype=torch.int32, device=device)
+    workspace   = torch.empty(4 * 1024 * 1024,         dtype=torch.uint8, device=device)  # 4MB upper bound
+    return buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace
+
+
+class TestGroupedCutlassGemmV2Benchmark:
+    """Benchmark grouped_cutlass_gemm_v2 (zero-overhead) vs v1."""
+
+    @pytest.mark.parametrize("shapes", _BENCH_CONFIGS)
+    def test_benchmark_v2_vs_v1(self, shapes):
+        _require_sm100()
+        device = "cuda"
+
+        # ---- v1 inputs (list-based) ----
+        a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list = (
+            TestGroupedCutlassGemmBenchmark._build_inputs(shapes)
+        )
+        n = shapes[0][1]
+        total_m = sum(s[0] for s in shapes)
+        D_v1 = torch.empty(total_m, n, dtype=torch.bfloat16, device=device)
+
+        def fn_v1():
+            grouped_nvfp4_cutlass_gemm_per_token_scale(
+                a_list=a_list,
+                b_list=b_list,
+                a_sf_list=a_sf_list,
+                b_sf_list=b_sf_list,
+                per_token_scale_list=pts_list,
+                out_dtype=torch.bfloat16,
+                sf_is_swizzled=True,
+                tensor_scale_a_list=ts_a_list,
+                tensor_scale_b_list=ts_b_list,
+            )
+
+        # ---- v2 inputs (contiguous) ----
+        A, B, A_sf, B_sf, a_rows, b_rows, a_sf_offs, b_sf_offs, prob_host, ng = (
+            _build_v2_inputs(shapes)
+        )
+        D_v2 = torch.empty(total_m, n, dtype=torch.bfloat16, device=device)
+        buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = (
+            _alloc_v2_buffers(ng, device)
+        )
+
+        def fn_v2():
+            _fp4_gemm.grouped_cutlass_gemm_v2(
+                D_v2, A, B, A_sf, B_sf,
+                a_rows, b_rows, a_sf_offs, b_sf_offs,
+                ng,
+                buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+                prob_host,
+                workspace,
+                torch.empty(0, dtype=torch.float32, device=device),
+            )
+
+        # Warmup both
+        fn_v1()
+        fn_v2()
+        torch.cuda.synchronize()
+
+        ms_v1 = _cuda_time_ms(fn_v1, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        ms_v2 = _cuda_time_ms(fn_v2, warmup=_BENCH_WARMUP, iters=_BENCH_ITERS)
+        tf_v1 = _tflops(shapes, ms_v1)
+        tf_v2 = _tflops(shapes, ms_v2)
+
+        print(
+            f"\n  groups={ng}  shapes={shapes[0]}{'...' if ng > 1 else ''}\n"
             f"  {'':20s} {'Latency µs':>12}  {'TFLOPS':>9}\n"
-            f"  {'CUTLASS C++':20s} {ms_cutlass*1e3:>12.1f}  {tf_cutlass:>9.2f}\n"
-            f"  {'TE general_grouped':20s} {ms_te*1e3:>12.1f}  {tf_te:>9.2f}\n"
-            f"  speedup (cutlass/te): {speedup:.2f}x"
+            f"  {'CUTLASS v1 (list)':20s} {ms_v1*1e3:>12.1f}  {tf_v1:>9.2f}\n"
+            f"  {'CUTLASS v2 (zero-OH)':20s} {ms_v2*1e3:>12.1f}  {tf_v2:>9.2f}\n"
+            f"  speedup v2/v1: {ms_v1/ms_v2:.2f}x"
         )
 
 

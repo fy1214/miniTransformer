@@ -38,9 +38,10 @@ struct QuantResultPT {
     __nv_fp8_e4m3 fp8s;
 };
 
-__device__ __forceinline__ QuantResultPT quantize_pt(float abs_max, float inv_val_max, float scale, bf16x8& x) {
-    float s_group     = abs_max * inv_val_max;
-    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(s_group / scale);
+// global_encode_scale = 2688.0f / row_abs_max  (matches golden's formula exactly)
+// scale               = scale_override / global_encode_scale
+__device__ __forceinline__ QuantResultPT quantize_pt(float abs_max, float val_max, float global_encode_scale, float scale, bf16x8& x) {
+    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(fminf(abs_max * (1.0f / val_max) * global_encode_scale, 448.0f));
     float s_round_fp8 = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
@@ -97,11 +98,14 @@ __global__ void fp4_pertoken_kernel(
 
     // Token-level global scale from externally supplied per-row amax.
     float row_abs_max = amax_per_row[row];
-    constexpr float inv_scales_max = NumCandidates > 1 ? 1.f / 256.f : 1.f / 448.f;
-    constexpr float one_over_six   = 1.f / 6.f;
-    float scale = row_abs_max == 0.f
+    constexpr float SCALES_MAX = NumCandidates > 1 ? 256.0f : 448.0f;
+    constexpr float FP4_MAX    = 6.0f;
+    float global_encode_scale = row_abs_max == 0.f
                 ? 1.f
-                : row_abs_max * inv_scales_max * (scale_override * one_over_six);
+                : (SCALES_MAX * FP4_MAX) / row_abs_max;
+    float scale = row_abs_max == 0.f
+                ? scale_override
+                : scale_override / global_encode_scale;
     if (col_in_row == 0)
         global_scale_ptr[row] = scale;
 
@@ -119,8 +123,7 @@ __global__ void fp4_pertoken_kernel(
     float best = INFINITY;
     QuantResultPT res;
     for (int i = 0; i < NumCandidates; ++i) {
-        float inv_val = 1.f / candidates[i];
-        results[i]    = quantize_pt(full_abs_max, inv_val * scale_override, scale, x);
+        results[i]    = quantize_pt(full_abs_max, candidates[i], global_encode_scale, scale, x);
         scores[i]     = quant_error_pt(x, results[i], scale);
         if (scores[i] < best) { best = scores[i]; res = results[i]; }
     }

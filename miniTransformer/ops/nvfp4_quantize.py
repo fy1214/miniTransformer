@@ -444,3 +444,110 @@ def group_quantize_nvfp4_pertoken_swizzled(
         scale_offsets=scale_offsets,
         row_offsets=row_offsets,
     )
+
+
+@dataclass
+class GroupWeightQuantizeResult:
+    """Output of group_quantize_nvfp4_tensor_global_packed.
+
+    data          – [total_n, k//2] uint8, packed FP4x2, all experts contiguous.
+    cute_data     – [total_n * k] int8, CUTE-layout (first half data, second half zero padding).
+                    cute_fp4_for(g) slices this zero-copy.
+    global_scale  – [num_experts] float32, per-expert alpha = amax / (448*6).
+                    Same value as TensorGlobalNvfp4Tensor._alpha_b_cached, ready to
+                    use directly as alpha_b_vec in grouped_gemm_cutedsl_pertoken.
+    scale_flat    – flat FP8 buffer; expert g lives at scale_flat[scale_offsets[g]:scale_offsets[g+1]].
+    scale_views   – list[Tensor], one per expert, shaped (32,4,nMT,4,nKT,1), CUTE-ready.
+    scale_offsets – list[int], len = num_experts+1, cumulative FP8 element counts.
+    row_offsets   – list[int], len = num_experts+1, cumulative row counts (fixed stride = n_per_expert).
+    """
+    data:          torch.Tensor
+    cute_data:     torch.Tensor
+    global_scale:  torch.Tensor
+    scale_flat:    torch.Tensor
+    scale_views:   List[torch.Tensor]
+    scale_offsets: List[int]
+    row_offsets:   List[int]
+
+
+_NVFP4_GLOBAL_SCALE_DENOM = 448.0 * 6.0
+
+
+def group_quantize_nvfp4_tensor_global_packed(
+    x: torch.Tensor,
+    n_per_expert: int,
+    *,
+    four_six: bool = False,
+    scale_override: float = 1.0,
+) -> GroupWeightQuantizeResult:
+    """Quantize all MoE expert weights in one kernel launch.
+
+    Args:
+        x:             3-D BF16 tensor [num_experts, n_per_expert, k], contiguous, on CUDA.
+                       k must be divisible by 128 and <= 4096.
+        n_per_expert:  Number of rows per expert (must equal x.shape[1]).
+        four_six:      Round-4-or-6 if True; RTN otherwise (default).
+        scale_override: Scalar multiplier for the per-expert global scale.
+
+    Returns:
+        GroupWeightQuantizeResult with all experts packed into contiguous buffers.
+        scale_views[g] is shaped (32,4,nMT,4,nKT,1), directly usable by the
+        Sm100 grouped GEMM kernel.
+    """
+    assert x.is_cuda, "x must be a CUDA tensor."
+    assert x.dtype == torch.bfloat16, "x must be bfloat16."
+    assert x.ndim == 3, "x must be 3-D [num_experts, n_per_expert, k]."
+    assert x.is_contiguous(), "x must be contiguous."
+    num_experts, n, k = x.shape
+    assert n == n_per_expert, f"x.shape[1]={n} != n_per_expert={n_per_expert}"
+    assert k % 128 == 0, "k must be divisible by 128."
+    assert k // 8 <= 512, "k must be <= 4096."
+    device = x.device
+
+    # Flatten to [total_n, k] for the kernel (experts are already contiguous).
+    total_n = num_experts * n_per_expert
+    x_2d = x.view(total_n, k)
+
+    # Build offsets (fixed stride per expert).
+    n_padded = ((n_per_expert + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    sf_stride = n_padded * k // 16
+
+    row_offsets: List[int] = [i * n_per_expert for i in range(num_experts + 1)]
+    scale_offsets: List[int] = [i * sf_stride for i in range(num_experts + 1)]
+
+    data         = torch.empty((total_n, k // 2), dtype=nvfp4_output_t, device=device)
+    global_scale = torch.empty(num_experts, dtype=torch.float32, device=device)
+    scale_flat   = torch.zeros(scale_offsets[-1], dtype=nvfp4_scale_t, device=device)
+
+    row_offsets_gpu   = torch.tensor(row_offsets,   dtype=torch.int32, device=device)
+    scale_offsets_gpu = torch.tensor(scale_offsets, dtype=torch.int64, device=device)
+
+    # Per-expert amax: one reduction per expert, fully on GPU.
+    amax = x.abs().amax(dim=(1, 2)).to(torch.float32).contiguous()
+
+    fn = fp4_gemm.four_six_fp4_group_tensor_global if four_six else fp4_gemm.rtn_fp4_group_tensor_global
+    fn(data, scale_flat, global_scale, x_2d, row_offsets_gpu, scale_offsets_gpu, amax, scale_override)
+
+    # Build one CUTE int8 buffer for all experts: [total_n * k] int8.
+    # Layout: first n*k//2 bytes per expert are FP4 data; second half is zero padding.
+    # This matches _make_fp4_tensor_for_cutedsl and allows cute_fp4_for to be zero-copy.
+    cute_data = torch.zeros(total_n * k, dtype=torch.int8, device=device)
+    cute_data[:total_n * k // 2].copy_(data.reshape(-1).view(torch.int8))
+
+    nMT = n_padded // _MMA_TILE_ROWS
+    nKT = k // 64
+    scale_views: List[torch.Tensor] = []
+    for g in range(num_experts):
+        sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
+        view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
+        scale_views.append(view)
+
+    return GroupWeightQuantizeResult(
+        data=data,
+        cute_data=cute_data,
+        global_scale=global_scale,
+        scale_flat=scale_flat,
+        scale_views=scale_views,
+        scale_offsets=scale_offsets,
+        row_offsets=row_offsets,
+    )

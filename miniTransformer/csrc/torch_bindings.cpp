@@ -29,6 +29,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_cutlass_gemm_with_per_token_scale",
           &grouped_cutlass_gemm_with_per_token_scale,
           "FP4 grouped GEMM (CUTLASS SM100) + per-token output scale (CUDA)");
+    m.def("grouped_cutlass_gemm_v2_buffer_sizes",
+          &grouped_cutlass_gemm_v2_buffer_sizes,
+          "Return (ptrs_bytes, strides_bytes, layouts_bytes) for pre-allocation");
+    m.def("grouped_cutlass_gemm_v2",
+          &grouped_cutlass_gemm_v2,
+          "FP4 grouped GEMM v2: zero-overhead, pre-allocated buffers (CUDA)");
 
 
     // quarter quantization
@@ -54,6 +60,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
           pybind11::arg("scale_override"),
           "Round-4-or-6 FP4 grouped per-token quantization with per-group swizzled SF layout (CUDA)");
+    m.def("rtn_fp4_group_tensor_global", &rtn_fp4_group_tensor_global_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("amax"), pybind11::arg("scale_override"),
+          "RTN FP4 grouped tensor-global quantization with per-group swizzled SF layout (CUDA)");
+    m.def("four_six_fp4_group_tensor_global", &four_six_fp4_group_tensor_global_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("amax"), pybind11::arg("scale_override"),
+          "Round-4-or-6 FP4 grouped tensor-global quantization with per-group swizzled SF layout (CUDA)");
     m.def("eden_fp4", &eden_fp4_binding, "Eden FP4 quantization (CUDA)");
     m.def("group_transform_128_eden", &group_transform_128_eden_binding, "Group Transform 128 Eden (CUDA)");
     m.def("dequant_tp_had_quant", &dequant_tp_had_quant_binding, "Dequant TP Had Quant (CUDA)");

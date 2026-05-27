@@ -64,6 +64,28 @@ void grouped_cutlass_gemm_with_per_token_scale(
     const std::vector<at::Tensor>& per_token_scale_list
 );
 
+std::vector<int64_t> grouped_cutlass_gemm_v2_buffer_sizes(int max_groups);
+
+void grouped_cutlass_gemm_v2(
+    at::Tensor&       D,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& A_sf,
+    const at::Tensor& B_sf,
+    const at::Tensor& a_row_offsets,
+    const at::Tensor& b_row_offsets,
+    const at::Tensor& a_sf_offsets,
+    const at::Tensor& b_sf_offsets,
+    int               num_groups,
+    at::Tensor&       buf_ptrs,
+    at::Tensor&       buf_strides,
+    at::Tensor&       buf_layouts,
+    at::Tensor&       buf_problem_sizes_dev,
+    const at::Tensor& problem_sizes_host,
+    at::Tensor&       workspace,
+    const at::Tensor& per_token_scale
+);
+
 
 // quarter quantization
 void four_six_fp4_binding(
@@ -171,6 +193,28 @@ void four_six_fp4_group_pertoken_binding(
     const at::Tensor& inp,
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
+    float scale_override
+);
+
+void rtn_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float scale_override
+);
+
+void four_six_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
     float scale_override
 );
 

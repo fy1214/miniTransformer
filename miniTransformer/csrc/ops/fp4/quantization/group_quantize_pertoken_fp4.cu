@@ -37,15 +37,40 @@ struct QuantResultGP {
     __nv_fp8_e4m3 fp8s;
 };
 
+// global_encode_scale = 2688.0f / row_abs_max  (matches golden's formula exactly)
+// scale               = scale_override / global_encode_scale
 __device__ __forceinline__ QuantResultGP
-quantize_gp(float abs_max, float inv_val_max, float scale, bf16x8& x)
+quantize_gp(float abs_max, float val_max, float global_encode_scale, float scale, bf16x8& x)
 {
-    float s_group      = abs_max * inv_val_max;
-    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(s_group / scale);
+    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(fminf((abs_max / val_max) * global_encode_scale, 448.0f));
     float s_round_fp8  = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
     float factor   = 1.0f / (s_round_fp8 * scale);
+    float2 factor2 = {factor, factor};
+    fp4x8 result;
+    for (int k = 0; k < bf16x8::size; k += 2) {
+        float2 src  = make_float2(static_cast<float>(x[k]), static_cast<float>(x[k + 1]));
+        float2 sc   = __fmul2_rn(src, factor2);
+        result[k/2] = __nv_cvt_float2_to_fp4x2(
+            sc, __nv_fp4_interpretation_t::__NV_E2M1, cudaRoundMode::cudaRoundNearest);
+    }
+    return QuantResultGP{result, s_round_fp8, s_as_fp8};
+}
+
+// Same quantization logic as quantize() in quantize_round_four_six.cu.
+// Uses reciprocal_approximate_ftz for bit-exact match with rtn_fp4 / four_six_fp4.
+// inv_val_max = scale_override / val_max  (e.g. 1/6 for RTN, 1/4 for 4-or-6)
+__device__ __forceinline__ QuantResultGP
+quantize_tg(float abs_max, float inv_val_max, float scale, bf16x8& x)
+{
+    float s_group    = abs_max * inv_val_max;
+    float inv_scale  = reciprocal_approximate_ftz(scale);
+    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(s_group * inv_scale);
+    float s_round_fp8 = static_cast<float>(s_as_fp8);
+    if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
+
+    float factor   = reciprocal_approximate_ftz(s_round_fp8 * scale);
     float2 factor2 = {factor, factor};
     fp4x8 result;
     for (int k = 0; k < bf16x8::size; k += 2) {
@@ -120,16 +145,18 @@ __global__ void fp4_group_pertoken_kernel(
             amax_bf = __hmax(amax_bf, __habs(smem[j]));
         float        row_amax = static_cast<float>(amax_bf);
 
-        constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
-        constexpr float one_over_six   = 1.f / 6.f;
-        float s = (row_amax == 0.f)
-                ? 1.f
-                : row_amax * inv_scales_max * (scale_override * one_over_six);
-        global_scale_ptr[row]         = s;
-        *reinterpret_cast<float*>(smem) = s;
+        constexpr float SCALES_MAX = (NumCandidates > 1) ? 256.0f : 448.0f;
+        constexpr float FP4_MAX    = 6.0f;
+        // scale = global decode scale, matches golden: 1.0 / global_encode_scale
+        float ges = (row_amax == 0.f) ? 1.f : (SCALES_MAX * FP4_MAX) / row_amax;
+        float s   = (row_amax == 0.f) ? scale_override : scale_override / ges;
+        global_scale_ptr[row]              = s;
+        reinterpret_cast<float*>(smem)[0]  = s;
+        reinterpret_cast<float*>(smem)[1]  = ges;
     }
     __syncthreads();
-    float scale = *reinterpret_cast<float*>(smem);
+    float scale               = reinterpret_cast<float*>(smem)[0];
+    float global_encode_scale = reinterpret_cast<float*>(smem)[1];
 
     // ---- Step 2: per-group (16-element) abs-max ----
     nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
@@ -139,14 +166,14 @@ __global__ void fp4_group_pertoken_kernel(
     // ---- Step 3: quantize (RTN or Round-4-or-6) ----
     QuantResultGP res;
     if constexpr (NumCandidates == 1) {
-        res = quantize_gp(full_abs_max, (1.f / 6.f) * scale_override, scale, x);
+        res = quantize_gp(full_abs_max, 6.0f, global_encode_scale, scale, x);
     } else {
         float candidates[2] = {6.f, 4.f};
         QuantResultGP results[2];
         float scores[2];
         float best = __builtin_inff();
         for (int i = 0; i < 2; ++i) {
-            results[i] = quantize_gp(full_abs_max, (1.f / candidates[i]) * scale_override, scale, x);
+            results[i] = quantize_gp(full_abs_max, candidates[i], global_encode_scale, scale, x);
             // Compute L2 error (same warp-level reduction as single-group kernel)
             const float descale = static_cast<float>(results[i].fp8s) * scale;
             float2 sum = {0.f, 0.f};
@@ -279,5 +306,219 @@ void four_six_fp4_group_pertoken_binding(
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
         scale_override, total_m, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
+}
+
+// ── Grouped tensor-global FP4 quantization ────────────────────────────────────
+//
+// Like fp4_group_pertoken_kernel but the amax is per-group (tensor-global),
+// not per-row.  Each block reads amax_ptr[group_id] instead of doing a
+// shared-memory row reduce.  This makes it suitable for weight quantization
+// where all rows in a group (one MoE expert) share a single amax.
+//
+// Inputs / outputs are identical to the pertoken variant except:
+//   global_scale_ptr  — [num_groups] float32  (one value per expert)
+//   amax_ptr          — [num_groups] float32  (caller computes per-expert amax)
+//
+// Grid  : (total_rows,)  Block : (cols/8,)   smem : 2*sizeof(float) only.
+
+template<int NumCandidates>
+__global__ void fp4_group_tensor_global_kernel(
+    __nv_fp4x4_e2m1*    __restrict__ y_ptr,
+    __nv_fp8_e4m3*      __restrict__ scale_ptr,
+    float*              __restrict__ global_scale_ptr,
+    const nv_bfloat16*  __restrict__ x_ptr,
+    const int32_t*      __restrict__ row_offsets,    // [num_groups+1]
+    const int64_t*      __restrict__ scale_offsets,  // [num_groups+1]
+    const float*        __restrict__ amax_ptr,       // [num_groups]
+    float  scale_override,
+    int    cols_div16,
+    int    num_groups)
+{
+    // smem holds two floats: [scale, global_encode_scale] broadcast from tid==0.
+    __shared__ float smem_f[2];
+
+    const int row          = blockIdx.x;
+    const int tid          = threadIdx.x;
+    const int nvecs_per_row = blockDim.x;
+
+    // Find group owning this row.
+    int group_id = 0;
+    while (group_id < num_groups - 1 && row >= row_offsets[group_id + 1]) {
+        ++group_id;
+    }
+    const int     local_row = row - row_offsets[group_id];
+    const int64_t sf_base   = scale_offsets[group_id];
+
+    // Broadcast per-group scale from tid==0.
+    // Formula matches four_six_fp4_kernel in quantize_round_four_six.cu exactly:
+    //   scale = group_amax * inv_scales_max * inv_val_max  (where inv_val_max = scale_override/6)
+    if (tid == 0) {
+        float group_amax = amax_ptr[group_id];
+        constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
+        constexpr float inv_six        = 1.f / 6.f;
+        float inv_val_max = scale_override * inv_six;
+        float s = (group_amax == 0.f) ? 1.f : group_amax * inv_scales_max * inv_val_max;
+        if (local_row == 0) global_scale_ptr[group_id] = s;
+        smem_f[0] = s;
+    }
+    __syncthreads();
+    const float scale = smem_f[0];
+
+    // Load 8 bf16 values.
+    bf16x8 x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
+
+    // Per-group-of-16 abs-max (pair of adjacent threads).
+    nv_bfloat16 local_abs_max = vecReduceAbsMax(x);
+    nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
+    float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
+
+    // Quantize using reciprocal_approximate_ftz path (bit-exact with rtn_fp4).
+    QuantResultGP res;
+    if constexpr (NumCandidates == 1) {
+        constexpr float inv_six = 1.f / 6.f;
+        res = quantize_tg(full_abs_max, scale_override * inv_six, scale, x);
+    } else {
+        float candidates[2]    = {6.f, 4.f};
+        QuantResultGP results[2];
+        float scores[2];
+        float best = __builtin_inff();
+        for (int i = 0; i < 2; ++i) {
+            float inv_cand = 1.f / candidates[i];
+            results[i] = quantize_tg(full_abs_max, scale_override * inv_cand, scale, x);
+            const float descale = static_cast<float>(results[i].fp8s) * scale;
+            float2 sum = {0.f, 0.f};
+            const float2 dsv = {-descale, -descale};
+            for (int j = 0; j < 4; ++j) {
+                float2 dq = __nv_cvt_fp4x2_to_float2(results[i].bits[j]);
+                float2 xv = {static_cast<float>(x[2*j]), static_cast<float>(x[2*j+1])};
+                float2 d  = __ffma2_rn(dq, dsv, xv);
+                sum = __ffma2_rn(d, d, sum);
+            }
+            float local_err = sum.x + sum.y;
+            local_err += __shfl_xor_sync(0xffffffff, local_err, 1);
+            scores[i] = local_err;
+            if (scores[i] < best) { best = scores[i]; res = results[i]; }
+        }
+    }
+
+    // Store packed FP4.
+    const int global_vec_idx = row * nvecs_per_row + tid;
+    res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
+
+    // Store FP8 scale with per-group swizzle.
+    if (tid % 2 == 0) {
+        const int     col      = tid / 2;
+        const int     numKTiles = cols_div16 / 4;
+        const int64_t tgt = cvt_quant_to_fp4_get_sf_out_offset(local_row, col, numKTiles);
+        scale_ptr[sf_base + tgt] = res.fp8s;
+    }
+}
+
+static void launch_fp4_group_tensor_global(
+    int num_candidates,
+    __nv_fp4x4_e2m1*   y_ptr,
+    __nv_fp8_e4m3*     scale_ptr,
+    float*             global_scale_ptr,
+    const nv_bfloat16* x_ptr,
+    const int32_t*     row_offsets,
+    const int64_t*     scale_offsets,
+    const float*       amax_ptr,
+    float  scale_override,
+    long   total_rows,
+    long   cols,
+    int    num_groups,
+    cudaStream_t stream)
+{
+    int   threads = static_cast<int>(cols / 8);
+    int   cdiv16  = static_cast<int>(cols / 16);
+
+    if (num_candidates == 2)
+        fp4_group_tensor_global_kernel<2><<<total_rows, threads, 0, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups);
+    else
+        fp4_group_tensor_global_kernel<1><<<total_rows, threads, 0, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups);
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rtn_fp4_group_tensor_global_binding(
+    at::Tensor&       out,           // [total_n, cols/2]  uint8
+    at::Tensor&       scales,        // flat FP8 scale buffer, pre-zeroed
+    at::Tensor&       global_scale,  // [num_groups]  float32
+    const at::Tensor& inp,           // [total_n, cols]  bfloat16  (experts stacked)
+    const at::Tensor& row_offsets,   // [num_groups+1]  int32  (on GPU)
+    const at::Tensor& scale_offsets, // [num_groups+1]  int64  (on GPU)
+    const at::Tensor& amax,          // [num_groups]  float32  (per-expert abs-max)
+    float             scale_override)
+{
+    TORCH_CHECK(inp.dtype()      == at::kBFloat16, "inp must be bfloat16");
+    TORCH_CHECK(inp.is_cuda(),                     "inp must be a CUDA tensor");
+    TORCH_CHECK(inp.is_contiguous(),               "inp must be contiguous");
+    TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
+    TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
+    TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
+    TORCH_CHECK(amax.dtype()     == at::kFloat,    "amax must be float32");
+    TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
+    TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
+    const int ngroups = static_cast<int>(row_offsets.numel()) - 1;
+    TORCH_CHECK(global_scale.numel() == ngroups,   "global_scale must have num_groups elements");
+    TORCH_CHECK(amax.numel()         == ngroups,   "amax must have num_groups elements");
+
+    const long total_n = inp.size(0);
+    const long cols    = inp.size(1);
+
+    launch_fp4_group_tensor_global(
+        1,
+        reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
+        reinterpret_cast<const float*>(amax.data_ptr()),
+        scale_override, total_n, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
+}
+
+void four_six_fp4_group_tensor_global_binding(
+    at::Tensor&       out,
+    at::Tensor&       scales,
+    at::Tensor&       global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float             scale_override)
+{
+    TORCH_CHECK(inp.dtype()      == at::kBFloat16, "inp must be bfloat16");
+    TORCH_CHECK(inp.is_cuda(),                     "inp must be a CUDA tensor");
+    TORCH_CHECK(inp.is_contiguous(),               "inp must be contiguous");
+    TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
+    TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
+    TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
+    TORCH_CHECK(amax.dtype()     == at::kFloat,    "amax must be float32");
+    TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
+    TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
+    const int ngroups = static_cast<int>(row_offsets.numel()) - 1;
+    TORCH_CHECK(global_scale.numel() == ngroups,   "global_scale must have num_groups elements");
+    TORCH_CHECK(amax.numel()         == ngroups,   "amax must have num_groups elements");
+
+    const long total_n = inp.size(0);
+    const long cols    = inp.size(1);
+
+    launch_fp4_group_tensor_global(
+        2,
+        reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
+        reinterpret_cast<const float*>(amax.data_ptr()),
+        scale_override, total_n, cols, ngroups,
         at::cuda::getCurrentCUDAStream());
 }

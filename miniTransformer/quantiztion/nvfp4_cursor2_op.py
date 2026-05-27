@@ -359,26 +359,33 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
+            from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_tensor_global_packed
+            from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import PackedWeightNvfp4Tensor
 
             if _DEBUG_CALL_COUNT < 3:
-                for i in range(num_gemms):
-                    wi = x[i]
-                    print(f"[W-QUANT PRE  g={i}] shape={wi.shape} dtype={wi.dtype} "
-                          f"nan={wi.isnan().any().item()} inf={wi.isinf().any().item()} "
-                          f"max={wi.abs().max().item():.4g}", flush=True)
+                print(f"[W-QUANT PRE ] shape={x.shape} dtype={x.dtype} "
+                      f"nan={x.isnan().any().item()} inf={x.isinf().any().item()} "
+                      f"max={x.abs().max().item():.4g}", flush=True)
 
-            quantize_tensor_list = [
-                quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
-            ]
+            gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1])
+            packed_b = PackedWeightNvfp4Tensor(
+                cute_data=gw.cute_data,
+                scale_flat=gw.scale_flat,
+                global_scale=gw.global_scale,
+                scale_views=gw.scale_views,
+                scale_offsets=gw.scale_offsets,
+                row_offsets=gw.row_offsets,
+                n_per_expert=x.shape[1],
+                k=x.shape[2],
+            )
+            # Return a list of the same packed object — grouped_gemm_cutedsl_pertoken
+            # will index into it by expert index.
+            quantize_tensor_list = [packed_b] * num_gemms
 
             if _DEBUG_CALL_COUNT < 3:
-                for i, t in enumerate(quantize_tensor_list):
-                    sfb = t.block_scale_fp8.float()
-                    print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
-                          f"sfb_nan={sfb.isnan().any().item()} sfb_inf={sfb.isinf().any().item()} "
-                          f"sfb_max={sfb.abs().max().item():.4g} "
-                          f"alpha_b={t._alpha_b_cached:.4g}", flush=True)
+                print(f"[W-QUANT POST] data={gw.data.shape} "
+                      f"global_scale={gw.global_scale[:4]} "
+                      f"scale_flat={gw.scale_flat.shape}", flush=True)
 
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]

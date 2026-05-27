@@ -1,6 +1,7 @@
 import logging
 import os
 import torch
+from torch.profiler import profile, ProfilerActivity, record_function
 from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
@@ -69,13 +70,28 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             _QuantizedGroupedLinear._dump_count = 0
         _do_dump = _dump_dir and _dump_rank == 0 and _QuantizedGroupedLinear._dump_count < _dump_call_limit
 
+        _prof_dir = os.environ.get("NVFP4_PROFILE_DIR", "")
+        _prof_calls = int(os.environ.get("NVFP4_PROFILE_CALLS", "0"))
+        if not hasattr(_QuantizedGroupedLinear, "_prof_count"):
+            _QuantizedGroupedLinear._prof_count = 0
+        _do_profile = bool(_prof_dir) and _dump_rank == 0 and _QuantizedGroupedLinear._prof_count < _prof_calls
+        if _do_profile:
+            _prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+            _prof.__enter__()
+
         # disable_backward_quant skips columnwise quantization since x_t is unused in BF16 backward
-        qresult_x_list = quantize_op.group_quantize(
-            x,
-            qlinear_params.x_params,
-            m_splits=m_splits,
-            return_transpose=(is_grad_enabled and not disable_backward_quant)
-        )
+        with record_function("group_quantize_x"):
+            qresult_x_list = quantize_op.group_quantize(
+                x,
+                qlinear_params.x_params,
+                m_splits=m_splits,
+                return_transpose=(is_grad_enabled and not disable_backward_quant)
+            )
         qx, sx, tx, qx_t, sx_t, tx_t = (qresult_x_list.data,
                                           qresult_x_list.scale,
                                           qresult_x_list.tensor_scale,
@@ -88,12 +104,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         if quantize_op.should_update_quantize_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
-            qresult_w_list = quantize_op.group_quantize(
-                w,
-                qlinear_params.w_params,
-                m_splits=m_splits,
-                return_transpose=(is_grad_enabled and not disable_backward_quant)
-            )
+            with record_function("group_quantize_w"):
+                qresult_w_list = quantize_op.group_quantize(
+                    w,
+                    qlinear_params.w_params,
+                    m_splits=m_splits,
+                    return_transpose=(is_grad_enabled and not disable_backward_quant)
+                )
             qw = qresult_w_list.data
             sw = qresult_w_list.scale
             qw_t = qresult_w_list.data_t
@@ -102,12 +119,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             tw_t = qresult_w_list.tensor_scale_t
         elif update_fp8_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
-            qresult_w_list = quantize_op.group_quantize(
-                w,
-                qlinear_params.w_params,
-                m_splits=m_splits,
-                return_transpose=(is_grad_enabled and not disable_backward_quant)
-            )
+            with record_function("group_quantize_w"):
+                qresult_w_list = quantize_op.group_quantize(
+                    w,
+                    qlinear_params.w_params,
+                    m_splits=m_splits,
+                    return_transpose=(is_grad_enabled and not disable_backward_quant)
+                )
             qw = weight_qresult_cache.data = qresult_w_list.data
             sw = weight_qresult_cache.scale = qresult_w_list.scale
             qw_t = weight_qresult_cache.data_t = qresult_w_list.data_t
@@ -131,21 +149,30 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         assert qw is not None, "FP8 weight cache should not be None"
 
-        y = quantize_op.grouped_gemm(
-            A=qx,
-            B=qw,
-            sA=sx,
-            sB=sw,
-            global_amax_A=tx,
-            global_amax_B=tw,
-            out=None,
-            out_dtype=out_dtype,
-            m_splits=m_splits,
-            qparams_x=qlinear_params.x_params,
-            qparams_w=qlinear_params.w_params,
-            extra_info_A=qresult_x_list.extra_info,
-            extra_info_B=qresult_w_list.extra_info
-        )
+        with record_function("grouped_gemm"):
+            y = quantize_op.grouped_gemm(
+                A=qx,
+                B=qw,
+                sA=sx,
+                sB=sw,
+                global_amax_A=tx,
+                global_amax_B=tw,
+                out=None,
+                out_dtype=out_dtype,
+                m_splits=m_splits,
+                qparams_x=qlinear_params.x_params,
+                qparams_w=qlinear_params.w_params,
+                extra_info_A=qresult_x_list.extra_info,
+                extra_info_B=qresult_w_list.extra_info
+            )
+        if _do_profile:
+            _prof.__exit__(None, None, None)
+            print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
+            os.makedirs(_prof_dir, exist_ok=True)
+            _trace = os.path.join(_prof_dir, f"gl_trace_{_QuantizedGroupedLinear._prof_count:03d}.json")
+            _prof.export_chrome_trace(_trace)
+            print(f"[PROFILE] Trace saved → {_trace}", flush=True)
+            _QuantizedGroupedLinear._prof_count += 1
         logger.debug(f"[Hybrid] After Grouped QGEMM, y shape [m, n]: {list(y.shape)}")
 
         # ── DUMP: save x / w(stacked) / y / m_splits for offline single-op replay ──

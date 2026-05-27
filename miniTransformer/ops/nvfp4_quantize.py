@@ -529,10 +529,14 @@ def group_quantize_nvfp4_tensor_global_packed(
     fn(data, scale_flat, global_scale, x_2d, row_offsets_gpu, scale_offsets_gpu, amax, scale_override)
 
     # Build one CUTE int8 buffer for all experts: [total_n * k] int8.
-    # Layout: first n*k//2 bytes per expert are FP4 data; second half is zero padding.
-    # This matches _make_fp4_tensor_for_cutedsl and allows cute_fp4_for to be zero-copy.
+    # Each expert occupies n_per_expert*k bytes: first half is FP4 data, second half zeros.
+    # cute_fp4_for(g) = cute_data[g*n*k : (g+1)*n*k], so each expert must be interleaved.
     cute_data = torch.zeros(total_n * k, dtype=torch.int8, device=device)
-    cute_data[:total_n * k // 2].copy_(data.reshape(-1).view(torch.int8))
+    n_per_expert = total_n // num_experts
+    for g in range(num_experts):
+        src = data[g * n_per_expert: (g + 1) * n_per_expert].reshape(-1).view(torch.int8)
+        dst_start = g * n_per_expert * k
+        cute_data[dst_start: dst_start + n_per_expert * k // 2].copy_(src)
 
     nMT = n_padded // _MMA_TILE_ROWS
     nKT = k // 64

@@ -220,20 +220,23 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
     CUTLASS SM100 grouped FP4 GEMM (v2) with fused per-token output scale.
 
     Per-token effective scale is computed as:
-        pts_eff[i] = act_ts[i] * wgt_ts[group(i)] / _NVFP4_FACTOR
+        pts_eff[i] = act_ts[i] * wgt_ts[group(i)]
 
     where act_ts is per-row and wgt_ts is per-expert (expanded via repeat_interleave).
+    Both act_ts and wgt_ts are already normalized (= amax / (448*6)), so no additional
+    _NVFP4_FACTOR division is applied here.
     The kernel applies pts_eff row-wise to the raw GEMM output before writing D.
     """
     ng     = len(inputs.m_splits)
     device = inputs.act_data.device
 
     # Expand per-expert weight scale to per-row, then fold in activation scale.
+    # act_ts = amax_row / (448*6), wgt_ts = amax_expert / (448*6) — both already normalized.
     ts_b    = torch.repeat_interleave(
         inputs.wgt_ts,
         torch.tensor(inputs.m_splits, device=device),
     )
-    pts_eff = (inputs.act_ts * ts_b / _NVFP4_FACTOR).contiguous()
+    pts_eff = (inputs.act_ts * ts_b).contiguous()
 
     total_m = inputs.act_data.shape[0]
     n       = inputs.wgt_data.shape[0] // ng

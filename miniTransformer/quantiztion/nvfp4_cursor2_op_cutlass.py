@@ -180,7 +180,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.WEIGHT:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_tensor_global_packed
 
-            gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1])
+            gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1], skip_cute_data=True)
             device = gw.data.device
             n, k = x.shape[1], x.shape[2]
 

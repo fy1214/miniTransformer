@@ -479,6 +479,7 @@ def group_quantize_nvfp4_tensor_global_packed(
     *,
     four_six: bool = False,
     scale_override: float = 1.0,
+    skip_cute_data: bool = False,
 ) -> GroupWeightQuantizeResult:
     """Quantize all MoE expert weights in one kernel launch.
 
@@ -531,12 +532,15 @@ def group_quantize_nvfp4_tensor_global_packed(
     # Build one CUTE int8 buffer for all experts: [total_n * k] int8.
     # Each expert occupies n_per_expert*k bytes: first half is FP4 data, second half zeros.
     # cute_fp4_for(g) = cute_data[g*n*k : (g+1)*n*k], so each expert must be interleaved.
-    cute_data = torch.zeros(total_n * k, dtype=torch.int8, device=device)
-    n_per_expert = total_n // num_experts
-    for g in range(num_experts):
-        src = data[g * n_per_expert: (g + 1) * n_per_expert].reshape(-1).view(torch.int8)
-        dst_start = g * n_per_expert * k
-        cute_data[dst_start: dst_start + n_per_expert * k // 2].copy_(src)
+    if skip_cute_data:
+        cute_data = None
+    else:
+        cute_data = torch.zeros(total_n * k, dtype=torch.int8, device=device)
+        n_per_expert = total_n // num_experts
+        for g in range(num_experts):
+            src = data[g * n_per_expert: (g + 1) * n_per_expert].reshape(-1).view(torch.int8)
+            dst_start = g * n_per_expert * k
+            cute_data[dst_start: dst_start + n_per_expert * k // 2].copy_(src)
 
     nMT = n_padded // _MMA_TILE_ROWS
     nKT = k // 64

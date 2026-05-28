@@ -171,6 +171,8 @@ def grouped_nvfp4_cutlass_gemm_per_token_scale(
 
 # Persistent buffers keyed by (max_groups, device).
 _v2_buf_cache: dict = {}
+# Output tensor cache keyed by (total_m, n, dtype, device) — avoids cudaMemGetInfo on every call.
+_v2_D_cache: dict = {}
 
 
 def _get_v2_buffers(max_groups: int, device):
@@ -227,20 +229,24 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
     _NVFP4_FACTOR division is applied here.
     The kernel applies pts_eff row-wise to the raw GEMM output before writing D.
     """
-    ng     = len(inputs.m_splits)
-    device = inputs.act_data.device
+    ng      = len(inputs.m_splits)
+    device  = inputs.act_data.device
+    total_m = inputs.act_data.shape[0]
+    n       = inputs.wgt_data.shape[0] // ng
 
     # Expand per-expert weight scale to per-row, then fold in activation scale.
     # act_ts = amax_row / (448*6), wgt_ts = amax_expert / (448*6) — both already normalized.
     ts_b    = torch.repeat_interleave(
         inputs.wgt_ts,
         torch.tensor(inputs.m_splits, device=device),
+        output_size=total_m,
     )
     pts_eff = (inputs.act_ts * ts_b).contiguous()
 
-    total_m = inputs.act_data.shape[0]
-    n       = inputs.wgt_data.shape[0] // ng
-    D       = torch.empty(total_m, n, dtype=out_dtype, device=device)
+    D_key = (total_m, n, out_dtype, str(device))
+    if D_key not in _v2_D_cache:
+        _v2_D_cache[D_key] = torch.empty(total_m, n, dtype=out_dtype, device=device)
+    D = _v2_D_cache[D_key]
 
     buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = _get_v2_buffers(ng, device)
 

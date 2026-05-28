@@ -36,7 +36,7 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
     def __init__(self):
         super().__init__()
-        self.should_update_quantize_weights = True
+        self.should_update_quantize_weights = False
         # Cached quantizers — rebuilt only when num_gemms changes.
         self._cached_num_gemms: int = 0
         self._w_quantizers_fp8: List = []   # rowwise=False, columnwise=True
@@ -215,10 +215,13 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.X:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
 
-            gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+            gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits, skip_scale_views=True)
             device = gq.data.device
 
-            quantize_tensor_list = tex.split_quantize(x, m_splits, self._x_quantizers)
+            if return_transpose:
+                quantize_tensor_list = tex.split_quantize(x, m_splits, self._x_quantizers)
+            else:
+                quantize_tensor_list = []
             return GroupQuantizeResult(
                 data=[gq],
                 scale=[gq],
@@ -288,11 +291,10 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             and extra_info_B is not None
         ):
             ng = len(m_splits)
-            prob_host = torch.zeros(ng * 3, dtype=torch.int32)
-            for g in range(ng):
-                prob_host[g * 3 + 0] = m_splits[g]
-                prob_host[g * 3 + 1] = extra_info_B["n"]
-                prob_host[g * 3 + 2] = extra_info_B["k"]
+            n, k = extra_info_B["n"], extra_info_B["k"]
+            prob_host = torch.tensor(
+                [[m, n, k] for m in m_splits], dtype=torch.int32
+            ).reshape(-1)
             inputs = V2GemmInputs(
                 act_data=extra_info_A["data"],
                 act_sf=extra_info_A["scale_flat"],

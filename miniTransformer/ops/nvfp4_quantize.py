@@ -366,6 +366,7 @@ def group_quantize_nvfp4_pertoken_swizzled(
     *,
     four_six: bool = False,
     scale_override: float = 1.0,
+    skip_scale_views: bool = False,
 ) -> GroupQuantizeSwizzledResult:
     """Grouped per-token NVFP4 quantization with per-group tcgen05 swizzled scales.
 
@@ -425,16 +426,19 @@ def group_quantize_nvfp4_pertoken_swizzled(
     fn(data, scale_flat, global_scale, x, row_offsets_gpu, scale_offsets_gpu, scale_override)
 
     nKT = k // 64
-    scale_views: List[torch.Tensor] = []
-    for g, m_i in enumerate(m_splits):
-        if m_i == 0:
-            scale_views.append(None)
-            continue
-        m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-        nMT  = m_padded // _MMA_TILE_ROWS
-        sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
-        view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
-        scale_views.append(view)
+    if skip_scale_views:
+        scale_views = []
+    else:
+        scale_views: List[torch.Tensor] = []
+        for g, m_i in enumerate(m_splits):
+            if m_i == 0:
+                scale_views.append(None)
+                continue
+            m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+            nMT  = m_padded // _MMA_TILE_ROWS
+            sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
+            view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
+            scale_views.append(view)
 
     return GroupQuantizeSwizzledResult(
         data=data,

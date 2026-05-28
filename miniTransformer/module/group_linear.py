@@ -109,11 +109,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
 
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
-        # If the cache was filled during a no_grad forward (data_t=[]) but this
-        # forward needs transpose for backward, force a re-quantize so qw_t is valid.
-        need_transpose = is_grad_enabled and not disable_backward_quant
-        if not update_fp8_weights and need_transpose and not weight_qresult_cache.data_t:
-            update_fp8_weights = True
 
         if quantize_op.should_update_quantize_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
@@ -122,7 +117,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                     w,
                     qlinear_params.w_params,
                     m_splits=m_splits,
-                    return_transpose=(is_grad_enabled and not disable_backward_quant)
+                    return_transpose=(not disable_backward_quant)
                 )
             qw = qresult_w_list.data
             sw = qresult_w_list.scale
@@ -137,10 +132,10 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                     w,
                     qlinear_params.w_params,
                     m_splits=m_splits,
-                    return_transpose=(is_grad_enabled and not disable_backward_quant)
+                    return_transpose=(not disable_backward_quant)
                 )
-            qw = weight_qresult_cache.data = qresult_w_list.data
             sw = weight_qresult_cache.scale = qresult_w_list.scale
+            qw = weight_qresult_cache.data = qresult_w_list.data
             qw_t = weight_qresult_cache.data_t = qresult_w_list.data_t
             sw_t = weight_qresult_cache.scale_t = qresult_w_list.scale_t
             tw = weight_qresult_cache.global_amax_row = qresult_w_list.tensor_scale

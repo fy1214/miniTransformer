@@ -83,12 +83,12 @@ static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
-using MmaTileShape  = Shape<_128, _128, _256>;
+using MmaTileShape  = Shape<_256, _256, _256>;
 // Runtime cluster shape (required for grouped GEMM hw_info path)
 using ClusterShape  = Shape<int32_t, int32_t, _1>;
 
-using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100;
-using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100;
+using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
 
 using CollectiveEpilogue =
     typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -247,8 +247,8 @@ void grouped_cutlass_gemm_with_per_token_scale(
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = A_list[0].device().index();
     hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-    hw_info.cluster_shape          = dim3(1, 1, 1);
-    hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+    hw_info.cluster_shape          = dim3(2, 1, 1);
+    hw_info.cluster_shape_fallback = dim3(2, 1, 1);
 
     // ------------------------------------------------------------------
     // Build CUTLASS Arguments and run Grouped GEMM
@@ -280,15 +280,4 @@ void grouped_cutlass_gemm_with_per_token_scale(
 
     CUTLASS_CHECK(gemm.initialize(arguments, workspace.get(), stream));
     CUTLASS_CHECK(gemm.run(arguments, workspace.get(), stream));
-
-    // ------------------------------------------------------------------
-    // Apply per-token scale per group (same stream)
-    // ------------------------------------------------------------------
-    for (int i = 0; i < groups; ++i) {
-        int M = static_cast<int>(A_list[i].size(0));
-        int N = static_cast<int>(B_list[i].size(0));
-        ElementD* D_ptr    = static_cast<ElementD*>(D_list[i].data_ptr());
-        const float* s_ptr = static_cast<const float*>(per_token_scale_list[i].data_ptr());
-        launch_per_token_scale(D_ptr, s_ptr, M, N, stream);
-    }
 }

@@ -97,6 +97,14 @@ quantize_tg(float abs_max, float inv_val_max, float scale, bf16x8& x)
 
 // NumCandidates=1 : RTN  (FP4 max value = 6)
 // NumCandidates=2 : Round-4-or-6  (picks lower L2-error candidate)
+//
+// Shared memory layout (two independent regions to guarantee float alignment):
+//   Region A (bf16): rows_per_block * (nvecs_per_row + 1) * sizeof(bf16)
+//     row r uses bf16_smem[r * (nvecs_per_row + 1) .. + nvecs_per_row]
+//   Region B (float, 4-byte aligned): rows_per_block * 2 * sizeof(float)
+//     row r uses float_smem[r * 2]   = scale
+//              float_smem[r * 2 + 1] = global_encode_scale
+//   Region A size is rounded up to 4-byte boundary before Region B starts.
 template<int NumCandidates>
 __global__ void fp4_group_pertoken_kernel(
     __nv_fp4x4_e2m1*    __restrict__ y_ptr,
@@ -112,27 +120,30 @@ __global__ void fp4_group_pertoken_kernel(
     int    warps_per_row,
     int    rows_per_block,
     int    total_rows,
-    int    grid_stride)       // gridDim.x * rows_per_block
+    int    grid_stride,       // gridDim.x * rows_per_block
+    int    bf16_region_floats)// byte offset (in floats) where Region B starts
 {
-    // smem[r * (nvecs_per_row+1) .. +nvecs_per_row]: bf16 partial abs-max for row r
-    extern __shared__ nv_bfloat16 smem[];
+    extern __shared__ float smem_raw[];
+    // Region A: bf16 abs-max reduce buffers
+    nv_bfloat16* bf16_smem = reinterpret_cast<nv_bfloat16*>(smem_raw);
+    // Region B: float broadcast (scale, ges) — starts at 4-byte aligned offset
+    float*        f_smem   = smem_raw + bf16_region_floats;
 
     const int flat_tid    = static_cast<int>(threadIdx.x);
     const int warp_id     = flat_tid / 32;
     const int lane_id     = flat_tid % 32;
-    const int local_row   = warp_id / warps_per_row;   // row index within block [0, rows_per_block)
+    const int local_row   = warp_id / warps_per_row;
     const int warp_in_row = warp_id % warps_per_row;
-    const int tid         = warp_in_row * 32 + lane_id; // logical thread within a row [0, nvecs_per_row)
+    const int tid         = warp_in_row * 32 + lane_id;
 
-    // Sentinel slot index for this row's smem segment.
-    const int smem_base = local_row * (nvecs_per_row + 1);
+    const int smem_base = local_row * (nvecs_per_row + 1);  // bf16 slot base for this row
 
     // Outer grid-stride loop.
     for (int base_row = blockIdx.x * rows_per_block;
          base_row < total_rows;
          base_row += grid_stride)
     {
-        const int row       = base_row + local_row;
+        const int row        = base_row + local_row;
         const bool valid_row = row < total_rows;
         const bool valid_vec = valid_row && (tid < nvecs_per_row);
 
@@ -154,52 +165,49 @@ __global__ void fp4_group_pertoken_kernel(
         }
 
         // ---- Step 1: per-row abs-max via shared-memory tree reduce ----
-        smem[smem_base + tid] = valid_vec ? local_abs_max : __float2bfloat16(0.f);
-        // Sentinel for odd nvecs_per_row: must be written before first sync.
+        bf16_smem[smem_base + tid] = valid_vec ? local_abs_max : __float2bfloat16(0.f);
         if (tid == nvecs_per_row - 1 || (!valid_vec && tid == nvecs_per_row))
-            smem[smem_base + nvecs_per_row] = __float2bfloat16(0.f);
+            bf16_smem[smem_base + nvecs_per_row] = __float2bfloat16(0.f);
         __syncthreads();
 
         for (int stride = nvecs_per_row / 2; stride >= 2; stride /= 2) {
             if (valid_row && tid < stride) {
-                nv_bfloat162 a = make_bfloat162(smem[smem_base + tid],          smem[smem_base + tid + 1]);
-                nv_bfloat162 b = make_bfloat162(smem[smem_base + tid + stride], smem[smem_base + tid + stride + 1]);
+                nv_bfloat162 a = make_bfloat162(bf16_smem[smem_base + tid],          bf16_smem[smem_base + tid + 1]);
+                nv_bfloat162 b = make_bfloat162(bf16_smem[smem_base + tid + stride], bf16_smem[smem_base + tid + stride + 1]);
                 nv_bfloat162 m;
                 __asm__ volatile(
                     "max.xorsign.abs.bf16x2 %0, %1, %2;"
                     : "=r"(reinterpret_cast<int&>(m))
                     : "r"(reinterpret_cast<int&>(a)), "r"(reinterpret_cast<int&>(b)));
-                smem[smem_base + tid]     = m.x;
-                smem[smem_base + tid + 1] = m.y;
+                bf16_smem[smem_base + tid]     = m.x;
+                bf16_smem[smem_base + tid + 1] = m.y;
             }
             __syncthreads();
         }
 
-        // tid==0 of each row finishes the reduce and writes scale back to smem[smem_base]
-        // (reused as float broadcast slot) and smem[smem_base+1] for global_encode_scale.
+        // tid==0 of each row: finish reduce, write scale + ges to Region B (float, aligned).
         if (valid_row && tid == 0) {
             int last_stride = nvecs_per_row / 2;
             while (last_stride / 2 >= 2) last_stride /= 2;
-            nv_bfloat16 amax_bf = __habs(smem[smem_base]);
+            nv_bfloat16 amax_bf = __habs(bf16_smem[smem_base]);
             for (int j = 1; j < last_stride; j++)
-                amax_bf = __hmax(amax_bf, __habs(smem[smem_base + j]));
+                amax_bf = __hmax(amax_bf, __habs(bf16_smem[smem_base + j]));
             float row_amax = static_cast<float>(amax_bf);
 
             constexpr float SCALES_MAX = (NumCandidates > 1) ? 256.0f : 448.0f;
             constexpr float FP4_MAX    = 6.0f;
             float ges = (row_amax == 0.f) ? 1.f : (SCALES_MAX * FP4_MAX) / row_amax;
             float s   = (row_amax == 0.f) ? scale_override : scale_override / ges;
-            global_scale_ptr[row] = s;
-            // Reuse first two bf16 slots as float broadcast (16-byte aligned smem_base).
-            reinterpret_cast<float*>(&smem[smem_base])[0] = s;
-            reinterpret_cast<float*>(&smem[smem_base])[1] = ges;
+            global_scale_ptr[row]        = s;
+            f_smem[local_row * 2 + 0]   = s;
+            f_smem[local_row * 2 + 1]   = ges;
         }
         __syncthreads();
 
         if (!valid_row) continue;
 
-        const float scale               = reinterpret_cast<float*>(&smem[smem_base])[0];
-        const float global_encode_scale = reinterpret_cast<float*>(&smem[smem_base])[1];
+        const float scale               = f_smem[local_row * 2 + 0];
+        const float global_encode_scale = f_smem[local_row * 2 + 1];
 
         if (!valid_vec) continue;
 
@@ -275,19 +283,25 @@ static void launch_fp4_group_pertoken(
     const int grid_dim       = min(natural_grid, MAX_BLOCKS_GP);
     const int grid_stride    = grid_dim * rows_per_block;
     const int cdiv16         = static_cast<int>(cols / 16);
-    // smem: rows_per_block * (nvecs_per_row + 1) bf16 elements.
-    const size_t smem = static_cast<size_t>(rows_per_block) * (nvecs_per_row + 1) * sizeof(nv_bfloat16);
+    // Region A: rows_per_block * (nvecs_per_row + 1) bf16, rounded up to 4-byte boundary.
+    // Region B: rows_per_block * 2 float (4-byte aligned, starts right after Region A).
+    const size_t bf16_bytes       = static_cast<size_t>(rows_per_block) * (nvecs_per_row + 1) * sizeof(nv_bfloat16);
+    const size_t bf16_bytes_align = (bf16_bytes + 3) & ~size_t(3);  // round up to 4 bytes
+    const int    bf16_region_floats = static_cast<int>(bf16_bytes_align / sizeof(float));
+    const size_t smem             = bf16_bytes_align + static_cast<size_t>(rows_per_block) * 2 * sizeof(float);
 
     if (num_candidates == 2)
         fp4_group_pertoken_kernel<2><<<grid_dim, block_dim, smem, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);
+            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride,
+            bf16_region_floats);
     else
         fp4_group_pertoken_kernel<1><<<grid_dim, block_dim, smem, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);
+            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride,
+            bf16_region_floats);
 
     CUDA_CHECK(cudaGetLastError());
 }

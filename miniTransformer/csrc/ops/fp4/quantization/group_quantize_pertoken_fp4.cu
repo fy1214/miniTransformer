@@ -55,7 +55,7 @@ struct QuantResultGP {
 __device__ __forceinline__ QuantResultGP
 quantize_gp(float abs_max, float val_max, float global_encode_scale, float scale, bf16x8& x)
 {
-    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(fminf((abs_max / val_max) * global_encode_scale, 448.0f));
+    __nv_fp8_e4m3 s_as_fp8 = static_cast<__nv_fp8_e4m3>(fminf(abs_max * (1.0f / val_max) * global_encode_scale, 448.0f));
     float s_round_fp8  = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
@@ -204,17 +204,20 @@ __global__ void fp4_group_pertoken_kernel(
         }
         __syncthreads();
 
+        // ---- Step 2: per-group (16-element) abs-max ----
+        // Must be called by ALL threads in the warp (before any continue that
+        // would cause divergence). OOB threads have local_abs_max==0, which is
+        // the neutral element for max, so valid threads get correct results.
+        nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
+        float full_abs_max = static_cast<float>(
+            __hmax(__habs(local_abs_max), __habs(other_abs_max)));
+
         if (!valid_row) continue;
 
         const float scale               = f_smem[local_row * 2 + 0];
         const float global_encode_scale = f_smem[local_row * 2 + 1];
 
         if (!valid_vec) continue;
-
-        // ---- Step 2: per-group (16-element) abs-max ----
-        nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
-        float full_abs_max = static_cast<float>(
-            __hmax(__habs(local_abs_max), __habs(other_abs_max)));
 
         // ---- Step 3: quantize (RTN or Round-4-or-6) ----
         QuantResultGP res;
@@ -453,15 +456,20 @@ __global__ void fp4_group_tensor_global_kernel(
 
         const float scale = smem_f[local_row * 2 + 0];
 
-        if (!valid_vec) continue;
+        // Load 8 bf16 values (OOB threads load zero).
+        bf16x8 x{};
+        nv_bfloat16 local_abs_max = __float2bfloat16(0.f);
+        if (valid_vec) {
+            x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
+            local_abs_max = vecReduceAbsMax(x);
+        }
 
-        // Load 8 bf16 values.
-        bf16x8 x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
-
-        // Per-group-of-16 abs-max (pair of adjacent threads).
-        nv_bfloat16 local_abs_max = vecReduceAbsMax(x);
+        // Per-group-of-16 abs-max: must be called by all warp threads uniformly.
+        // OOB threads contribute 0 (neutral for max), so valid threads are unaffected.
         nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
         float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
+
+        if (!valid_vec) continue;
 
         // Quantize using reciprocal_approximate_ftz path (bit-exact with rtn_fp4).
         QuantResultGP res;

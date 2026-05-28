@@ -109,6 +109,11 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
 
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
+        # If the cache was filled during a no_grad forward (data_t=[]) but this
+        # forward needs transpose for backward, force a re-quantize so qw_t is valid.
+        need_transpose = is_grad_enabled and not disable_backward_quant
+        if not update_fp8_weights and need_transpose and not weight_qresult_cache.data_t:
+            update_fp8_weights = True
 
         if quantize_op.should_update_quantize_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]

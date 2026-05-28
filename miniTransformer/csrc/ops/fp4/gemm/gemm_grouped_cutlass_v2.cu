@@ -73,27 +73,29 @@ __global__ void per_token_scale_kernel_v2(
 
     constexpr int VEC = 8;
     const int n_vec = N / VEC;
-    struct alignas(16) Vec8 { __nv_bfloat162 h[4]; };
 
     // Grid-stride over rows: each CTA processes ceil(total_M / gridDim.x) rows.
     for (int m = blockIdx.x; m < total_M; m += gridDim.x) {
         const float s = __ldcs(&scale[m]);
         const __nv_bfloat162 s2 = __float2bfloat162_rn(s);
 
-        Vec8* row_v = reinterpret_cast<Vec8*>(D + (int64_t)m * N);
+        // uint4 is a CUDA built-in (128-bit), supported by __ldcs/__stcs.
+        // Reinterpret as 4x __nv_bfloat162 for the multiply.
+        uint4* row_v = reinterpret_cast<uint4*>(D + (int64_t)m * N);
         for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-            Vec8 v = __ldcs(&row_v[i]);
-            v.h[0] = __hmul2(v.h[0], s2);
-            v.h[1] = __hmul2(v.h[1], s2);
-            v.h[2] = __hmul2(v.h[2], s2);
-            v.h[3] = __hmul2(v.h[3], s2);
+            uint4 v = __ldcs(&row_v[i]);
+            __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&v);
+            h[0] = __hmul2(h[0], s2);
+            h[1] = __hmul2(h[1], s2);
+            h[2] = __hmul2(h[2], s2);
+            h[3] = __hmul2(h[3], s2);
             __stcs(&row_v[i], v);
         }
 
-        // Tail: remaining elements when N % 8 != 0
+        // Tail: remaining elements when N % 8 != 0 (typically 0 for N=4096).
         T* row = D + (int64_t)m * N;
         for (int n = n_vec * VEC + threadIdx.x; n < N; n += blockDim.x)
-            row[n] = static_cast<T>(static_cast<float>(__ldcs(&row[n])) * s);
+            row[n] = static_cast<T>(static_cast<float>(row[n]) * s);
     }
 }
 

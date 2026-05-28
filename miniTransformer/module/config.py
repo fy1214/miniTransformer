@@ -104,6 +104,7 @@ class QuantizeRecipe(enum.Enum):
     FP4_SUB_CHANNEL_CURSOR2 = "fp4_subchannel_scaling_cursor2"
     FP4_SUB_CHANNEL_CURSOR2_REF = "fp4_subchannel_scaling_cursor2_ref"
     FP4_SUB_CHANNEL_CURSOR2_CUTLASS = "fp4_subchannel_scaling_cursor2_cutlass"
+    FP4_SUB_CHANNEL_W4A16 = "fp4_subchannel_scaling_w4a16"
 
 
 def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:

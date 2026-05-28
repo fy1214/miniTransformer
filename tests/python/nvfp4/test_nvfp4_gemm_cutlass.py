@@ -13,8 +13,18 @@ from miniTransformer.ops.nvfp4_qgemm import (
     initialize_nvfp4_for_qgemm,
     swizzle_scale,
 )
+from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend
 
-import fp4_gemm
+
+@pytest.fixture(scope="session")
+def backend_name() -> str:
+    return os.environ.get("GEMM_BACKEND", "cutlass")
+
+
+@pytest.fixture(scope="session")
+def backend(backend_name):
+    return dispatch_gemm_backend(backend_name, "nvfp4")
+
 
 DEEPGEMM_NORMAL_ONLY_PARAMS = [
     pytest.param(128, 16384, 7168, id="deepgemm_2"),
@@ -59,7 +69,7 @@ class TestCutlassNvfp4Gemm:
     @pytest.mark.parametrize("seed", [1234])
     @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
     @pytest.mark.parametrize("nvfp4_cuda_device", ["cuda:7"])
-    def test_cutlass_nvfp4_matches_ref(self, M, K, N, seed, out_dtype, nvfp4_cuda_device):
+    def test_cutlass_nvfp4_matches_ref(self, M, K, N, seed, out_dtype, nvfp4_cuda_device, backend, backend_name):
         warmup = 10
         bench_iters = 100
 
@@ -94,32 +104,26 @@ class TestCutlassNvfp4Gemm:
         sx_4d = swizzle_scale(sx, M, K)  # (M//128, K//64, 32, 16)
         sw_4d = swizzle_scale(sw, N, K)  # (N//128, K//64, 32, 16)
 
-        D_cutlass = torch.empty((M, N), device=device, dtype=out_dtype)
-
         factor = 6.0 * 6.0 * 448.0 * 448.0
         alpha = (global_amax_qx * global_amax_qw).to(torch.float32).squeeze(-1).item() / factor
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
 
         for _ in range(warmup):
-            fp4_gemm.cutlass_gemm(
-                D_cutlass,
-                qx,
-                qw,
-                sx_4d,
-                sw_4d,
-                alpha,
+            D_cutlass = backend.gemm(
+                qx, qw, out_dtype,
+                sx_4d, sw_4d,
+                None, None, False, False, "TN",
+                alpha, None, None, True,
             )
             _sync_cuda_device(device)
 
         start = time.time()
         for _ in range(bench_iters):
-            fp4_gemm.cutlass_gemm(
-                D_cutlass,  # output
-                qx,         # A：uint8 packed NVFP4
-                qw,         # B：uint8 packed NVFP4
-                sx_4d,      # A_sf：block‑scaled scale for A
-                sw_4d,      # B_sf：block‑scaled scale for B
-                alpha,      # alpha
+            D_cutlass = backend.gemm(
+                qx, qw, out_dtype,
+                sx_4d, sw_4d,
+                None, None, False, False, "TN",
+                alpha, None, None, True,
             )
         _sync_cuda_device(device)
         cutlass_time = (time.time() - start) / bench_iters
@@ -135,9 +139,9 @@ class TestCutlassNvfp4Gemm:
         abs_diff = (y_ref_f32 - y_cutlass_f32).abs()
         rel_diff = abs_diff / (y_ref_f32.abs() + 1e-8)
 
-        print(f"\nCutlass NVFP4 GEMM device={device} M={M}, K={K}, N={N}, seed={seed}")
+        print(f"\nNVFP4 GEMM backend={backend_name} device={device} M={M}, K={K}, N={N}, seed={seed}")
         print(
-            f"  Cutlass time (avg over {bench_iters} iters, "
+            f"  [{backend_name}] time (avg over {bench_iters} iters, "
             f"warmup={warmup}): {cutlass_time * 1e6:.3f} us"
         )
         print(f"  Max abs diff: {abs_diff.max().item():.6f}")

@@ -65,22 +65,52 @@
 // Per-token scale: D[m][n] *= scale[m].
 // Persistent kernel: fixed grid = sm_count * TILES_PER_SM, each CTA iterates over
 // multiple rows via grid-stride loop.  Keeps all SMs busy regardless of total_M.
+//
+// sm_100+ (Blackwell): uses 256-bit ld/st.global.cs.v4.u64 (16 bf16 per iteration).
+// older arch: falls back to 128-bit uint4 ld/st.global.cs (8 bf16 per iteration).
 template <typename T>
 __global__ void per_token_scale_kernel_v2(
     T* __restrict__ D, const float* __restrict__ scale, int total_M, int N)
 {
     static_assert(sizeof(T) == 2, "per_token_scale_kernel_v2 requires 2-byte element type");
 
+#if __CUDA_ARCH__ >= 1000
+    // 256-bit path: v4.u64 load/store via __align__(32) struct — 16 bf16 per iteration.
+    // Compiler emits ld.global.v4.u64 / st.global.v4.u64 automatically when the
+    // struct is 32-byte aligned and __restrict__ is used.
+    struct __align__(32) u256 { uint64_t x, y, z, w; };
+    constexpr int VEC = 16;
+    const int n_vec = N / VEC;
+
+    for (int m = blockIdx.x; m < total_M; m += gridDim.x) {
+        const float s           = __ldcs(&scale[m]);
+        const __nv_bfloat162 s2 = __float2bfloat162_rn(s);
+
+        u256* __restrict__ row = reinterpret_cast<u256*>(D + (int64_t)m * N);
+        for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+            u256 v = row[i];
+            __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&v);
+            h[0] = __hmul2(h[0], s2); h[1] = __hmul2(h[1], s2);
+            h[2] = __hmul2(h[2], s2); h[3] = __hmul2(h[3], s2);
+            h[4] = __hmul2(h[4], s2); h[5] = __hmul2(h[5], s2);
+            h[6] = __hmul2(h[6], s2); h[7] = __hmul2(h[7], s2);
+            row[i] = v;
+        }
+        // Tail: remaining elements when N % 16 != 0.
+        T* rowb = D + (int64_t)m * N;
+        for (int n = n_vec * VEC + threadIdx.x; n < N; n += blockDim.x)
+            rowb[n] = static_cast<T>(static_cast<float>(rowb[n]) * s);
+    }
+#else
+    // 128-bit path: uint4 __ldcs/__stcs — 8 bf16 per iteration.
     constexpr int VEC = 8;
     const int n_vec = N / VEC;
 
-    // Grid-stride over rows: each CTA processes ceil(total_M / gridDim.x) rows.
     for (int m = blockIdx.x; m < total_M; m += gridDim.x) {
-        const float s = __ldcs(&scale[m]);
+        const float s           = __ldcs(&scale[m]);
         const __nv_bfloat162 s2 = __float2bfloat162_rn(s);
 
         // uint4 is a CUDA built-in (128-bit), supported by __ldcs/__stcs.
-        // Reinterpret as 4x __nv_bfloat162 for the multiply.
         uint4* row_v = reinterpret_cast<uint4*>(D + (int64_t)m * N);
         for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
             uint4 v = __ldcs(&row_v[i]);
@@ -97,6 +127,7 @@ __global__ void per_token_scale_kernel_v2(
         for (int n = n_vec * VEC + threadIdx.x; n < N; n += blockDim.x)
             row[n] = static_cast<T>(static_cast<float>(row[n]) * s);
     }
+#endif
 }
 
 #define CUTLASS_CHECK(status)                       \

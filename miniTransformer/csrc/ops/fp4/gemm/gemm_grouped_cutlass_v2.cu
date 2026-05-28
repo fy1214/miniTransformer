@@ -48,7 +48,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <vector>
-#include <unordered_map>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -62,39 +61,15 @@
 
 #include "../../../ops.h"
 
-// Per-token scale: D[m][n] *= scale[m].
-// Persistent kernel: fixed grid = sm_count * TILES_PER_SM, each CTA iterates over
-// multiple rows via grid-stride loop.  Keeps all SMs busy regardless of total_M.
+// Per-token scale: D[m][n] *= scale[m], one CTA per row.
 template <typename T>
-__global__ void per_token_scale_kernel_v2(
-    T* __restrict__ D, const float* __restrict__ scale, int total_M, int N)
+__global__ void per_token_scale_kernel_v2(T* __restrict__ D, const float* __restrict__ scale, int N)
 {
-    static_assert(sizeof(T) == 2, "per_token_scale_kernel_v2 requires 2-byte element type");
-
-    constexpr int VEC = 8;
-    const int n_vec = N / VEC;
-    struct alignas(16) Vec8 { __nv_bfloat162 h[4]; };
-
-    // Grid-stride over rows: each CTA processes ceil(total_M / gridDim.x) rows.
-    for (int m = blockIdx.x; m < total_M; m += gridDim.x) {
-        const float s = __ldcs(&scale[m]);
-        const __nv_bfloat162 s2 = __float2bfloat162_rn(s);
-
-        Vec8* row_v = reinterpret_cast<Vec8*>(D + (int64_t)m * N);
-        for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
-            Vec8 v = __ldcs(&row_v[i]);
-            v.h[0] = __hmul2(v.h[0], s2);
-            v.h[1] = __hmul2(v.h[1], s2);
-            v.h[2] = __hmul2(v.h[2], s2);
-            v.h[3] = __hmul2(v.h[3], s2);
-            __stcs(&row_v[i], v);
-        }
-
-        // Tail: remaining elements when N % 8 != 0
-        T* row = D + (int64_t)m * N;
-        for (int n = n_vec * VEC + threadIdx.x; n < N; n += blockDim.x)
-            row[n] = static_cast<T>(static_cast<float>(__ldcs(&row[n])) * s);
-    }
+    const int m = blockIdx.x;
+    const float s = scale[m];
+    T* row = D + (int64_t)m * N;
+    for (int n = threadIdx.x; n < N; n += blockDim.x)
+        row[n] = static_cast<T>(static_cast<float>(row[n]) * s);
 }
 
 #define CUTLASS_CHECK(status)                       \
@@ -243,24 +218,6 @@ __global__ void fill_grouped_gemm_args_kernel(
 } // namespace v2
 
 // ---------------------------------------------------------------------------
-// Persistent Gemm instance cache keyed by (num_groups, device_id).
-// initialize() builds TMA descriptors from TileShape constants only
-// (grouped GEMM uses nullptr for actual pointers, filled on-device later),
-// so the result is identical across calls with the same num_groups/device.
-// We keep the Gemm object alive and skip initialize() on subsequent calls.
-// ---------------------------------------------------------------------------
-struct GemmCacheEntry {
-    v2::Gemm gemm;
-    bool initialized = false;
-};
-
-static std::unordered_map<int64_t, GemmCacheEntry> s_gemm_cache;
-
-static inline int64_t gemm_cache_key(int num_groups, int device_id) {
-    return (int64_t)device_id * 100000 + num_groups;
-}
-
-// ---------------------------------------------------------------------------
 // Helper: return buffer sizes required by grouped_cutlass_gemm_v2.
 // Call once to allocate persistent tensors on the Python side.
 // Returns a dict: { "ptrs": int, "strides": int, "layouts": int }  (bytes)
@@ -399,30 +356,21 @@ void grouped_cutlass_gemm_v2(
     arguments.epilogue.thread.beta  = ElementAccumulator(0);
 
     // ------------------------------------------------------------------
-    // Step 3: initialize (first call only) + run
+    // Step 3: initialize + run (workspace reused, no cudaMalloc)
     // ------------------------------------------------------------------
-    int64_t key = gemm_cache_key(num_groups, A.device().index());
-    auto& entry = s_gemm_cache[key];
-    if (!entry.initialized) {
-        CUTLASS_CHECK(entry.gemm.can_implement(arguments));
-        CUTLASS_CHECK(entry.gemm.initialize(arguments, workspace.data_ptr(), stream));
-        entry.initialized = true;
-    }
-    CUTLASS_CHECK(entry.gemm.run(arguments, workspace.data_ptr(), stream));
+    Gemm gemm;
+    CUTLASS_CHECK(gemm.can_implement(arguments));
+    CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+    CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
 
     // Optional per-token scale (same stream, no sync needed)
     if (per_token_scale.defined() && per_token_scale.numel() > 0) {
         const int total_M = static_cast<int>(D.size(0));
         const int N_out   = static_cast<int>(D.size(1));
-        // Persistent kernel: fix grid to sm_count * 4 so all SMs stay busy even
-        // when total_M is small (e.g. 64 tokens across 60 experts = ~1 token/expert).
-        // Each CTA processes ceil(total_M / grid_rows) rows via grid-stride loop.
-        const int threads   = 256;
-        const int sm_count  = hw_info.sm_count;  // already queried above
-        const int grid_rows = std::min(total_M, sm_count * 4);
-        per_token_scale_kernel_v2<v2::ElementD><<<grid_rows, threads, 0, stream>>>(
+        const int threads = std::min(N_out, 128);
+        per_token_scale_kernel_v2<v2::ElementD><<<total_M, threads, 0, stream>>>(
             static_cast<v2::ElementD*>(D.data_ptr()),
             static_cast<const float*>(per_token_scale.data_ptr()),
-            total_M, N_out);
+            N_out);
     }
 }

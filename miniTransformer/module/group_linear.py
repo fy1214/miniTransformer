@@ -72,9 +72,17 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         _prof_dir = os.environ.get("NVFP4_PROFILE_DIR", "")
         _prof_calls = int(os.environ.get("NVFP4_PROFILE_CALLS", "0"))
+        _prof_grad = os.environ.get("NVFP4_PROFILE_GRAD", "0") == "1"
         if not hasattr(_QuantizedGroupedLinear, "_prof_count"):
             _QuantizedGroupedLinear._prof_count = 0
-        _do_profile = bool(_prof_dir) and _dump_rank == 0 and _QuantizedGroupedLinear._prof_count < _prof_calls
+        # When NVFP4_PROFILE_GRAD=1, profiling is driven from GroupedLinear.forward
+        # to capture backward as well; skip starting the profiler here.
+        _do_profile = (
+            bool(_prof_dir)
+            and _dump_rank == 0
+            and _QuantizedGroupedLinear._prof_count < _prof_calls
+            and not _prof_grad
+        )
         if _do_profile:
             _prof = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -664,7 +672,44 @@ class GroupedLinear(LayerLinearBaseModule):
             self.disable_backward_quant,
             *weight_tensors,
         )
+
+        _prof_dir = os.environ.get("NVFP4_PROFILE_DIR", "")
+        _prof_calls = int(os.environ.get("NVFP4_PROFILE_CALLS", "0"))
+        _prof_grad = os.environ.get("NVFP4_PROFILE_GRAD", "0") == "1"
+        _prof_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        if not hasattr(GroupedLinear, "_grad_prof_count"):
+            GroupedLinear._grad_prof_count = 0
+        _do_grad_profile = (
+            _prof_grad
+            and bool(_prof_dir)
+            and _prof_rank == 0
+            and torch.is_grad_enabled()
+            and GroupedLinear._grad_prof_count < _prof_calls
+        )
+
+        if _do_grad_profile:
+            _gprof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+            _gprof.__enter__()
+
         out = linear_fn(*args)
+
+        if _do_grad_profile:
+            # Register backward hook to stop profiler after backward completes.
+            def _stop_prof(grad):
+                _gprof.__exit__(None, None, None)
+                print(_gprof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
+                os.makedirs(_prof_dir, exist_ok=True)
+                _trace = os.path.join(_prof_dir, f"gl_grad_trace_{GroupedLinear._grad_prof_count:03d}.json")
+                _gprof.export_chrome_trace(_trace)
+                print(f"[PROFILE] grad trace saved → {_trace}", flush=True)
+                GroupedLinear._grad_prof_count += 1
+                return grad
+            out.register_hook(_stop_prof)
 
         if self.gemm_bias_unfused_add:
             out_shape = out.shape

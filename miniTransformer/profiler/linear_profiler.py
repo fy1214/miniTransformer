@@ -101,6 +101,9 @@ class LinearStatsHook:
         self._module_attr: str | None = None
         # tensors stashed in fwd_pre for use in fwd_post and bwd hooks
         self._last_inp: torch.Tensor | None = None
+        self._last_weights: list[torch.Tensor] = []   # all weight params
+        self._last_m_splits: list[int] | None = None  # GroupedLinear token splits
+        # keep old alias for backward compat (bwd hooks reference it)
         self._last_weight: torch.Tensor | None = None
 
     @property
@@ -143,6 +146,8 @@ class LinearStatsHook:
         self._handles = []
         self._last_inp = None
         self._last_weight = None
+        self._last_weights = []
+        self._last_m_splits = None
         if self._module is not None:
             attr = getattr(self, "_module_attr", None)
             if attr and hasattr(self._module, attr):
@@ -154,45 +159,69 @@ class LinearStatsHook:
     # ------------------------------------------------------------------
 
     def _on_fwd_pre(self, module, inputs):
-        """Before forward: print inp, weight."""
+        """Before forward: print inp, weight(s)."""
         self._step_count += 1
         if not self._should_capture():
             return
         inp = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-        weight = next((p for p in module.parameters(recurse=False)), None)
+        # m_splits is inputs[1] for GroupedLinear
+        m_splits = None
+        if isinstance(inputs, (tuple, list)) and len(inputs) > 1 and isinstance(inputs[1], (list, tuple)):
+            m_splits = inputs[1]
+        # capture all 2-D+ weight params (skip 1-D norm params like layer_norm_weight)
+        weights = [p.detach() for p in module.parameters(recurse=False) if p.dim() >= 2]
         self._last_inp = inp.detach()
-        self._last_weight = weight.detach() if weight is not None else None
+        self._last_weights = weights
+        self._last_weight = weights[0] if weights else None
+        self._last_m_splits = list(m_splits) if m_splits is not None else None
 
         step = self._capture_count
         lines = [f"[TensorStats] {self.label}  step={step}  fwd_pre"]
-        lines.append(_fmt_stats("inp",    _tensor_stats(self._last_inp)))
-        if self._last_weight is not None:
-            lines.append(_fmt_stats("weight", _tensor_stats(self._last_weight)))
+        lines.append(_fmt_stats("inp", _tensor_stats(self._last_inp)))
+        if len(weights) == 1:
+            lines.append(_fmt_stats("weight", _tensor_stats(weights[0])))
+        elif len(weights) > 1:
+            lines.append(f"  weight   {len(weights)} params each {list(weights[0].shape)}  dtype={weights[0].dtype}")
+        if self._last_m_splits is not None:
+            lines.append(f"  m_splits {self._last_m_splits}  (sum={sum(self._last_m_splits)})")
         print("\n".join(lines), flush=True)
 
     def _on_fwd_post(self, module, inputs, output):
-        """After forward: print inp, weight, output."""
+        """After forward: print inp, weight(s), output."""
         if not self._should_capture():
             return
         step = self._capture_count
         lines = [f"[TensorStats] {self.label}  step={step}  fwd_post"]
         if self._last_inp is not None:
-            lines.append(_fmt_stats("inp",    _tensor_stats(self._last_inp)))
-        if self._last_weight is not None:
-            lines.append(_fmt_stats("weight", _tensor_stats(self._last_weight)))
+            lines.append(_fmt_stats("inp", _tensor_stats(self._last_inp)))
+        weights = self._last_weights
+        if len(weights) == 1:
+            lines.append(_fmt_stats("weight", _tensor_stats(weights[0])))
+        elif len(weights) > 1:
+            lines.append(f"  weight   {len(weights)} params each {list(weights[0].shape)}")
         out = output[0] if isinstance(output, (tuple, list)) else output
         if isinstance(out, torch.Tensor):
-            lines.append(_fmt_stats("output",  _tensor_stats(out)))
+            lines.append(_fmt_stats("output", _tensor_stats(out)))
         print("\n".join(lines), flush=True)
         if self.dump_dir is not None:
-            self._dump(self._last_inp,    f"step{step:04d}_inp")
-            self._dump(self._last_weight, f"step{step:04d}_weight")
-            self._dump(out if isinstance(out, torch.Tensor) else None,
-                       f"step{step:04d}_output")
+            self._dump(self._last_inp, f"step{step:04d}_inp")
+            for i, w in enumerate(weights):
+                suffix = f"step{step:04d}_weight" if len(weights) == 1 else f"step{step:04d}_weight_{i:03d}"
+                self._dump(w, suffix)
+            if self._last_m_splits is not None:
+                import json
+                os.makedirs(self.dump_dir, exist_ok=True)
+                path = os.path.join(self.dump_dir, f"{self.label}_step{step:04d}_m_splits.json")
+                with open(path, "w") as f:
+                    json.dump(self._last_m_splits, f)
+                print(f"[TensorStats] dumped → {path}", flush=True)
+            self._dump(out if isinstance(out, torch.Tensor) else None, f"step{step:04d}_output")
         if not self.with_backward:
             self._capture_count += 1
             self._last_inp = None
             self._last_weight = None
+            self._last_weights = []
+            self._last_m_splits = None
             if self.done:
                 self.detach()
 
@@ -239,6 +268,8 @@ class LinearStatsHook:
         self._capture_count += 1
         self._last_inp = None
         self._last_weight = None
+        self._last_weights = []
+        self._last_m_splits = None
         if self.done:
             self.detach()
 

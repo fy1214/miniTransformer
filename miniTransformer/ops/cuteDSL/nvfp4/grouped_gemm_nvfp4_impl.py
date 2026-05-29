@@ -21,6 +21,20 @@ import torch
 _timing_enabled: bool = False
 _last_timing_us: dict = {}
 
+# Diagnostic flag: set to True to bypass ALL in-memory caches (per-object weight
+# tensors, kernel alpha/stub/shape buffers).  Useful for isolating stale-cache bugs.
+# Enable via: import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl; _impl.NO_CACHE = True
+NO_CACHE: bool = False
+
+# Module-level GPU buffer caches — avoid repeated large mallocs on the hot path.
+# Keys are (k, device_str); values grow to the max seen size (never shrink).
+# Keyed by k (not by total_active_m*k) so we get at most one entry per k-dimension
+# (fc1 and fc2 have different k), preventing unbounded accumulation across steps.
+_a_fp4_buf_cache: dict = {}   # (k, device) → int8 flat tensor, size = max_seen_total_active_m * k
+# c_out is NOT cached across calls: each fc output is ~500-600 MB and holding it
+# permanently causes OOM when other large buffers (e.g. logits) are allocated later.
+_alpha_b_buf_cache: dict = {} # (max_groups, device) → float32 GPU tensor
+
 from miniTransformer.ops.nvfp4_qgemm import create_cute_scale_factor_tensor
 from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2, cast_to_fp4x2
 
@@ -81,6 +95,53 @@ class TensorGlobalNvfp4Tensor:
         self._cute_fp4 = _make_fp4_tensor_for_cutedsl(self.data_uint8, n, k, dev)
         self._cute_sfb = _make_cute_sf(self.block_scale_fp8, n, sf_k)
         return self
+
+
+@dataclass
+class PackedWeightNvfp4Tensor:
+    """All MoE expert weights packed into contiguous buffers for zero-copy grouped GEMM.
+
+    Produced by ``group_quantize_nvfp4_tensor_global_packed``.  A single instance
+    represents *all* experts for one layer (fc1 or fc2).  The grouped GEMM reads
+    per-expert slices via index rather than scattered pointers.
+
+    Fields:
+        cute_data    – [total_n * k] int8, CUTE layout (first half data, second half zero).
+                       cute_fp4_for(g) returns a zero-copy [n, k, 1] slice.
+        scale_flat   – flat FP8 block-scale buffer; expert g at scale_flat[scale_offsets[g]:].
+        global_scale – [num_experts] float32, per-expert alpha = amax / (448*6).
+        scale_views  – list[Tensor], one per expert, tcgen05-swizzled CUTE layout.
+        scale_offsets– list[int], cumulative FP8 element counts (len = num_experts+1).
+        row_offsets  – list[int], cumulative row counts (len = num_experts+1).
+        n_per_expert – int, rows per expert.
+        k            – int, column count.
+    """
+    cute_data:     torch.Tensor          # [total_n * k] int8, CUTE layout
+    scale_flat:    torch.Tensor
+    global_scale:  torch.Tensor          # shape [num_experts], same as alpha_b
+    scale_views:   list                  # list[Tensor], one CUTE view per expert
+    scale_offsets: list                  # list[int], len = num_experts+1
+    row_offsets:   list                  # list[int], len = num_experts+1
+    n_per_expert:  int
+    k:             int
+    data_uint8:    Optional[torch.Tensor] = None  # [total_n, k//2] uint8, for v2 CUTLASS GEMM
+
+    @property
+    def num_experts(self) -> int:
+        return len(self.scale_views)
+
+    def cute_fp4_for(self, expert_idx: int) -> torch.Tensor:
+        """Return the CUTE int8 view for expert expert_idx (zero-copy slice).
+
+        cute_data layout: [total_n * k] int8 where each expert g occupies
+        cute_data[row_offsets[g]*k : row_offsets[g+1]*k].  The first n*k//2
+        bytes are FP4 data and the second half is zero padding, matching the
+        layout produced by _make_fp4_tensor_for_cutedsl.
+        """
+        n     = self.n_per_expert
+        k     = self.k
+        start = self.row_offsets[expert_idx] * k
+        return self.cute_data[start: start + n * k].view(n, k, 1)
 
 
 def is_sm100() -> bool:
@@ -398,23 +459,88 @@ def grouped_gemm_cutedsl_pertoken(
         _last_timing_us["make_fp4_us"] = 0.0
         _last_timing_us["block_scale_fp8_us"] = 0.0
 
+    # ── Pre-pass: collect active expert data_uint8, find n_i, build a_fp4_full ──
+    # Uses module-level buffer caches to avoid repeated large GPU malloc calls.
+    total_m_all = sum(m_splits)
+    _act_data_parts: list = []
+    _act_m_active: list = []
+    n_i_first: int = 0
+    for _idx, _m in enumerate(m_splits):
+        _b = B[_idx]
+        if n_i_first == 0:
+            if isinstance(_b, PackedWeightNvfp4Tensor):
+                n_i_first = _b.n_per_expert
+            elif isinstance(_b, TensorGlobalNvfp4Tensor):
+                n_i_first = _b.data_uint8.shape[0]
+            elif hasattr(_b, '_rowwise_data'):
+                n_i_first = _b._rowwise_data.shape[0]
+        if _m > 0:
+            _ai = A[_idx] if isinstance(A[_idx], PertokenNvfp4Tensor) else _resolve_pertoken_activation(A[_idx])
+            _act_data_parts.append(_ai.data_uint8)
+            _act_m_active.append(_m)
+
+    # ── a_fp4_full: one alloc + one copy for all active experts ──
+    _a_fp4_full: Optional[torch.Tensor] = None
+    _a_fp4_row_offset = 0
+    if _act_data_parts:
+        _total_active_m = sum(_act_m_active)
+        _k_half = _act_data_parts[0].shape[1]
+        _expected_ptr = _act_data_parts[0].data_ptr()
+        _all_contig = True
+        for _d in _act_data_parts:
+            if _d.data_ptr() != _expected_ptr:
+                _all_contig = False
+                break
+            _expected_ptr += _d.nbytes
+        if _all_contig:
+            _act_data_full = torch.as_strided(
+                _act_data_parts[0], (_total_active_m, _k_half), (_k_half, 1)
+            )
+        else:
+            _act_data_full = torch.cat(_act_data_parts, dim=0)
+        # Reuse cached int8 buffer — avoids large GPU malloc on every forward pass.
+        # Key by (k, device) so we hold at most one entry per GEMM shape (fc1/fc2),
+        # and only reallocate when total_active_m grows beyond the previous maximum.
+        _afp4_size = _total_active_m * k
+        _afp4_key = (k, str(device))
+        _existing_buf = _a_fp4_buf_cache.get(_afp4_key)
+        if NO_CACHE or _existing_buf is None or _existing_buf.numel() < _afp4_size:
+            _a_fp4_buf_cache[_afp4_key] = torch.empty(_afp4_size, dtype=torch.int8, device=device)
+        _afp4_buf = _a_fp4_buf_cache[_afp4_key]
+        _afp4_buf[:_afp4_size // 2].copy_(_act_data_full.reshape(-1).view(torch.int8))
+        _a_fp4_full = _afp4_buf[:_afp4_size].view(_total_active_m, k, 1)
+
+    # ── c_out_full: one alloc for all experts (replaces 64 small allocs + final cat) ──
+    # Not cached across calls to avoid permanently pinning ~500-600 MB output buffers.
+    c_out_full = torch.empty((total_m_all, n_i_first), dtype=out_dtype, device=device)
+    _c_out_offset = 0
+
     for i, m_i in enumerate(m_splits):
         act = A[i] if isinstance(A[i], PertokenNvfp4Tensor) else _resolve_pertoken_activation(A[i])
         b = B[i]
 
-        if isinstance(b, TensorGlobalNvfp4Tensor):
+        if isinstance(b, PackedWeightNvfp4Tensor):
+            n_i = b.n_per_expert
+            if m_i == 0:
+                _c_out_offset += 0
+                continue
+            # Zero-copy: data and scale views are already in CUTE layout.
+            b_fp4 = b.cute_fp4_for(i)
+            sfb   = b.scale_views[i]
+            # alpha_b will be read from b.global_scale GPU tensor below; use sentinel here.
+            alpha_b = None
+
+        elif isinstance(b, TensorGlobalNvfp4Tensor):
             n_i = b.data_uint8.shape[0]
             if m_i == 0:
-                outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+                _c_out_offset += 0
                 continue
-            # Cache alpha_b on weight object — amax is fixed between weight updates,
-            # avoids a D2H scalar fetch on every forward pass.
-            if b._alpha_b_cached is None:
+            if NO_CACHE or b._alpha_b_cached is None:
                 b._alpha_b_cached = float(b.amax.item()) / _NVFP4_GLOBAL_SCALE_DENOM
             alpha_b = b._alpha_b_cached
-            if b._cute_fp4 is None:
+            if NO_CACHE or b._cute_fp4 is None:
                 b._cute_fp4 = _make_fp4_tensor_for_cutedsl(b.data_uint8, n_i, k, device)
-                if b._cute_sfb is None:
+                if b._cute_sfb is None or (NO_CACHE and b.block_scale_fp8.dim() == 2):
                     b._cute_sfb = _make_cute_sf(b.block_scale_fp8[:n_i, :sf_k], n_i, sf_k)
             b_fp4, sfb = b._cute_fp4, b._cute_sfb
 
@@ -425,13 +551,12 @@ def grouped_gemm_cutedsl_pertoken(
             )
 
         else:
-            # TE NVFP4 tensor fallback
             n_i = b._rowwise_data.shape[0]
             if m_i == 0:
-                outputs.append(torch.empty((0, n_i), dtype=out_dtype, device=device))
+                _c_out_offset += 0
                 continue
             b_data, sfb_2d, alpha_b, b_obj = _resolve_group_weight(b, n_i, k)
-            if not hasattr(b_obj, "_cute_fp4_cached"):
+            if NO_CACHE or not hasattr(b_obj, "_cute_fp4_cached"):
                 b_obj._cute_fp4_cached = _make_fp4_tensor_for_cutedsl(b_data, n_i, k, device)
                 b_obj._cute_sfb_cached = _make_cute_sf(sfb_2d, n_i, sf_k)
             b_fp4, sfb = b_obj._cute_fp4_cached, b_obj._cute_sfb_cached
@@ -439,8 +564,10 @@ def grouped_gemm_cutedsl_pertoken(
         if _timing_enabled:
             torch.cuda.synchronize()
             _pt = _time.perf_counter()
-        a_fp4 = _make_fp4_tensor_for_cutedsl(act.data_uint8, m_i, k, device)
-        c_out = torch.empty((m_i, n_i), dtype=out_dtype, device=device)
+        a_fp4 = _a_fp4_full[_a_fp4_row_offset:_a_fp4_row_offset + m_i]
+        _a_fp4_row_offset += m_i
+        c_out = c_out_full[_c_out_offset:_c_out_offset + m_i]
+        _c_out_offset += m_i
         if _timing_enabled:
             torch.cuda.synchronize()
             _last_timing_us["make_fp4_us"] += (_time.perf_counter() - _pt) * 1e6
@@ -471,7 +598,22 @@ def grouped_gemm_cutedsl_pertoken(
             global_scales = active_acts[0].global_scale_full.float()
         else:
             global_scales = torch.cat([a.global_scale for a in active_acts]).float()
-        alpha_b_vec = torch.tensor(alpha_b_per_group, dtype=torch.float32, device=device)
+
+        # Build alpha_b_vec — GPU tensor, no H2D.
+        # If B is PackedWeightNvfp4Tensor, global_scale is already a [num_experts] GPU tensor;
+        # index into active experts directly.  Otherwise fall back to the Python-list path.
+        _first_b = B[0]
+        if isinstance(_first_b, PackedWeightNvfp4Tensor):
+            # active group indices = those with m_i > 0, in order
+            _active_indices = [i for i, m in enumerate(m_splits) if m > 0]
+            alpha_b_vec = _first_b.global_scale[_active_indices]
+        else:
+            num_active = len(alpha_b_per_group)
+            _ab_key = (num_active, str(device))
+            if NO_CACHE or _ab_key not in _alpha_b_buf_cache:
+                _alpha_b_buf_cache[_ab_key] = torch.empty(num_active, dtype=torch.float32, device=device)
+            alpha_b_vec = _alpha_b_buf_cache[_ab_key]
+            alpha_b_vec.copy_(torch.tensor(alpha_b_per_group, dtype=torch.float32))
         repeats = torch.tensor([ps[0] for ps in problem_sizes], dtype=torch.int64, device=device)
         alphas_packed = global_scales * alpha_b_vec.repeat_interleave(repeats)
 
@@ -490,7 +632,9 @@ def grouped_gemm_cutedsl_pertoken(
         for idx, result in zip(kernel_output_indices, kernel_results):
             outputs[idx] = result
 
-    return torch.cat(outputs, dim=0)
+    # Return c_out_full directly — all active expert outputs are already written
+    # into it as contiguous slices; no extra torch.cat needed.
+    return c_out_full
 
 
 def warmup_grouped_gemm_cutedsl_pertoken(

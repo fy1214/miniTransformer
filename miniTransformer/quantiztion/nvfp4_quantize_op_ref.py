@@ -13,7 +13,7 @@ nvfp4_scale_t = torch.float8_e4m3fn
 
 
 def unpack_quantize_results(qresult_list):
-    """将 QuantizeResult 列表拆分成各字段的列表。"""
+    """Unpack a list of QuantizeResult objects into per-field lists."""
     return (
         [r.data for r in qresult_list],
         [r.scale for r in qresult_list],
@@ -327,13 +327,12 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             decode_scale = cast_to_e8(decode_scale)
             encode_scale = torch.reciprocal(decode_scale.to(torch.float32))
         else:
-            # global_amax 可能是 [1]（per-tensor）或 [M, 1]（per-token）
-            # decode_scale 是 [M, num_tiles, 1]（3D）
-            # 需要把 global_amax 变为 [M, 1, 1] 才能正确广播
+            # global_amax is [1] (per-tensor) or [M, 1] (per-token).
+            # decode_scale is 3D [M, num_tiles, 1]; broadcast global_amax to [M, 1, 1].
             if global_amax.dim() == 2:
                 global_amax_bc = global_amax.unsqueeze(1)  # [M, 1] -> [M, 1, 1]
             else:
-                global_amax_bc = global_amax               # [1]，直接广播
+                global_amax_bc = global_amax               # [1], broadcasts directly
             global_encode_scale = torch.div(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, global_amax_bc)
             global_encode_scale = torch.clamp(
                 global_encode_scale,
@@ -357,7 +356,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             encode_scale = torch.clamp(
                 torch.div(1.0, decode_scale.to(torch.float32) * global_decode_scale),
                 max=torch.finfo(torch.float32).max,
-            )   # encode_scale = (vec_max/6)
+            )   # encode_scale = vec_max/6
 
         scaled_x = x.to(torch.float32) * encode_scale
 
@@ -381,39 +380,37 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
 
         Args:
             qx          : packed uint8 tensor, shape [M, N//2]
-                          （每个字节存 2 个 FP4，低 4 bit 为偶数列，高 4 bit 为奇数列）
+                          (each byte stores 2 FP4 values: low 4 bits = even column, high 4 bits = odd column)
             decode_scale: fp8_e4m3fn tensor, shape [M, N//tile_len_x]
-                          （每个 tile 对应一个 scale）
-            original_shape: (M, N) 原始未 pad 的尺寸
-            tile_len_x  : tile 的列数（一般为 16）
-            tile_len_y  : tile 的行数（1D 量化为 1，2D 量化为 16）
-            out_dtype   : 输出 dtype
+                          (one scale per tile)
+            original_shape: (M, N) original unpadded size
+            tile_len_x  : number of columns per tile (typically 16)
+            tile_len_y  : number of rows per tile (1 for 1D quant, 16 for 2D quant)
+            out_dtype   : output dtype
 
         Returns:
-            dequantized tensor, shape [M, N]，dtype=out_dtype
+            dequantized tensor, shape [M, N], dtype=out_dtype
         """
         M_orig, N_orig = original_shape
 
-        # 1. 解包 packed uint8 → float，shape [M, N]
-        #    cast_from_fp4x2 输出 shape [M_packed, N_orig]（已裁剪到原始列数）
-        x_fp4 = cast_from_fp4x2(qx, torch.float32)   # [M, N]，每个元素是 FP4 的浮点值
+        # 1. Unpack packed uint8 -> float, shape [M, N]
+        x_fp4 = cast_from_fp4x2(qx, torch.float32)   # [M, N], each element is an FP4 float value
 
         M, N = x_fp4.shape
 
-        # 2. reshape 成 tile 视图，乘以 decode_scale
-        #    decode_scale shape: [M, N//tile_len_x]，对应每行每 tile 一个 scale
+        # 2. Reshape into tile view and multiply by decode_scale
+        #    decode_scale shape: [M, N//tile_len_x], one scale per row per tile
         #    x_fp4 reshape: [M, N//tile_len_x, tile_len_x]
         x_tiles = x_fp4.view(M, N // tile_len_x, tile_len_x)          # [M, num_tiles, tile_len_x]
 
-        # decode_scale 是 fp8_e4m3fn，转 float32 再用
         scale = decode_scale.to(torch.float32)                          # [M, num_tiles]
 
-        # tile_len_y > 1 时（2D 量化），scale 的行维度已经被 repeat_interleave 展开，
-        # 此时 scale shape 仍是 [M, N//tile_len_x]，与 1D 路径一致，无需额外处理
+        # For 2D quantization (tile_len_y > 1), scale rows are already expanded via repeat_interleave,
+        # so shape remains [M, N//tile_len_x] — no extra handling needed.
         x_dequant = x_tiles * scale.unsqueeze(-1)                       # [M, num_tiles, tile_len_x]
         x_dequant = x_dequant.view(M, N)                                # [M, N]
 
-        # 3. 裁剪到原始尺寸（去掉 padding）
+        # 3. Crop to original size (remove padding)
         x_dequant = x_dequant[:M_orig, :N_orig].contiguous()
 
         return x_dequant.to(out_dtype)
@@ -427,20 +424,20 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         qparams: Optional["quantization.QParams"] = None,
     ) -> torch.Tensor:
         """
-        对应 quantize() 的反操作。
+        Inverse of quantize().
 
         Args:
-            qx         : packed uint8，shape [M, N//2]
-            sx         : decode_scale，fp8_e4m3fn，shape [M, N//tile_len_x]
-            global_amax: 全局 amax（pow_2_scales=False 时用于还原 global_decode_scale）
-            out_dtype  : 输出 dtype（默认 bfloat16）
-            qparams    : 量化参数，None 时使用默认值
+            qx         : packed uint8, shape [M, N//2]
+            sx         : decode_scale, fp8_e4m3fn, shape [M, N//tile_len_x]
+            global_amax: global amax (used to recover global_decode_scale when pow_2_scales=False)
+            out_dtype  : output dtype (default bfloat16)
+            qparams    : quantization params; uses defaults when None
 
         Returns:
-            dequantized tensor，shape [M, N]，dtype=out_dtype
+            dequantized tensor, shape [M, N], dtype=out_dtype
         """
         if qparams is None:
-            # 默认参数：1x16 tile，非 pow_2_scales，非 2D 量化
+            # Default: 1x16 tile, no pow_2_scales, no 2D quantization
             tile_len_x = 16
             tile_len_y = 1
             pow_2_scales = False
@@ -451,17 +448,17 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             pow_2_scales = qparams.pow_2_scales
             with_2d_quantization = qparams.with_2d_quantization
 
-        # qx shape: [M, N//2]，原始 N = qx.shape[1] * 2
+        # qx shape: [M, N//2]; original N = qx.shape[1] * 2
         M = qx.shape[0]
         N = qx.shape[1] * 2
 
         if pow_2_scales:
-            # pow_2_scales 路径：decode_scale 直接就是 scale，不需要 global_decode_scale
+            # pow_2_scales path: decode_scale is already the final scale, no global factor needed
             actual_scale = sx
         else:
-            # 非 pow_2_scales 路径：
-            # 量化时 decode_scale = (vec_max / E2M1_MAX) * global_encode_scale
-            # 反量化时需要乘以 global_decode_scale = 1 / global_encode_scale = global_amax / (E4M3_MAX * E2M1_MAX)
+            # Non-pow_2_scales path:
+            # During quantization: decode_scale = (vec_max / E2M1_MAX) * global_encode_scale
+            # To dequantize, multiply by global_decode_scale = 1 / global_encode_scale = global_amax / (E4M3_MAX * E2M1_MAX)
             FLOAT8_E4M3_MAX = 448.0
             FLOAT4_E2M1_MAX = 6.0
             global_decode_scale = global_amax.to(torch.float32) / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
@@ -496,7 +493,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             else x.t().contiguous()
         )
         
-        # 兼容 qparams 中的 per_token_amax 设置
+        # Compatibility shim: support per_token_amax if set on qparams
         per_token_amax = getattr(qparams, 'per_token_amax', False)
 
         if per_token_amax:
@@ -644,6 +641,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """Python implementation of microblock FP4 GEMM."""
         assert bias is None, "Bias is implemented for FP4 GEMM."
@@ -800,6 +799,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
 
         num_gemms = len(m_splits)

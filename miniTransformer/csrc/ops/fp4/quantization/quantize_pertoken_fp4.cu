@@ -38,14 +38,14 @@ struct QuantResultPT {
     __nv_fp8_e4m3 fp8s;
 };
 
-__device__ __forceinline__ QuantResultPT quantize_pt(float abs_max, float inv_val_max, float scale, bf16x8& x) {
-    float s_group     = abs_max * inv_val_max;
-    float inv_scale   = reciprocal_approximate_ftz(scale);
-    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(s_group * inv_scale);
+// global_encode_scale = 2688.0f / row_abs_max  (matches golden's formula exactly)
+// scale               = scale_override / global_encode_scale
+__device__ __forceinline__ QuantResultPT quantize_pt(float abs_max, float val_max, float global_encode_scale, float scale, bf16x8& x) {
+    __nv_fp8_e4m3 s_as_fp8  = static_cast<__nv_fp8_e4m3>(fminf(abs_max * (1.0f / val_max) * global_encode_scale, 448.0f));
     float s_round_fp8 = static_cast<float>(s_as_fp8);
     if (s_round_fp8 == 0.f) s_round_fp8 = 1.f;
 
-    float factor   = reciprocal_approximate_ftz(s_round_fp8 * scale);
+    float factor   = 1.0f / (s_round_fp8 * scale);
     float2 factor2 = {factor, factor};
     fp4x8 result;
     for (int k = 0; k < bf16x8::size; k += 2) {
@@ -98,11 +98,14 @@ __global__ void fp4_pertoken_kernel(
 
     // Token-level global scale from externally supplied per-row amax.
     float row_abs_max = amax_per_row[row];
-    constexpr float inv_scales_max = NumCandidates > 1 ? 1.f / 256.f : 1.f / 448.f;
-    constexpr float one_over_six   = 1.f / 6.f;
-    float scale = row_abs_max == 0.f
+    constexpr float SCALES_MAX = NumCandidates > 1 ? 256.0f : 448.0f;
+    constexpr float FP4_MAX    = 6.0f;
+    float global_encode_scale = row_abs_max == 0.f
                 ? 1.f
-                : row_abs_max * inv_scales_max * (scale_override * one_over_six);
+                : (SCALES_MAX * FP4_MAX) / row_abs_max;
+    float scale = row_abs_max == 0.f
+                ? scale_override
+                : scale_override / global_encode_scale;
     if (col_in_row == 0)
         global_scale_ptr[row] = scale;
 
@@ -120,8 +123,7 @@ __global__ void fp4_pertoken_kernel(
     float best = INFINITY;
     QuantResultPT res;
     for (int i = 0; i < NumCandidates; ++i) {
-        float inv_val = 1.f / candidates[i];
-        results[i]    = quantize_pt(full_abs_max, inv_val * scale_override, scale, x);
+        results[i]    = quantize_pt(full_abs_max, candidates[i], global_encode_scale, scale, x);
         scores[i]     = quant_error_pt(x, results[i], scale);
         if (scores[i] < best) { best = scores[i]; res = results[i]; }
     }
@@ -147,7 +149,7 @@ static void launch_fp4_pertoken(
     int num_candidates, bool swizzle,
     __nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr,
     const nv_bfloat16* x_ptr, const float* amax_per_row,
-    float scale_override, long rows, long cols)
+    float scale_override, long rows, long cols, cudaStream_t stream)
 {
     int nvecs_per_row = static_cast<int>(cols / 8);
     int total_vecs    = static_cast<int>(rows) * nvecs_per_row;
@@ -156,13 +158,13 @@ static void launch_fp4_pertoken(
     int n_blocks = (total_vecs + BLOCK - 1) / BLOCK;
 
     if (num_candidates == 2 && swizzle)
-        fp4_pertoken_kernel<2, true> <<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
+        fp4_pertoken_kernel<2, true> <<<n_blocks, BLOCK, 0, stream>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else if (num_candidates == 2 && !swizzle)
-        fp4_pertoken_kernel<2, false><<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
+        fp4_pertoken_kernel<2, false><<<n_blocks, BLOCK, 0, stream>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else if (num_candidates == 1 && swizzle)
-        fp4_pertoken_kernel<1, true> <<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
+        fp4_pertoken_kernel<1, true> <<<n_blocks, BLOCK, 0, stream>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
     else
-        fp4_pertoken_kernel<1, false><<<n_blocks, BLOCK>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
+        fp4_pertoken_kernel<1, false><<<n_blocks, BLOCK, 0, stream>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, nvecs_per_row, cdiv16, total_vecs);
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -179,7 +181,7 @@ void four_six_fp4_pertoken(
     const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
     check_args("four_six_fp4_pertoken", cols);
-    launch_fp4_pertoken(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
+    launch_fp4_pertoken(2, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols, 0);
 }
 
 void rtn_fp4_pertoken(
@@ -187,7 +189,7 @@ void rtn_fp4_pertoken(
     const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
     check_args("rtn_fp4_pertoken", cols);
-    launch_fp4_pertoken(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
+    launch_fp4_pertoken(1, true, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols, 0);
 }
 
 void four_six_fp4_pertoken_linear(
@@ -195,7 +197,7 @@ void four_six_fp4_pertoken_linear(
     const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
     check_args("four_six_fp4_pertoken_linear", cols);
-    launch_fp4_pertoken(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
+    launch_fp4_pertoken(2, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols, 0);
 }
 
 void rtn_fp4_pertoken_linear(
@@ -203,7 +205,7 @@ void rtn_fp4_pertoken_linear(
     const nv_bfloat16* x_ptr, const float* amax_per_row, float scale_override, long rows, long cols)
 {
     check_args("rtn_fp4_pertoken_linear", cols);
-    launch_fp4_pertoken(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols);
+    launch_fp4_pertoken(1, false, y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row, scale_override, rows, cols, 0);
 }
 
 // ---- PyTorch bindings ----
@@ -226,7 +228,8 @@ static void binding_impl(
         reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const float*>(amax_per_row.data_ptr()),
-        scale_override, inp.size(0), inp.size(1));
+        scale_override, inp.size(0), inp.size(1),
+        at::cuda::getCurrentCUDAStream());
 }
 
 void four_six_fp4_pertoken_binding(

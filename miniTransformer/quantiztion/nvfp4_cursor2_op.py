@@ -27,11 +27,19 @@ _GEMM_CALL_COUNT: int = 0
 
 # Independent debug counter for quant/GEMM prints (not gated by _GEMM_CALL_COUNT).
 _DEBUG_CALL_COUNT: int = 0
+# Separate counter for backward GEMM prints (reset independently).
+_DEBUG_BGRAD_COUNT: int = 0
+_DEBUG_BGRAD_LIMIT: int = 5   # show first 5 backward calls (catches both zero and NaN)
 
 # Capture one torch.profiler trace at this call index (0 = first call).
 # Set to -1 to disable. Output written to NVFP4_PROFILE_DIR (default /tmp).
 _GEMM_PROFILE_AT: int = int(os.environ.get("NVFP4_PROFILE_AT", "50"))
 _GEMM_PROFILED: bool = False
+
+# Forward NaN detection: print on first occurrence, -1 = not yet detected.
+_XQUANT_NAN_CALL: int = -1   # X-quant first NaN (gs or sfb)
+_WQUANT_NAN_CALL: int = -1   # W-quant first NaN (sfb or alpha_b)
+_GEMM_NAN_CALL:   int = -1   # forward GEMM output first NaN
 
 
 def _is_sm100() -> bool:
@@ -63,6 +71,7 @@ def _grouped_gemm_cutedsl_pertoken(
     import miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl as _impl
     import time
     global _GEMM_CALL_COUNT, _GEMM_PROFILED, _DEBUG_CALL_COUNT
+    global _GEMM_NAN_CALL
 
     do_timing = _GEMM_TIMING_INTERVAL > 0 and _GEMM_CALL_COUNT % _GEMM_TIMING_INTERVAL == 0
     do_profile = (
@@ -97,13 +106,42 @@ def _grouped_gemm_cutedsl_pertoken(
             b_data = getattr(b, 'data_uint8', b)
             a_gs   = getattr(a, 'global_scale', None)
             b_alpha = getattr(b, '_alpha_b_cached', None)
-            gs_str    = f"{a_gs.abs().max().item():.4g}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
+            if a_gs is not None and a_gs.numel() > 0:
+                gs_str     = f"{a_gs.abs().max().item():.4g}"
+                gs_nan_str = f"{a_gs.isnan().any().item()}"
+                gs_large   = (a_gs > 1.0).sum().item()
+                gs_large_str = f"{gs_large}/{a_gs.numel()}"
+            else:
+                gs_str = gs_nan_str = gs_large_str = "N/A"
             alpha_str = f"{b_alpha:.4g}" if b_alpha is not None else "N/A"
-            gs_nan_str = f"{a_gs.isnan().any().item()}" if (a_gs is not None and a_gs.numel() > 0) else "N/A"
             print(f"[GEMM PRE g={i}] A.data={a_data.shape} B.data={b_data.shape} "
-                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} B.alpha_b={alpha_str}", flush=True)
+                  f"A.gs_nan={gs_nan_str} A.gs_max={gs_str} A.gs>1={gs_large_str} B.alpha_b={alpha_str}", flush=True)
 
     res = grouped_gemm_cutedsl_pertoken(A, B, m_splits, out_dtype)
+
+    # Always check for first NaN in forward GEMM output.
+    if _GEMM_NAN_CALL < 0:
+        res_t = res if isinstance(res, torch.Tensor) else (res[0] if res else None)
+        if res_t is not None and res_t.numel() > 0 and res_t.isnan().any():
+            _GEMM_NAN_CALL = _GEMM_CALL_COUNT
+            nan_cnt = res_t.isnan().sum().item()
+            print(f"[GEMM NAN! call={_GEMM_CALL_COUNT}] out={res_t.shape} "
+                  f"nan_cnt={nan_cnt}/{res_t.numel()}", flush=True)
+            for i, (a, b) in enumerate(zip(A, B)):
+                a_gs    = getattr(a, 'global_scale', None)
+                b_alpha = getattr(b, '_alpha_b_cached', None)
+                a_data  = getattr(a, 'data_uint8', a)
+                if a_gs is not None and a_gs.numel() > 0:
+                    gs_nan   = a_gs.isnan().any().item()
+                    gs_inf   = a_gs.isinf().any().item()
+                    gs_max   = a_gs.abs().max().item()
+                    gs_large = (a_gs > 1.0).sum().item()
+                else:
+                    gs_nan = gs_inf = gs_max = gs_large = "N/A"
+                alpha_s = f"{b_alpha:.6g}" if b_alpha is not None else "N/A"
+                print(f"  g={i}: rows={a_data.shape[0] if hasattr(a_data,'shape') else '?'} "
+                      f"gs_nan={gs_nan} gs_inf={gs_inf} gs_max={gs_max} gs>1={gs_large} "
+                      f"alpha_b={alpha_s}", flush=True)
 
     if _DEBUG_CALL_COUNT < 3:
         res_t = res if isinstance(res, torch.Tensor) else res[0] if res else None
@@ -321,26 +359,33 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         self._refresh_quantizer_cache(num_gemms)
 
         if qparams.param_type == qparams.param_type.WEIGHT:
-            from miniTransformer.ops.nvfp4_quantize import quantize_weight_nvfp4_swizzled
+            from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_tensor_global_packed
+            from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import PackedWeightNvfp4Tensor
 
             if _DEBUG_CALL_COUNT < 3:
-                for i in range(num_gemms):
-                    wi = x[i]
-                    print(f"[W-QUANT PRE  g={i}] shape={wi.shape} dtype={wi.dtype} "
-                          f"nan={wi.isnan().any().item()} inf={wi.isinf().any().item()} "
-                          f"max={wi.abs().max().item():.4g}", flush=True)
+                print(f"[W-QUANT PRE ] shape={x.shape} dtype={x.dtype} "
+                      f"nan={x.isnan().any().item()} inf={x.isinf().any().item()} "
+                      f"max={x.abs().max().item():.4g}", flush=True)
 
-            quantize_tensor_list = [
-                quantize_weight_nvfp4_swizzled(x[i]) for i in range(num_gemms)
-            ]
+            gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1])
+            packed_b = PackedWeightNvfp4Tensor(
+                cute_data=gw.cute_data,
+                scale_flat=gw.scale_flat,
+                global_scale=gw.global_scale,
+                scale_views=gw.scale_views,
+                scale_offsets=gw.scale_offsets,
+                row_offsets=gw.row_offsets,
+                n_per_expert=x.shape[1],
+                k=x.shape[2],
+            )
+            # Return a list of the same packed object — grouped_gemm_cutedsl_pertoken
+            # will index into it by expert index.
+            quantize_tensor_list = [packed_b] * num_gemms
 
             if _DEBUG_CALL_COUNT < 3:
-                for i, t in enumerate(quantize_tensor_list):
-                    sfb = t.block_scale_fp8.float()
-                    print(f"[W-QUANT POST g={i}] data={t.data_uint8.shape} "
-                          f"sfb_nan={sfb.isnan().any().item()} sfb_inf={sfb.isinf().any().item()} "
-                          f"sfb_max={sfb.abs().max().item():.4g} "
-                          f"alpha_b={t._alpha_b_cached:.4g}", flush=True)
+                print(f"[W-QUANT POST] data={gw.data.shape} "
+                      f"global_scale={gw.global_scale[:4]} "
+                      f"scale_flat={gw.scale_flat.shape}", flush=True)
 
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
@@ -373,10 +418,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
 
             if _DEBUG_CALL_COUNT < 3:
                 sfb = gq.scale_flat.float()
+                gs = gq.global_scale
+                gs_large = (gs > 1.0).sum().item()
                 print(f"[X-QUANT POST] data={gq.data.shape} "
-                      f"gs_nan={gq.global_scale.isnan().any().item()} "
-                      f"gs_inf={gq.global_scale.isinf().any().item()} "
-                      f"gs_max={gq.global_scale.abs().max().item():.4g} "
+                      f"gs_nan={gs.isnan().any().item()} "
+                      f"gs_inf={gs.isinf().any().item()} "
+                      f"gs_max={gs.abs().max().item():.4g} "
+                      f"gs_mean={gs.mean().item():.4g} "
+                      f"gs>1={gs_large}/{gs.numel()} "
                       f"sfb_nan={sfb.isnan().any().item()} "
                       f"sfb_inf={sfb.isinf().any().item()} "
                       f"sfb_max={sfb.abs().max().item():.4g}", flush=True)
@@ -408,6 +457,14 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
 
         # Dy: MXFP8 quant for backward
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT:
+            dy_nan = x.isnan().any().item()
+            dy_inf = x.isinf().any().item()
+            dy_max = x.abs().max().item() if x.numel() > 0 else 0.0
+            dy_nan_cnt = x.isnan().sum().item() if dy_nan else 0
+            print(f"[DY-QUANT PRE] dy.shape={x.shape} dtype={x.dtype} "
+                  f"nan={dy_nan}(cnt={dy_nan_cnt}) inf={dy_inf} "
+                  f"max={dy_max:.4g} m_splits={m_splits}", flush=True)
         quantize_tensor_list = tex.split_quantize(
             x,
             m_splits,
@@ -442,12 +499,19 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> Tuple[List[torch.Tensor], ...]:
         activation_dtype = out_dtype
 
         a0 = A[0]
         is_te_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
-        global _DEBUG_CALL_COUNT
+        global _DEBUG_CALL_COUNT, _DEBUG_BGRAD_COUNT
+
+        # Unconditional entry log — confirms whether grad=True path is ever reached.
+        if grad and _DEBUG_BGRAD_COUNT < 5:
+            print(f"[GROUPED_GEMM GRAD=TRUE ENTRY] layout={layout} m_splits_sum={sum(m_splits)} "
+                  f"_DEBUG_BGRAD_COUNT={_DEBUG_BGRAD_COUNT}", flush=True)
 
         if _DEBUG_CALL_COUNT <= 3:
             from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
@@ -472,6 +536,48 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "CuTeDSL pertoken grouped GEMM failed on SM100; "
                     "set disable_backward_quant and use Nvfp4Cursor2QuantizeOp."
                 ) from exc
+
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT and grad:
+            for i, (a, b) in enumerate(zip(A, B)):
+                def _tstat(t, name):
+                    try:
+                        # TE QuantizedTensor: has _rowwise_data
+                        if hasattr(t, '_rowwise_data') and t._rowwise_data is not None:
+                            rw = t._rowwise_data
+                            amax = getattr(t, '_amax_rowwise', None)
+                            amax_s = f"amax={amax.float().item():.4g}" if (amax is not None and amax.numel() > 0) else ""
+                            # FP8 E4M3 NaN = byte 0x7F(+) or 0xFF(-): (byte & 0x7F)==0x7F
+                            if rw.dtype == torch.uint8:
+                                fp8_nan = ((rw & 0x7F) == 0x7F).any().item()
+                                fp8_cnt = ((rw & 0x7F) == 0x7F).sum().item()
+                                nan_s = f"fp8_nan={fp8_nan}(cnt={fp8_cnt})"
+                            else:
+                                f = rw.float()
+                                nan_s = f"nan={f.isnan().any().item()} inf={f.isinf().any().item()}"
+                            return f"{name}.rw={rw.shape} {nan_s} {amax_s}"
+                        # TE QuantizedTensor: columnwise only
+                        if hasattr(t, '_columnwise_data') and t._columnwise_data is not None:
+                            cw = t._columnwise_data
+                            if cw.dtype == torch.uint8:
+                                fp8_nan = ((cw & 0x7F) == 0x7F).any().item()
+                                fp8_cnt = ((cw & 0x7F) == 0x7F).sum().item()
+                                nan_s = f"fp8_nan={fp8_nan}(cnt={fp8_cnt})"
+                            else:
+                                f = cw.float()
+                                nan_s = f"nan={f.isnan().any().item()} inf={f.isinf().any().item()}"
+                            return f"{name}.cw={cw.shape} {nan_s}"
+                        # Plain or FP4 tensor
+                        if isinstance(t, torch.Tensor):
+                            if t.numel() == 0:
+                                return f"{name}={t.shape}(empty)"
+                            f = t.float() if t.dtype not in (torch.float32, torch.bfloat16, torch.float16) else t
+                            return (f"{name}.shape={t.shape} nan={f.isnan().any().item()} "
+                                    f"inf={f.isinf().any().item()} max={f.abs().max().item():.4g}")
+                        return f"{name}=type:{type(t).__name__}"
+                    except Exception as e:
+                        return f"{name}=stat-err:{e}"
+                print(f"[BGRAD PRE g={i}] layout={layout} "
+                      f"{_tstat(a, 'A')} | {_tstat(b, 'B')}", flush=True)
 
         if grad:
             if layout == "NN":
@@ -510,6 +616,22 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             use_split_accumulator=False,
             accumulate=accumulate
         )
+
+        if _DEBUG_BGRAD_COUNT < _DEBUG_BGRAD_LIMIT and grad:
+            out_tensors = out if isinstance(out, list) else [out]
+            for i, ot in enumerate(out_tensors):
+                if ot is None:
+                    continue
+                try:
+                    if ot.numel() == 0:
+                        print(f"[BGRAD POST i={i}] layout={layout} shape={ot.shape} (empty)", flush=True)
+                        continue
+                    print(f"[BGRAD POST i={i}] layout={layout} shape={ot.shape} "
+                          f"nan={ot.isnan().any().item()} inf={ot.isinf().any().item()} "
+                          f"max={ot.abs().max().item():.4g}", flush=True)
+                except Exception as e:
+                    print(f"[BGRAD POST i={i}] stat-err={e}", flush=True)
+            _DEBUG_BGRAD_COUNT += 1
 
         if grad and layout == "NT":
             return out

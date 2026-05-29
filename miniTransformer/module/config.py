@@ -12,6 +12,7 @@ from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
+from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2QuantizeOp as Nvfp4Cursor2CutlassQuantizeOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType
 from miniTransformer.quantiztion import quantization
 import miniTransformer.utils.env as env
@@ -20,9 +21,8 @@ logger = logging.getLogger(__name__)
 
 @enum.unique
 class QuantizeType(enum.Enum):
-    """quantization type for linear layers."""
+    """Quantization format for linear layers."""
 
-    # Non-quantize
     NONE = "none"
     FP8 = "fp8"
     MXFP8 = "mxfp8"
@@ -95,7 +95,6 @@ class QLinearParams:
 class QuantizeRecipe(enum.Enum):
     """Pre-defined quantization recipes for linear layers."""
 
-    # Non-quantize
     NON_QUANTIZE = "non_quantize"
     BF16_REF = "bf16_ref"
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
@@ -104,12 +103,13 @@ class QuantizeRecipe(enum.Enum):
     FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
     FP4_SUB_CHANNEL_CURSOR2 = "fp4_subchannel_scaling_cursor2"
     FP4_SUB_CHANNEL_CURSOR2_REF = "fp4_subchannel_scaling_cursor2_ref"
+    FP4_SUB_CHANNEL_CURSOR2_CUTLASS = "fp4_subchannel_scaling_cursor2_cutlass"
+    FP4_SUB_CHANNEL_W4A16 = "fp4_subchannel_scaling_w4a16"
 
 
 def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     """Get quantization parameters for linear layer based on recipe."""
     if recipe == QuantizeRecipe.NON_QUANTIZE:
-        # Non-quantize (bf16)
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
     elif recipe == QuantizeRecipe.BF16_REF:
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
@@ -238,7 +238,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_REF:
-        # Pertoken activation (Triton) + tensor-global weight + CuTeDSL grouped GEMM (SM100).
+        # Pertoken activation + tensor-global weight + CuTeDSL grouped GEMM (SM100).
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -270,6 +270,41 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 param_type=ParamType.Y,
             ),
             quantize_op=Nvfp4Cursor2QuantizeOpRef(),
+            allgather_quantize=False,
+        )
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS:
+        # Pertoken activation + tensor-global weight + CUTLASS v2 grouped FP4 GEMM (SM100).
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=not env.should_disable_rht(),
+                stochastic_rounding=False,
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(16, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=not env.should_disable_rht(),
+                stochastic_rounding=not env.should_disable_stochastic_rounding(),
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Nvfp4Cursor2CutlassQuantizeOp(),
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET:
@@ -317,17 +352,14 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
     if qat_params_idx == 1:
         return get_qlinear_params_from_predefined(QuantizeRecipe.NON_QUANTIZE)
     if qat_params_idx == 2:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.INT4_SUB_CHANNEL
         )
     if qat_params_idx == 3:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_REF
         )
     if qat_params_idx == 4:
-        # default pow_2_scales=False
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL
         )
@@ -342,6 +374,10 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
     if qat_params_idx == 7:
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2
+        )
+    if qat_params_idx == 8:
+        return get_qlinear_params_from_predefined(
+            QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS
         )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

@@ -142,7 +142,7 @@ __global__ __launch_bounds__(32*8, 2) void rht128_eden_tma_kernel(__nv_fp4x2_sto
     }
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols);
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols, cudaStream_t stream);
 
 template<bool Transpose>
 void rht128_eden_launcher(
@@ -160,11 +160,12 @@ void rht128_eden_launcher(
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rht128_eden_tma_kernel<Transpose>, 32*8, smem));
     int sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaMemset(max_scale, 0, sizeof(unsigned)));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaMemsetAsync(max_scale, 0, sizeof(unsigned), stream));
     auto tmap = Transpose ? create_xT_tensor_map(x, M, N) : create_x_tensor_map(x, M, N);
-    rht128_eden_tma_kernel<Transpose><<<sms * blocks, dim3(32, 8), smem>>>(y, scratch_scales, max_scale, h, tmap, M, N, 1.f / fp4_max);
+    rht128_eden_tma_kernel<Transpose><<<sms * blocks, dim3(32, 8), smem, stream>>>(y, scratch_scales, max_scale, h, tmap, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, Transpose ? N : M, Transpose ? M / 16 : N / 16);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, Transpose ? N : M, Transpose ? M / 16 : N / 16, stream);
 }
 
 void transform_rht128_eden(__nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,

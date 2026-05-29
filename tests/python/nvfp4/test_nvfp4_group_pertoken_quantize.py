@@ -57,11 +57,25 @@ pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or
 try:
     from miniTransformer.ops.nvfp4_quantize import (
         GroupQuantizeSwizzledResult,
+        GroupWeightQuantizeResult,
         group_quantize_nvfp4_pertoken_swizzled,
+        group_quantize_nvfp4_tensor_global_packed,
+        quantize_weight_nvfp4_swizzled,
     )
 except ImportError as _e:
     pytestmark = pytest.mark.skip(reason=f"nvfp4_quantization not importable: {_e}")
     group_quantize_nvfp4_pertoken_swizzled = None  # type: ignore[assignment]
+    group_quantize_nvfp4_tensor_global_packed = None  # type: ignore[assignment]
+    quantize_weight_nvfp4_swizzled = None  # type: ignore[assignment]
+
+try:
+    from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_impl import (
+        PackedWeightNvfp4Tensor,
+        _make_fp4_tensor_for_cutedsl,
+    )
+except ImportError:
+    PackedWeightNvfp4Tensor = None  # type: ignore[assignment,misc]
+    _make_fp4_tensor_for_cutedsl = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Dequantization helpers  (same as test_nvfp4_pertoken_quantize.py)
@@ -542,3 +556,113 @@ if __name__ == "__main__":
             )
         except Exception:
             print(f"  {label:<26} {us_new:<12.1f} {'N/A':<12} {'N/A':<10}")
+
+
+# ---------------------------------------------------------------------------
+# Tests for group_quantize_nvfp4_tensor_global_packed (weight / tensor-global)
+# ---------------------------------------------------------------------------
+
+# (num_experts, n_per_expert, k)
+_WEIGHT_SHAPES = [
+    (4,  128, 256),
+    (8,  128, 1024),
+    (64, 128, 4096),
+    (4,  256, 512),
+]
+
+_skip_weight = pytest.mark.skipif(
+    group_quantize_nvfp4_tensor_global_packed is None,
+    reason="group_quantize_nvfp4_tensor_global_packed not importable",
+)
+
+
+@_skip_weight
+@pytest.mark.parametrize("num_experts,n,k", _WEIGHT_SHAPES)
+def test_weight_packed_global_scale_matches_per_expert(num_experts: int, n: int, k: int):
+    """global_scale[g] must match quantize_weight_nvfp4_swizzled._alpha_b_cached per expert."""
+    torch.manual_seed(42)
+    x = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+    gw = group_quantize_nvfp4_tensor_global_packed(x, n)
+
+    for g in range(num_experts):
+        ref = quantize_weight_nvfp4_swizzled(x[g])
+        packed_gs = gw.global_scale[g].item()
+        ref_gs    = ref._alpha_b_cached
+        assert abs(packed_gs - ref_gs) < 1e-5, (
+            f"expert {g}: global_scale mismatch packed={packed_gs:.8f} ref={ref_gs:.8f}"
+        )
+
+
+@_skip_weight
+@pytest.mark.parametrize("num_experts,n,k", _WEIGHT_SHAPES)
+def test_weight_packed_fp4_data_matches_per_expert(num_experts: int, n: int, k: int):
+    """FP4 data bytes must be bit-exact vs quantize_weight_nvfp4_swizzled per expert."""
+    torch.manual_seed(42)
+    x = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+    gw = group_quantize_nvfp4_tensor_global_packed(x, n)
+
+    for g in range(num_experts):
+        ref         = quantize_weight_nvfp4_swizzled(x[g])
+        packed_data = gw.data[g * n:(g + 1) * n]
+        assert torch.equal(packed_data, ref.data_uint8), (
+            f"expert {g}: FP4 data mismatch  "
+            f"max_diff={( packed_data.int() - ref.data_uint8.int()).abs().max().item()}  "
+            f"nonzero={(packed_data.int() - ref.data_uint8.int()).abs().nonzero().shape[0]}"
+        )
+
+
+@_skip_weight
+@pytest.mark.parametrize("num_experts,n,k", _WEIGHT_SHAPES)
+def test_weight_packed_scale_view_matches_per_expert(num_experts: int, n: int, k: int):
+    """scale_views[g] content must be bit-exact vs quantize_weight_nvfp4_swizzled per expert."""
+    torch.manual_seed(42)
+    x = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+    gw = group_quantize_nvfp4_tensor_global_packed(x, n)
+
+    for g in range(num_experts):
+        ref = quantize_weight_nvfp4_swizzled(x[g])
+        sv  = gw.scale_views[g].contiguous()
+        rv  = ref._cute_sfb.contiguous()
+        assert sv.shape == rv.shape, (
+            f"expert {g}: scale_view shape mismatch {sv.shape} vs {rv.shape}"
+        )
+        assert torch.equal(sv.view(torch.uint8), rv.view(torch.uint8)), (
+            f"expert {g}: scale_view content mismatch  "
+            f"max_diff={(sv.view(torch.uint8).int() - rv.view(torch.uint8).int()).abs().max().item()}"
+        )
+
+
+@_skip_weight
+@pytest.mark.parametrize("num_experts,n,k", _WEIGHT_SHAPES)
+def test_weight_packed_cute_fp4_slice_matches_per_expert(num_experts: int, n: int, k: int):
+    """cute_fp4_for(g) zero-copy slice must match _make_fp4_tensor_for_cutedsl output."""
+    if PackedWeightNvfp4Tensor is None or _make_fp4_tensor_for_cutedsl is None:
+        pytest.skip("grouped_gemm_nvfp4_impl not importable")
+    torch.manual_seed(42)
+    x      = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+    gw     = group_quantize_nvfp4_tensor_global_packed(x, n)
+    packed = PackedWeightNvfp4Tensor(
+        cute_data=gw.cute_data,
+        scale_flat=gw.scale_flat,
+        global_scale=gw.global_scale,
+        scale_views=gw.scale_views,
+        scale_offsets=gw.scale_offsets,
+        row_offsets=gw.row_offsets,
+        n_per_expert=n,
+        k=k,
+    )
+
+    for g in range(num_experts):
+        ref        = quantize_weight_nvfp4_swizzled(x[g])
+        ref_fp4    = _make_fp4_tensor_for_cutedsl(ref.data_uint8, n, k, x.device)
+        packed_fp4 = packed.cute_fp4_for(g)
+        # Compare only the first n*k//2 bytes (actual FP4 data).
+        # The second half is zero-padding in cute_data but uninitialized in
+        # _make_fp4_tensor_for_cutedsl (torch.empty), so they legitimately differ.
+        half = n * k // 2
+        p_fp4 = packed_fp4.reshape(-1)[:half]
+        r_fp4 = ref_fp4.reshape(-1)[:half]
+        assert torch.equal(p_fp4, r_fp4), (
+            f"expert {g}: cute_fp4 FP4-data mismatch  "
+            f"max_diff={(p_fp4.int() - r_fp4.int()).abs().max().item()}"
+        )

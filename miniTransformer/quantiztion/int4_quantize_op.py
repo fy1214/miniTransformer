@@ -1,40 +1,27 @@
 """
-int4_quantize_op.py
-===================
-作者: mingfa
-日期: 2026-05-09
+INT4 fake-quantization op with Straight-Through Estimator (STE).
 
-INT4 Fake-Quantization Op with Straight-Through Estimator (STE).
+Applies per-group symmetric INT4 fake quantization to weights, retaining results
+as BF16 (no actual INT4 packing). Intended for QAT (quantization-aware training).
 
-功能:
-    对权重做 per-group symmetric INT4 fake quantization，量化结果保留为 BF16
-    （fake quant），不做真正的 INT4 packing。适用于 QAT（量化感知训练）。
-
-量化规格:
-    - 格式: symmetric INT4，量化范围 [-7, 7]（q_max=7，保留一个负数位做对称性）
-    - 粒度: per-group，group_size 来自 qparams.quant_tile_shape[1]（通常 128）
-    - group 方向: 沿 K 维（输入维）做分组，每 group_size 个元素共享一个 scale
-    - Scale 计算: scale = amax(|x_group|) / 7，最小值 clamp 到 1e-5
+Quantization spec:
+    - Format: symmetric INT4, range [-7, 7] (q_max=7, one negative value reserved for symmetry)
+    - Granularity: per-group along the K dimension; group_size from qparams.quant_tile_shape[1]
+    - Scale: scale = amax(|x_group|) / 7, clamped to a minimum of 1e-5
 
 STE (Straight-Through Estimator):
     forward:  x_fq = dequant(quant(x)) = round(x/scale).clamp(-7,7) * scale
-    backward: dx = dy（梯度直通，不阻断梯度流）
+    backward: dx = dy (gradient passes through unchanged)
 
-Backward 路径:
-    group_linear.py 中设置 disable_backward_quant=True，
-    因此 backward 的 dy 和 x 不经过 INT4 量化，直接走 BF16 grouped GEMM。
-    本文件只需实现 forward 路径的量化（weight + activation）。
+Backward path:
+    group_linear.py sets disable_backward_quant=True, so backward dy and x bypass
+    INT4 quantization and use BF16 grouped GEMM directly. Only the forward quantization
+    path (weight + activation) is implemented here.
 
-与 nvfp4_quantize_op.py 的关系:
-    接口完全一致（group_quantize / grouped_gemm / qgemm），
-    但由于 fake quant 后 tensor 仍是 BF16，grouped_gemm 走 BF16 plain tensor 路径，
-    无需 QuantizedTensor / NVFP4Quantizer。
-
-参考:
-    - /root/Megatron-LM/megatron/core/extensions/transformer_engine.py
-      _FakeInt4QuantizationSTE 和 fake_int4_quantization_ste
-    - miniTransformer/quantiztion/nvfp4_quantize_op.py（接口参考）
-    - miniTransformer/module/group_linear.py（调用方）
+Interface compatibility:
+    Matches Nvfp4TiledQuantizeOp (group_quantize / grouped_gemm / qgemm).
+    Because fake-quantized tensors remain BF16, grouped_gemm uses the BF16 plain tensor
+    path — no QuantizedTensor / NVFP4Quantizer needed.
 """
 
 import dataclasses
@@ -46,8 +33,6 @@ from miniTransformer.utils import utils
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult, ParamType
 
 
-# ── TE 延迟导入（避免循环 import）────────────────────────────────────────
-
 def _get_te_gemm():
     from transformer_engine.pytorch.cpp_extensions.gemm import (
         general_gemm,
@@ -56,32 +41,28 @@ def _get_te_gemm():
     return general_gemm, general_grouped_gemm
 
 
-# ── 辅助函数 ─────────────────────────────────────────────────────────────
-
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
-
-# ── INT4 Fake Quant STE ───────────────────────────────────────────────────
 
 class _FakeInt4QuantizeSTE(torch.autograd.Function):
     """
     Per-group symmetric INT4 fake quantization with STE.
 
-    Group shape: [1, group_size]（沿 K 维分组，每行独立）
-    Quantization range: [-7, 7]（q_max=7，symmetric）
+    Group shape: [1, group_size] (grouped along K dimension, each row independently)
+    Quantization range: [-7, 7] (q_max=7, symmetric)
 
     forward: x_fq = round(x / scale).clamp(-7, 7) * scale
-    backward: dx = dy（Straight-Through Estimator，梯度直通）
+    backward: dx = dy (Straight-Through Estimator, gradient passes through)
 
-    完全移植自 Megatron 的 _FakeInt4QuantizationSTE，支持非对齐尺寸（pad-then-crop）。
+    Ported from Megatron's _FakeInt4QuantizationSTE; supports non-aligned sizes via pad-then-crop.
     """
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, group_size: int) -> torch.Tensor:
         m, n = x.shape
 
-        # ── 1. pad N 到 group_size 的整数倍 ──────────────────────────────
+        # Pad N to a multiple of group_size
         n_padded = _ceil_div(n, group_size) * group_size
         if n_padded != n:
             x_padded = torch.zeros(
@@ -91,22 +72,18 @@ class _FakeInt4QuantizeSTE(torch.autograd.Function):
         else:
             x_padded = x
 
-        # ── 2. reshape 成 [m, num_groups, group_size] ─────────────────────
         num_groups = n_padded // group_size
         x_view = x_padded.view(m, num_groups, group_size)
 
-        # ── 3. per-group scale = amax / q_max ─────────────────────────────
         q_max = 7
         x_max = x_view.abs().float().amax(dim=-1, keepdim=True)   # [m, num_groups, 1]
         x_scale = (x_max / q_max).clamp(min=1e-5)                 # [m, num_groups, 1]
 
-        # ── 4. fake quant: quantize + dequantize ──────────────────────────
         x_div   = x_view.float() / x_scale
         x_round = torch.round(x_div)
         x_q_clamped  = x_round.clamp(-q_max, q_max)
         x_dequant = (x_q_clamped * x_scale).to(x.dtype)           # [m, num_groups, group_size]
 
-        # ── 5. 还原原始 shape，截取有效部分 ─────────────────────────────
         x_out = x_dequant.view(m, n_padded)
         if n_padded != n:
             x_out = x_out[:, :n].contiguous()
@@ -115,35 +92,28 @@ class _FakeInt4QuantizeSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        # STE：梯度直通，不阻断
         return grad_output, None
 
 
 def fake_int4_quantize_ste(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    """
-    对外接口：对 x 做 per-group INT4 fake quantization（STE）。
-    保留 main_grad 属性（Megatron 兼容性）。
-    """
+    """Apply per-group INT4 fake quantization (STE) to x. Preserves main_grad attribute."""
     x_out = _FakeInt4QuantizeSTE.apply(x, group_size)
     if hasattr(x, "main_grad"):
         x_out.main_grad = x.main_grad
     return x_out
 
 
-# ── Int4TiledQuantizeOp ───────────────────────────────────────────────────
-
 class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
     """
-    INT4 per-group fake quantization operator，实现 QuantizeOpBase 接口。
+    INT4 per-group fake quantization operator implementing the QuantizeOpBase interface.
 
-    设计原则：
-    - fake quant 后 tensor 仍是 BF16，所有 GEMM 走 BF16 plain tensor 路径
-    - group_quantize 返回的 GroupQuantizeResult 中 data/scale 均为 BF16 tensor list
-    - grouped_gemm 调用 TE 的 general_grouped_gemm（BF16 路径）
-    - backward 由 group_linear.py 的 disable_backward_quant=True 控制，
-      直接走 BF16 GEMM，不调用本 Op 的量化逻辑
+    - Fake-quantized tensors remain BF16; all GEMMs use the BF16 plain tensor path.
+    - group_quantize returns a GroupQuantizeResult where data/scale are BF16 tensor lists.
+    - grouped_gemm delegates to TE general_grouped_gemm (BF16 path).
+    - Backward is controlled by group_linear.py's disable_backward_quant=True;
+      backward GEMMs use BF16 directly without invoking this op's quantization logic.
 
-    接口与 Nvfp4TiledQuantizeOp 完全一致，可直接替换使用。
+    Interface is identical to Nvfp4TiledQuantizeOp and can be used as a drop-in replacement.
     """
 
     def __init__(self):
@@ -152,8 +122,6 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
     @property
     def supports_allgather(self) -> bool:
         return False
-
-    # ── quantize（单 tensor 接口，兼容 QuantizeOpBase）────────────────────
 
     def quantize(
         self,
@@ -165,15 +133,15 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> quantization.QuantizeResult:
         """
-        对单个 tensor 做 per-group INT4 fake quantization。
+        Apply per-group INT4 fake quantization to a single tensor.
 
         Args:
-            x: 输入 tensor，shape [M, K]，dtype 必须是高精度浮点
-            qparams: 量化参数，group_size = qparams.quant_tile_shape[1]
-            return_transpose: 是否同时返回转置后的 fake-quantized tensor
+            x: Input tensor, shape [M, K], must be high-precision float.
+            qparams: Quantization params; group_size = qparams.quant_tile_shape[1].
+            return_transpose: Whether to also return the fake-quantized transpose.
 
         Returns:
-            QuantizeResult，data 是 BF16 fake-quantized tensor，scale 同样为 data（占位）
+            QuantizeResult where data is BF16 fake-quantized; scale is a placeholder (same as data).
         """
         assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES, (
             f"Int4TiledQuantizeOp.quantize: unsupported input dtype {x.dtype}"
@@ -182,20 +150,18 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         assert len(qparams.quant_tile_shape) == 2
 
         group_size = qparams.quant_tile_shape[1]
-        x_fq = fake_int4_quantize_ste(x, group_size)              # BF16 fake-quantized
+        x_fq = fake_int4_quantize_ste(x, group_size)
 
         x_fq_t = x_fq.T.contiguous() if return_transpose else None
 
         return quantization.QuantizeResult(
             data=x_fq,
-            scale=x_fq,        # fake quant 无独立 scale，用 data 占位
+            scale=x_fq,        # no separate scale for fake quant; use data as placeholder
             data_t=x_fq_t,
             scale_t=x_fq_t,
             tensor_scale=None,
             tensor_scale_t=None,
         )
-
-    # ── group_quantize（批量接口，供 _QuantizedGroupedLinear 调用）─────────
 
     def group_quantize(
         self,
@@ -208,20 +174,20 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> GroupQuantizeResult:
         """
-        批量 per-group INT4 fake quantization，适配 grouped GEMM 场景。
+        Batched per-group INT4 fake quantization for grouped GEMM.
 
-        输入 shape 约定（与 nvfp4_quantize_op.py 一致）：
-            WEIGHT: x.shape = [num_gemms, n, k]，对每个 expert 的 [n, k] 分别量化
-            ACT/GRAD: x.shape = [m_sum, k]，按 m_splits split 后分别量化
+        Input shape convention (consistent with nvfp4_quantize_op.py):
+            WEIGHT: x.shape = [num_gemms, n, k]; each expert's [n, k] is quantized independently.
+            ACT/GRAD: x.shape = [m_sum, k]; split by m_splits before quantization.
 
         Args:
-            x: 输入 tensor
-            qparams: 量化参数，group_size = qparams.quant_tile_shape[1]
-            m_splits: token 按 expert 的分割列表，len(m_splits) == num_gemms
-            return_transpose: 是否同时返回每个 tensor 的转置
+            x: Input tensor.
+            qparams: Quantization params; group_size = qparams.quant_tile_shape[1].
+            m_splits: Per-expert token counts; len(m_splits) == num_gemms.
+            return_transpose: Whether to also return each tensor's transpose.
 
         Returns:
-            GroupQuantizeResult，data/scale 均为 BF16 fake-quantized tensor list
+            GroupQuantizeResult where data/scale are BF16 fake-quantized tensor lists.
         """
         assert m_splits is not None, "group_quantize requires m_splits"
         assert qparams.quant_tile_shape is not None
@@ -230,7 +196,7 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         num_gemms = len(m_splits)
 
         if qparams.param_type == ParamType.WEIGHT:
-            # x: [num_gemms, n, k] → 对每个 [n, k] 分别做 fake quant
+            # x: [num_gemms, n, k] — fake-quantize each [n, k] slab independently
             assert x.dim() == 3, (
                 f"WEIGHT group_quantize expects 3D input [num_gemms, n, k], got {x.shape}"
             )
@@ -239,7 +205,7 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
                 for i in range(num_gemms)
             ]
         else:
-            # ACT/GRAD: 不量化
+            # ACT/GRAD: pass through without quantization
             assert x.dim() == 2, (
                 f"ACT/GRAD group_quantize expects 2D input [m_sum, k], got {x.shape}"
             )
@@ -251,7 +217,7 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         else:
             fq_t_list = [None] * num_gemms
 
-        # fake quant 后 tensor 即是最终结果，scale 用 data 占位（无独立 scale tensor）
+        # scale uses data as placeholder — fake quant has no separate scale tensor
         return GroupQuantizeResult(
             data=fq_list,
             scale=fq_list,
@@ -260,8 +226,6 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
             tensor_scale=fq_list,
             tensor_scale_t=fq_t_list,
         )
-
-    # ── qgemm（单次 BF16 GEMM）───────────────────────────────────────────
 
     def qgemm(
         self,
@@ -283,10 +247,9 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
         """
-        单次 BF16 GEMM（fake quant 后 tensor 仍是 BF16，直接调用 TE general_gemm）。
+        BF16 GEMM (fake-quantized tensors remain BF16; delegates to TE general_gemm).
 
-        fake quant 后 qx/qw 是 BF16 plain tensor，sx/sw 为占位（不使用）。
-        调用约定与 nvfp4_quantize_op.py 的 qgemm 保持一致。
+        sx/sw are placeholders and are not used.
         """
         general_gemm, _ = _get_te_gemm()
         gemm_out = general_gemm(
@@ -311,8 +274,6 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         )[0]
         return gemm_out
 
-    # ── grouped_gemm（BF16 grouped GEMM）────────────────────────────────
-
     def grouped_gemm(
         self,
         A: List[torch.Tensor],
@@ -332,38 +293,30 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        BF16 grouped GEMM，对应 group_linear.py 中 quantize_op.grouped_gemm 的调用。
+        BF16 grouped GEMM corresponding to group_linear.py's quantize_op.grouped_gemm call.
 
-        A, B 均为 BF16 fake-quantized tensor list（plain torch.Tensor），
-        sA/sB/global_amax_A/global_amax_B 均为 None（fake quant 无独立 scale）。
+        A and B are BF16 fake-quantized tensor lists (plain torch.Tensor).
+        sA/sB/global_amax_A/global_amax_B are None (no separate scale for fake quant).
 
-        调用约定与 nvfp4_quantize_op.py 的 grouped_gemm 保持一致：
-            - fprop (layout="TN"):  Y = A @ B.T，A=x_splits，B=weights
-            - dgrad (layout="NN"):  dX = dy @ W，A=dy_splits，B=weights
-            - wgrad (layout="NT"):  dW = dy.T @ x，A=dy_splits，B=x_splits
+        Layout convention (consistent with nvfp4_quantize_op.py):
+            fprop (layout="TN"):  Y = A @ B.T, A=x_splits, B=weights
+            dgrad (layout="NN"):  dX = dy @ W, A=dy_splits, B=weights
+            wgrad (layout="NT"):  dW = dy.T @ x, A=dy_splits, B=x_splits
 
-        注意：TE general_grouped_gemm 的 A/B 参数约定与直觉相反，
-        这里与 nvfp4_quantize_op.py 保持一致，传入时对调 A 和 B。
-
-        Args:
-            A: 左矩阵 tensor list（通常是 x 或 dy）
-            B: 右矩阵 tensor list（通常是 weight 或 x_t）
-            out_dtype: 输出 dtype
-            layout: "TN"（fprop）/ "NN"（dgrad）/ "NT"（wgrad）
-            m_splits: 每个 expert 的 token 数列表
-            grad: 是否为 backward 路径
-            accumulate: 是否累加到 out
+        Note: TE general_grouped_gemm's A/B convention is swapped vs. intuition;
+        we match nvfp4_quantize_op.py by passing A and B transposed.
         """
         assert m_splits is not None, "grouped_gemm requires m_splits"
 
         _, general_grouped_gemm = _get_te_gemm()
 
-        # ── 计算 out tensor ──────────────────────────────────────────────
         if grad:
             if layout == "NN":
-                # dgrad: A=dy_splits [m_i, n], B=weights [n, k] → [m_sum, k]
+                # dgrad: A=dy_splits [m_i, n], B=weights [n, k] -> [m_sum, k]
                 n_cols = B[0].size(1)
                 out = torch.empty(
                     [sum(m_splits), n_cols],
@@ -371,9 +324,9 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
                     device=B[0].device,
                 )
                 out = [out]
-            # wgrad (layout="NT") 的 out 由调用方传入（main_grad buffer）
+            # wgrad (layout="NT") out is provided by caller (main_grad buffer)
         else:
-            # fprop: B[i] shape [n, k] → output shape [m_sum, n]
+            # fprop: B[i] shape [n, k] -> output shape [m_sum, n]
             n_cols = B[0].size(0)
             out = torch.empty(
                 [sum(m_splits), n_cols],
@@ -382,7 +335,6 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
             )
             out = [out]
 
-        # ── 调用 TE general_grouped_gemm（A/B 对调，与 nvfp4 保持一致）────
         general_grouped_gemm(
             A=B,
             B=A,

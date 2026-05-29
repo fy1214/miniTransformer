@@ -266,7 +266,7 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void rht128_requant_kernel(
     }
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols);
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols, cudaStream_t stream);
 void rht128_requant_launcher(
     __nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
     nv_bfloat16* scratch_scales, unsigned* max_scale, const nv_bfloat16* h,
@@ -286,14 +286,15 @@ void rht128_requant_launcher(
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rht128_requant_kernel, 32*NUM_WARPS, smem));
     int sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaMemset(max_scale, 0, sizeof(unsigned)));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaMemsetAsync(max_scale, 0, sizeof(unsigned), stream));
 
     auto tmap = create_xT_fp4_tensor_map(x, M, N);
 
-    rht128_requant_kernel<<<sms * blocks, dim3(32, NUM_WARPS), smem>>>(
+    rht128_requant_kernel<<<sms * blocks, dim3(32, NUM_WARPS), smem, stream>>>(
         y, scratch_scales, max_scale, h, tmap, x_scales, x_global_scale, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, N, M/16);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, N, M/16, stream);
 }
 
 void rht128_requant(

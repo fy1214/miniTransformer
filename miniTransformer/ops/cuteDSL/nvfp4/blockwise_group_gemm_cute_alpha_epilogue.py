@@ -52,6 +52,10 @@ from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_compile_cache import (
     get_or_compile_grouped_gemm,
 )
 
+# Mirror the NO_CACHE flag from grouped_gemm_nvfp4_impl so kernel-level caches
+# (_stub_cache, _hw_cache, _inplace_buf, alpha_buf) are also bypassed.
+from miniTransformer.ops.cuteDSL.nvfp4 import grouped_gemm_nvfp4_impl as _impl_mod
+
 
 @dataclass(frozen=True)
 class GroupedBlockScaledConfig:
@@ -374,18 +378,22 @@ class Sm100GroupedBlockScaledGemmKernel:
             # underlying raw buffer via copy_ to avoid a new cute_tensor_like each call.
             total_m = alphas_packed.shape[0]
             _packed_key = (total_m, str(device))
-            if _packed_key not in _alpha_cache:
+            if _impl_mod.NO_CACHE or _packed_key not in _alpha_cache:
                 raw_buf = torch.empty(total_m, dtype=torch.float32, device=device)
-                wrapper, _ = cutlass_torch.cute_tensor_like(
+                wrapper, torch_tensor = cutlass_torch.cute_tensor_like(
                     raw_buf, cutlass.Float32, is_dynamic_layout=False, assumed_align=16,
                 )
-                _alpha_cache[_packed_key] = (raw_buf, wrapper)
+                # cute_tensor_like allocates a NEW torch_tensor (separate from raw_buf) and
+                # the CuTe wrapper points to torch_tensor's memory, not raw_buf's.
+                # We must cache torch_tensor so subsequent copy_ calls update the
+                # buffer the kernel actually reads from.
+                _alpha_cache[_packed_key] = (torch_tensor, wrapper)
             raw_buf, tensor_of_alpha_buf = _alpha_cache[_packed_key]
             raw_buf.copy_(alphas_packed)
         elif alphas is None:
             # All-ones alpha: fully cacheable.
             _alpha_key = ("ones", tuple(m for m, *_ in problem_sizes), str(device))
-            if _alpha_key not in _alpha_cache:
+            if _impl_mod.NO_CACHE or _alpha_key not in _alpha_cache:
                 alphas_list = [
                     torch.ones(m, dtype=torch.float32, device=device)
                     for m, *_ in problem_sizes
@@ -455,7 +463,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         min_sf_size *= (divisibility_sf + min_sf_size - 1) // min_sf_size
 
         _stub_key = out_dtype
-        if _stub_key not in self._stub_cache:
+        if _impl_mod.NO_CACHE or _stub_key not in self._stub_cache:
             self._stub_cache[_stub_key] = (
                 [
                     create_tensor_and_stride(
@@ -478,7 +486,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         initial_cute_tensors_abc, initial_cute_tensors_sfasfb = self._stub_cache[_stub_key]
 
         cluster_n = profile_cfg.cluster_shape_mn[0] * profile_cfg.cluster_shape_mn[1]
-        if 1 not in self._hw_cache or cluster_n not in self._hw_cache:
+        if _impl_mod.NO_CACHE or 1 not in self._hw_cache or cluster_n not in self._hw_cache:
             _hw = cutlass.utils.HardwareInfo()
             self._hw_cache[1] = _hw.get_max_active_clusters(1)
             self._hw_cache[cluster_n] = (
@@ -493,7 +501,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         )
         _tmap_key = sm_count
         _tmaps = self._run_cache.setdefault("tmap", {})
-        if _tmap_key not in _tmaps:
+        if _impl_mod.NO_CACHE or _tmap_key not in _tmaps:
             _tmaps[_tmap_key], _ = cutlass_torch.cute_tensor_like(
                 torch.empty(tensormap_shape, dtype=torch.int64, device=device),
                 cutlass.Int64,
@@ -507,7 +515,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         # from that internal buffer, NOT from the data_ref passed in.  We therefore save the
         # internal buffer (second return value) and update it on every call.
         _inplace_key = (num_groups, str(out_dtype), str(device))
-        if _inplace_key not in self._inplace_buf:
+        if _impl_mod.NO_CACHE or _inplace_key not in self._inplace_buf:
             _cute_mnkl, _buf_mnkl = cutlass_torch.cute_tensor_like(
                 torch.empty((num_groups, 4), dtype=torch.int32, device=device),
                 cutlass.Int32, is_dynamic_layout=False, assumed_align=16,
@@ -2083,11 +2091,14 @@ class Sm100GroupedBlockScaledGemmKernel:
 
                 # We still need to store 0s when k_tile_cnt is 0
                 if is_group_changed:
-                    # Incrementally advance offset: add previous group's M.
-                    # Group indices are non-decreasing per CTA in persistent scheduling,
-                    # so a single addition suffices (no O(G) loop needed).
-                    if last_group_idx >= cutlass.Int32(0):
-                        cur_alpha_offset = cur_alpha_offset + cur_alpha_m
+                    # Recompute alpha offset as prefix sum up to cur_group_idx.
+                    # Persistent scheduling can assign non-consecutive group indices to a
+                    # CTA (e.g. group 0 then group 5), so an incremental +prev_M is wrong
+                    # when groups are skipped.  An O(G) prefix sum is correct in all cases.
+                    cur_alpha_offset = cutlass.Int32(0)
+                    for _g in cutlass.range_constexpr(group_count):
+                        if cutlass.Int32(_g) < cur_group_idx:
+                            cur_alpha_offset = cur_alpha_offset + cutlass.Int32(problem_sizes_mnkl[_g, 0])
                     cur_alpha_m = cutlass.Int32(problem_sizes_mnkl[cur_group_idx, 0])
                     # construct tensor c based on real shape, stride information
                     real_tensor_c = self.make_tensor_abc_for_tensormap_update(

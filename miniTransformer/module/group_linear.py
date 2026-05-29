@@ -1,5 +1,7 @@
 import logging
+import os
 import torch
+from torch.profiler import record_function  # keep for profiler annotations
 from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
@@ -8,7 +10,7 @@ from ..distributed.distributed import get_distributed_rank, allreduce, set_tenso
 from ..quantiztion import quantization
 from ..quantiztion.quantization import GroupQuantizeResultCache
 from ..utils.utils import is_rank_0, cast_if_needed, divide, init_method_constant
-from ..utils.env import should_keep_backward_in_bf16
+from ..utils.env import should_keep_backward_in_bf16, get_linear_profiler_config, get_linear_tensor_stats_config
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +51,8 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         num_gemms = len(m_splits)
 
         assert qlinear_params.quantize_op is not None
-        # Use DeepGEMM quantize_op for x, w, w_t, dy (not dy_t nor x_t)
         quantize_op: quantization.QuantizeOpBase = qlinear_params.quantize_op
 
-        # Set dtypes, shapes
         x_shape = x.shape
         out_dtype = (
             x.dtype
@@ -62,15 +62,14 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         x = x.view(-1, x.shape[-1])  # to 2D
         x = cast_if_needed(x, activation_dtype)
 
-        # Quantize x (x_t is handled in backward)
-        # x: [m_sum, k], scale shape: [m_sum, k/128]
-        # disable_backward_quant=True 时不需要 x_t（backward 直接用 BF16 x），省略 columnwise 量化
-        qresult_x_list = quantize_op.group_quantize(
-            x,
-            qlinear_params.x_params,
-            m_splits=m_splits,
-            return_transpose=(is_grad_enabled and not disable_backward_quant)
-        )
+        # disable_backward_quant skips columnwise quantization since x_t is unused in BF16 backward
+        with record_function("group_quantize_x"):
+            qresult_x_list = quantize_op.group_quantize(
+                x,
+                qlinear_params.x_params,
+                m_splits=m_splits,
+                return_transpose=(is_grad_enabled and not disable_backward_quant)
+            )
         qx, sx, tx, qx_t, sx_t, tx_t = (qresult_x_list.data,
                                           qresult_x_list.scale,
                                           qresult_x_list.tensor_scale,
@@ -79,17 +78,17 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                                           qresult_x_list.tensor_scale_t)
 
 
-        # Quantize w only for is_first_microbatch is True or None
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
 
         if quantize_op.should_update_quantize_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
-            qresult_w_list = quantize_op.group_quantize(
-                w,
-                qlinear_params.w_params,
-                m_splits=m_splits,
-                return_transpose=(is_grad_enabled and not disable_backward_quant)
-            )
+            with record_function("group_quantize_w"):
+                qresult_w_list = quantize_op.group_quantize(
+                    w,
+                    qlinear_params.w_params,
+                    m_splits=m_splits,
+                    return_transpose=(not disable_backward_quant)
+                )
             qw = qresult_w_list.data
             sw = qresult_w_list.scale
             qw_t = qresult_w_list.data_t
@@ -98,19 +97,20 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             tw_t = qresult_w_list.tensor_scale_t
         elif update_fp8_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]
-            qresult_w_list = quantize_op.group_quantize(
-                w,
-                qlinear_params.w_params,
-                m_splits=m_splits,
-                return_transpose=(is_grad_enabled and not disable_backward_quant)
-            )
-            # save FP8 weight cache between microbatches
-            qw = weight_qresult_cache.data = qresult_w_list.data
+            with record_function("group_quantize_w"):
+                qresult_w_list = quantize_op.group_quantize(
+                    w,
+                    qlinear_params.w_params,
+                    m_splits=m_splits,
+                    return_transpose=(not disable_backward_quant)
+                )
             sw = weight_qresult_cache.scale = qresult_w_list.scale
+            qw = weight_qresult_cache.data = qresult_w_list.data
             qw_t = weight_qresult_cache.data_t = qresult_w_list.data_t
             sw_t = weight_qresult_cache.scale_t = qresult_w_list.scale_t
             tw = weight_qresult_cache.global_amax_row = qresult_w_list.tensor_scale
             tw_t = weight_qresult_cache.global_amax_col = qresult_w_list.tensor_scale_t
+            weight_qresult_cache.extra_info = qresult_w_list.extra_info
         else:
             w = None
             qw, sw, tw, qw_t, sw_t, tw_t  = (weight_qresult_cache.data,
@@ -119,34 +119,40 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                                              weight_qresult_cache.data_t,
                                              weight_qresult_cache.scale_t,
                                              weight_qresult_cache.global_amax_col)
+            qresult_w_list = quantization.GroupQuantizeResult(
+                data=qw, scale=sw, data_t=qw_t, scale_t=sw_t,
+                tensor_scale=tw, tensor_scale_t=tw_t,
+                extra_info=weight_qresult_cache.extra_info,
+            )
 
         assert qw is not None, "FP8 weight cache should not be None"
 
-        y = quantize_op.grouped_gemm(
-            A=qx,
-            B=qw,
-            sA=sx,
-            sB=sw,
-            global_amax_A=tx,
-            global_amax_B=tw,
-            out=None,
-            out_dtype=out_dtype,
-            m_splits=m_splits,
-            qparams_x=qlinear_params.x_params,
-            qparams_w=qlinear_params.w_params
-        )
+        with record_function("grouped_gemm"):
+            y = quantize_op.grouped_gemm(
+                A=qx,
+                B=qw,
+                sA=sx,
+                sB=sw,
+                global_amax_A=tx,
+                global_amax_B=tw,
+                out=None,
+                out_dtype=out_dtype,
+                m_splits=m_splits,
+                qparams_x=qlinear_params.x_params,
+                qparams_w=qlinear_params.w_params,
+                extra_info_A=qresult_x_list.extra_info,
+                extra_info_B=qresult_w_list.extra_info
+            )
         logger.debug(f"[Hybrid] After Grouped QGEMM, y shape [m, n]: {list(y.shape)}")
 
         # Save context for backward pass
         if is_grad_enabled:
-            ctx.use_bias = False    # not use bias inside this OP, but may apply bias outside
-            # ctx.sequence_parallel = sequence_parallel
+            ctx.use_bias = False    # bias is applied outside this op
             ctx.num_gemms = num_gemms
             ctx.m_splits = m_splits
             ctx.tp_group = tp_group
             ctx.tp_size = tp_size
             ctx.tp_rank = get_distributed_rank(tp_group) if tp_group is not None else 0
-            # ctx.x_gather_required = gather_required
             ctx.parallel_mode = parallel_mode
             ctx.x_shape = x_shape
             ctx.qlinear_params = qlinear_params
@@ -156,11 +162,9 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             ctx.device = x.device  # Save device for backward
             ctx.weights_requires_grad = weights[0].requires_grad
             if fuse_wgrad_accumulation and ctx.weights_requires_grad:
-                # This check is needed to ensure that main_grad is not created
-                # during the forward pass when using MCore FSDP as it creates
-                # the main_grad buffer lazily before backprop
+                # MCore FSDP creates main_grad lazily before backward — don't access it during forward.
                 if hasattr(weights[0], "__fsdp_param__"):
-                    # MCore FSDP creates main_grad lazily before backward
+                    # MCore FSDP: retrieve main_grad via accessor to avoid premature materialization
                     ctx.main_grad_funcs = [weights[i].get_main_grad for i in range(num_gemms)]
                 else:
                     ctx.main_grad_funcs = [
@@ -172,13 +176,10 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.disable_backward_quant = disable_backward_quant
 
-            # save_for_backward only accepts plain torch.Tensor.
-            # NVFP4TensorStorage / NVFP4Tensor are TE custom objects, store them on ctx directly.
-            # Only plain weight tensors go into save_for_backward.
+            # save_for_backward only accepts plain torch.Tensor; TE custom objects (NVFP4TensorStorage etc.)
+            # must be stored directly on ctx.
             if disable_backward_quant:
-                # 不量化 backward：保存原始 BF16 的 x 切片列表和 w
-                # dgrad 用：dy @ w.T（BF16）
-                # wgrad 用：dy.T @ x（BF16）
+                # BF16 backward path: save raw input slices; dgrad = dy @ w.T, wgrad = dy.T @ x
                 ctx.x_bf16_list = list(torch.split(x, m_splits, dim=0))
                 ctx.qx_t = ctx.sx_t = ctx.tx_t = None
                 ctx.qw_t = ctx.sw_t = ctx.tw_t = None
@@ -192,12 +193,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 ctx.x_bf16_list = None
             ctx.save_for_backward(*weights)
 
-        # JQ: sequence parallel not ready yet
-        # if parallel_mode == "row" and sequence_parallel:
-        #     assert tp_group is not None
-        #     y, _ = reduce_scatter_along_first_dim(y, tp_group)
-
-        # TODO:
         if (parallel_mode == "row") and (tp_size > 1):
             y, _ = allreduce(y, tp_group)
 
@@ -226,7 +221,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         if not ctx.disable_backward_quant:
             assert qw_t is not None and sw_t is not None
 
-        # Set dtypes, shapes
         out_dtype_dgrad = (
             dy.dtype
             if ctx.qlinear_params.mm_dgrad.out_dtype is None
@@ -235,14 +229,12 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         dy = dy.contiguous()
         dy = dy.view(-1, dy.shape[-1])
 
-        # Bias gradient
         b_grad = torch.sum(dy, dim=0) if ctx.use_bias else None
 
-        dy_splits = None  # 供 BF16 路径的 dgrad 和 wgrad 共用
+        dy_splits = None  # reused by both dgrad and wgrad BF16 paths below
 
         if ctx.disable_backward_quant:
-            # ── BF16 路径：直接传 BF16 tensor list 给 grouped_gemm ──────────
-            # dgrad layout "NN": A=dy_splits [m_i, n], B=weights [n, k] → [m_sum, k]
+            # BF16 path: dgrad = dy @ w.T (layout NN)
             dy_splits = list(torch.split(dy, ctx.m_splits, dim=0))
             dgrad = ctx.quantize_op.grouped_gemm(
                 A=dy_splits,
@@ -256,15 +248,12 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 grad=True,
             )
         else:
-            # ── 量化路径 ──────────────────────────────────────────────────
-            # Quantize dy (with transpose)
-            # dy: [m_sum, h_out]
-            # dy_t: [groups, h_out, m]
+            # Quantized path: quantize dy and compute dgrad via quantized grouped GEMM
             qresult_dy_list = ctx.quantize_op.group_quantize(
                 dy,
                 ctx.qlinear_params.g_params,
                 m_splits=ctx.m_splits,
-                return_transpose=True,  # Need transpose for wgrad computation
+                return_transpose=True,
             )
             qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = (qresult_dy_list.data,
                                                    qresult_dy_list.scale,
@@ -310,12 +299,8 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 for w in weights
             ]
 
-        # GEMM wgrad
         if ctx.disable_backward_quant:
-            # ── BF16 路径：传 BF16 tensor list 给 grouped_gemm ──────────────
-            # wgrad layout "NT": A=dy_splits [m_i, n], B=x_bf16_list [m_i, k]
-            # → wgrad_i [n, k] = dy_i.T @ x_i
-            # dy_splits 已在 dgrad 路径中计算，直接复用
+            # BF16 path: wgrad = dy.T @ x (layout NT); dy_splits already computed in dgrad path
             wgrad = ctx.quantize_op.grouped_gemm(
                 A=dy_splits,
                 B=ctx.x_bf16_list,
@@ -348,7 +333,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         def handle_custom_ddp_from_mcore(weight, wgrad):
             if ctx.weights_requires_grad:
-                # Handle custom DDP from mcore.
+                # Megatron-Core custom DDP accumulates gradients into main_grad instead of .grad.
                 if ctx.fuse_wgrad_accumulation and hasattr(
                         weight, "grad_added_to_main_grad"
                 ):
@@ -396,6 +381,44 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         )
 
 class GroupedLinear(LayerLinearBaseModule):
+
+    _profiler_instance_count: int = 0
+    _stats_instance_count: int = 0
+
+    @classmethod
+    def _try_attach_profiler(cls, module: "GroupedLinear") -> None:
+        cfg = get_linear_profiler_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "grouped":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._profiler_instance_count
+        cls._profiler_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearProfiler
+        label = module.layer_name or f"grouped_linear_{idx}"
+        LinearProfiler(label=label, **cfg).attach(module)
+        print(f"[LinearProfiler] attached to GroupedLinear instance {idx} (label={label})", flush=True)
+
+    @classmethod
+    def _try_attach_tensor_stats(cls, module: "GroupedLinear") -> None:
+        cfg = get_linear_tensor_stats_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "grouped":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._stats_instance_count
+        cls._stats_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearStatsHook
+        label = module.layer_name or f"grouped_linear_{idx}"
+        LinearStatsHook(label=label, **cfg).attach(module)
+        print(f"[TensorStats] attached to GroupedLinear instance {idx} (label={label})", flush=True)
+
     def __init__(
         self,
         num_gemms: int,
@@ -441,7 +464,6 @@ class GroupedLinear(LayerLinearBaseModule):
         ), "GroupedLinear doesn't support Userbuffer overlap."
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
-        # JQ: hybrid addtional
         self.layer_name = ub_name
         self.layer_number = layer_number
 
@@ -451,8 +473,6 @@ class GroupedLinear(LayerLinearBaseModule):
                    f", fuse wgrad accum: {fuse_wgrad_accumulation}"
                    f", use_bias: {bias}")
 
-        # JQ: just set hybrid recipe
-        # Set quantization parameters
         self.qlinear_params = self.set_qlinear_params(
             qlinear_params=qlinear_params,
             layer_number=self.layer_number,
@@ -487,7 +507,6 @@ class GroupedLinear(LayerLinearBaseModule):
             "grad_output": 0
         }
         for i in range(self.num_gemms):
-            # Construct weight parameter
             self.register_parameter(
                 f"weight{i}",
                 torch.nn.Parameter(
@@ -500,11 +519,8 @@ class GroupedLinear(LayerLinearBaseModule):
                 ),
                 init_fn=init_method,
                 get_rng_state_tracker=get_rng_state_tracker,
-                # JQ: not needed in hybrid, see _ParameterInitMeta
-                # fp8_meta_index=self._offsets["weight"] + i,
             )
 
-            # Construct bias parameters if needed
             if self.use_bias:
                 self.register_parameter(
                     f"bias{i}",
@@ -542,8 +558,11 @@ class GroupedLinear(LayerLinearBaseModule):
         self.fp8_calibration = False
         self.fp8_meta: dict = {"fp8_checkpoint": False}
 
-        # JQ: DeepGEMM Grouped GEMM not support bias yet, thus apply bias at the end.
+        # Grouped GEMM backend doesn't support bias fusion; apply bias after GEMM.
         self.gemm_bias_unfused_add = (self.use_bias and not return_bias)
+
+        GroupedLinear._try_attach_profiler(self)
+        GroupedLinear._try_attach_tensor_stats(self)
 
     def init_fp8_metadata(self, num_gemms: int = 1) -> None:
         """Stub for Megatron compatibility (merge_extra_states pre-hook calls this on load).
@@ -555,7 +574,6 @@ class GroupedLinear(LayerLinearBaseModule):
         super().reset_parameters(defer_init=defer_init)
 
         if not defer_init:
-            # Set parallelism attributes for linear weights
             for i in range(self.num_gemms):
                 set_tensor_model_parallel_attributes(
                     tensor=getattr(self, f"weight{i}"),
@@ -564,7 +582,6 @@ class GroupedLinear(LayerLinearBaseModule):
                     stride=1,
                 )
 
-            # Set parallelism attributes for linear biases
             if self.use_bias:
                 for i in range(self.num_gemms):
                     if self.parallel_mode == "row":
@@ -582,9 +599,6 @@ class GroupedLinear(LayerLinearBaseModule):
         inp: torch.Tensor,
         m_splits: List[int],
         is_first_microbatch: Optional[bool] = None,
-        # JQ: Linear has these two, do we need them here?
-        # fp8_output: Optional[bool] = False,
-        # inp_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply the linear transformation to the input.
@@ -615,18 +629,16 @@ class GroupedLinear(LayerLinearBaseModule):
         # if skip_fp8_weight_update is not None:
         #     is_first_microbatch = False
 
-        # with self.prepare_forward(inp, num_gemms=self.num_gemms) as inp:
         self.set_activation_dtype(inp)
         inp = inp.contiguous()
 
-        # Prepare weight and bias
         weight_tensors = [getattr(self, f"weight{i}") for i in range(self.num_gemms)]
         bias_tensors = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
 
-        if torch.is_grad_enabled(): # Training
+        if torch.is_grad_enabled():
             linear_fn = _QuantizedGroupedLinear.apply
             args = []
-        else: # Validation
+        else:
             linear_fn = _QuantizedGroupedLinear.forward
             args = [None]
         args += (
@@ -644,6 +656,7 @@ class GroupedLinear(LayerLinearBaseModule):
             self.disable_backward_quant,
             *weight_tensors,
         )
+
         out = linear_fn(*args)
 
         if self.gemm_bias_unfused_add:

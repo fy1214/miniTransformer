@@ -718,7 +718,7 @@ class TestGroupedCutlassGemmVsTE:
         from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
 
         # ---- CUTLASS C++ inputs ----
-        cutlass_inputs = TestGroupedCutlassGemmBenchmark._build_inputs(shapes)
+        cutlass_inputs = TestGroupedCutlassGemmV2Correctness._build_inputs(shapes)
         a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list = cutlass_inputs
 
         def fn_cutlass():
@@ -892,7 +892,7 @@ class TestGroupedCutlassGemmV2Benchmark:
 
         # ---- v1 inputs (list-based) ----
         a_list, b_list, a_sf_list, b_sf_list, pts_list, ts_a_list, ts_b_list = (
-            TestGroupedCutlassGemmBenchmark._build_inputs(shapes)
+            TestGroupedCutlassGemmV2Correctness._build_inputs(shapes)
         )
         n = shapes[0][1]
         total_m = sum(s[0] for s in shapes)

@@ -1,7 +1,7 @@
 import logging
 import os
 import torch
-from torch.profiler import profile, ProfilerActivity, record_function
+from torch.profiler import record_function  # keep for profiler annotations
 from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
@@ -10,7 +10,7 @@ from ..distributed.distributed import get_distributed_rank, allreduce, set_tenso
 from ..quantiztion import quantization
 from ..quantiztion.quantization import GroupQuantizeResultCache
 from ..utils.utils import is_rank_0, cast_if_needed, divide, init_method_constant
-from ..utils.env import should_keep_backward_in_bf16
+from ..utils.env import should_keep_backward_in_bf16, get_linear_profiler_config, get_linear_tensor_stats_config
 
 logger = logging.getLogger(__name__)
 
@@ -61,36 +61,6 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         )
         x = x.view(-1, x.shape[-1])  # to 2D
         x = cast_if_needed(x, activation_dtype)
-
-        # ── DUMP: save first forward call's raw bf16 x/w/y for offline analysis ──
-        _dump_dir = os.environ.get("NVFP4_DUMP_DIR", "")
-        _dump_call_limit = int(os.environ.get("NVFP4_DUMP_CALLS", "0"))
-        _dump_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        if not hasattr(_QuantizedGroupedLinear, "_dump_count"):
-            _QuantizedGroupedLinear._dump_count = 0
-        _do_dump = _dump_dir and _dump_rank == 0 and _QuantizedGroupedLinear._dump_count < _dump_call_limit
-
-        _prof_dir = os.environ.get("NVFP4_PROFILE_DIR", "")
-        _prof_calls = int(os.environ.get("NVFP4_PROFILE_CALLS", "0"))
-        _prof_grad = os.environ.get("NVFP4_PROFILE_GRAD", "0") == "1"
-        if not hasattr(_QuantizedGroupedLinear, "_prof_count"):
-            _QuantizedGroupedLinear._prof_count = 0
-        # When NVFP4_PROFILE_GRAD=1, profiling is driven from GroupedLinear.forward
-        # to capture backward as well; skip starting the profiler here.
-        _do_profile = (
-            bool(_prof_dir)
-            and _dump_rank == 0
-            and _QuantizedGroupedLinear._prof_count < _prof_calls
-            and not _prof_grad
-        )
-        if _do_profile:
-            _prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-            )
-            _prof.__enter__()
 
         # disable_backward_quant skips columnwise quantization since x_t is unused in BF16 backward
         with record_function("group_quantize_x"):
@@ -173,34 +143,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 extra_info_A=qresult_x_list.extra_info,
                 extra_info_B=qresult_w_list.extra_info
             )
-        if _do_profile:
-            _prof.__exit__(None, None, None)
-            print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
-            os.makedirs(_prof_dir, exist_ok=True)
-            _trace = os.path.join(_prof_dir, f"gl_trace_{_QuantizedGroupedLinear._prof_count:03d}.json")
-            _prof.export_chrome_trace(_trace)
-            print(f"[PROFILE] Trace saved → {_trace}", flush=True)
-            _QuantizedGroupedLinear._prof_count += 1
         logger.debug(f"[Hybrid] After Grouped QGEMM, y shape [m, n]: {list(y.shape)}")
-
-        # ── DUMP: save x / w(stacked) / y / m_splits for offline single-op replay ──
-        if _do_dump:
-            os.makedirs(_dump_dir, exist_ok=True)
-            save_path = os.path.join(_dump_dir, f"gemm_call_{_QuantizedGroupedLinear._dump_count:03d}.pt")
-            # w may be None when using cached weight (is_first_microbatch=False); skip those
-            w_save = w.detach().cpu() if w is not None else None
-            torch.save({
-                "x": x.detach().cpu(),       # bf16 [total_m, k]
-                "w": w_save,                 # bf16 [num_gemms, n, k] or None
-                "m_splits": m_splits,
-                "y_fp4": y.detach().cpu(),   # FP4 GEMM output [total_m, n]
-                "out_dtype": str(out_dtype),
-            }, save_path)
-            print(f"[DUMP] call={_QuantizedGroupedLinear._dump_count}  saved={save_path}  "
-                  f"x={tuple(x.shape)}  m_splits={m_splits}  "
-                  f"w={'x'.join(str(d) for d in w_save.shape) if w_save is not None else 'cached'}  "
-                  f"y={tuple(y.shape)}", flush=True)
-            _QuantizedGroupedLinear._dump_count += 1
 
         # Save context for backward pass
         if is_grad_enabled:
@@ -438,6 +381,44 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         )
 
 class GroupedLinear(LayerLinearBaseModule):
+
+    _profiler_instance_count: int = 0
+    _stats_instance_count: int = 0
+
+    @classmethod
+    def _try_attach_profiler(cls, module: "GroupedLinear") -> None:
+        cfg = get_linear_profiler_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "grouped":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._profiler_instance_count
+        cls._profiler_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearProfiler
+        label = module.layer_name or f"grouped_linear_{idx}"
+        LinearProfiler(label=label, **cfg).attach(module)
+        print(f"[LinearProfiler] attached to GroupedLinear instance {idx} (label={label})", flush=True)
+
+    @classmethod
+    def _try_attach_tensor_stats(cls, module: "GroupedLinear") -> None:
+        cfg = get_linear_tensor_stats_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "grouped":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._stats_instance_count
+        cls._stats_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearStatsHook
+        label = module.layer_name or f"grouped_linear_{idx}"
+        LinearStatsHook(label=label, **cfg).attach(module)
+        print(f"[TensorStats] attached to GroupedLinear instance {idx} (label={label})", flush=True)
+
     def __init__(
         self,
         num_gemms: int,
@@ -580,6 +561,9 @@ class GroupedLinear(LayerLinearBaseModule):
         # Grouped GEMM backend doesn't support bias fusion; apply bias after GEMM.
         self.gemm_bias_unfused_add = (self.use_bias and not return_bias)
 
+        GroupedLinear._try_attach_profiler(self)
+        GroupedLinear._try_attach_tensor_stats(self)
+
     def init_fp8_metadata(self, num_gemms: int = 1) -> None:
         """Stub for Megatron compatibility (merge_extra_states pre-hook calls this on load).
         miniTransformer uses its own quantization pipeline, not TE's FP8 metadata.
@@ -673,43 +657,7 @@ class GroupedLinear(LayerLinearBaseModule):
             *weight_tensors,
         )
 
-        _prof_dir = os.environ.get("NVFP4_PROFILE_DIR", "")
-        _prof_calls = int(os.environ.get("NVFP4_PROFILE_CALLS", "0"))
-        _prof_grad = os.environ.get("NVFP4_PROFILE_GRAD", "0") == "1"
-        _prof_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        if not hasattr(GroupedLinear, "_grad_prof_count"):
-            GroupedLinear._grad_prof_count = 0
-        _do_grad_profile = (
-            _prof_grad
-            and bool(_prof_dir)
-            and _prof_rank == 0
-            and torch.is_grad_enabled()
-            and GroupedLinear._grad_prof_count < _prof_calls
-        )
-
-        if _do_grad_profile:
-            _gprof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-            )
-            _gprof.__enter__()
-
         out = linear_fn(*args)
-
-        if _do_grad_profile:
-            # Register backward hook to stop profiler after backward completes.
-            def _stop_prof(grad):
-                _gprof.__exit__(None, None, None)
-                print(_gprof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
-                os.makedirs(_prof_dir, exist_ok=True)
-                _trace = os.path.join(_prof_dir, f"gl_grad_trace_{GroupedLinear._grad_prof_count:03d}.json")
-                _gprof.export_chrome_trace(_trace)
-                print(f"[PROFILE] grad trace saved → {_trace}", flush=True)
-                GroupedLinear._grad_prof_count += 1
-                return grad
-            out.register_hook(_stop_prof)
 
         if self.gemm_bias_unfused_add:
             out_shape = out.shape

@@ -50,26 +50,32 @@ def _fmt_stats(name: str, stats: dict) -> str:
     )
 
 
-class TensorStatsHook:
-    """Lightweight hook that prints tensor statistics for inp/weight/dy/dgrad/wgrad.
+class LinearStatsHook:
+    """Lightweight hook that prints tensor statistics at four points per step:
+
+        fwd_pre  — before forward  : inp, weight
+        fwd_post — after  forward  : inp, weight, output
+        bwd_pre  — before backward : dy
+        bwd_post — after  backward : dy, dgrad, wgrad
 
     Activated via environment variables (see miniTransformer/utils/env.py):
 
-        LINEAR_STATS_DIR          : if set, enable stats printing and optional dump
+        LINEAR_STATS_STEPS        : total steps to capture (required to enable; -1 = infinite)
+        LINEAR_STATS_CLASS        : "linear" or "grouped" (default "linear")
+        LINEAR_STATS_INSTANCE     : 0-based instance index (default 0)
         LINEAR_STATS_SKIP_STEPS   : forward calls to skip before printing (default 0)
-        LINEAR_STATS_NUM_STEPS    : how many steps to print after skipping (default 1, -1 = infinite)
-        LINEAR_STATS_DUMP         : 1 = also save tensors as .pt files (default 0)
-        LINEAR_STATS_BWD          : 1 = also collect dy/dgrad/wgrad (default 1)
+        LINEAR_STATS_DUMP_DIR     : directory to save raw tensors as .pt files
+        LINEAR_STATS_BWD          : 1 = also hook backward (default 1)
         LINEAR_STATS_RANK         : rank to collect on; -1 = all ranks (default 0)
 
     Parameters
     ----------
-    label:      prefix used in log lines and file names.
-    skip_steps: forward calls to ignore before first capture.
-    num_steps:  how many steps to record; -1 = no limit.
-    with_backward: also hook backward (dy, dgrad, wgrad).
-    dump_dir:   if not None, save tensors as <dump_dir>/<label>_step<N>_<name>.pt.
-    rank:       local rank that performs capture; -1 = all ranks.
+    label:         prefix used in log lines and file names.
+    skip_steps:    forward calls to ignore before first capture.
+    num_steps:     how many steps to record; -1 = no limit.
+    with_backward: register bwd_pre and bwd_post hooks.
+    dump_dir:      if not None, save tensors as <dump_dir>/<label>_step<N>_<name>.pt.
+    rank:          local rank that performs capture; -1 = all ranks.
     """
 
     def __init__(
@@ -91,7 +97,9 @@ class TensorStatsHook:
         self._step_count = 0
         self._capture_count = 0
         self._handles: list = []
-        # stash inp/weight captured in fwd so backward hook can reference them
+        self._module: torch.nn.Module | None = None
+        self._module_attr: str | None = None
+        # tensors stashed in fwd_pre for use in fwd_post and bwd hooks
         self._last_inp: torch.Tensor | None = None
         self._last_weight: torch.Tensor | None = None
 
@@ -111,14 +119,21 @@ class TensorStatsHook:
     # Attach / detach
     # ------------------------------------------------------------------
 
-    def attach(self, module: torch.nn.Module) -> "TensorStatsHook":
+    def attach(self, module: torch.nn.Module) -> "LinearStatsHook":
         self.detach()
+        attr = f"_linear_stats_hook_{id(self)}"
+        if hasattr(module, attr):
+            return self  # already attached by this instance
+        setattr(module, attr, self)
+        self._module = module
+        self._module_attr = attr
         handles = [
             module.register_forward_pre_hook(self._on_fwd_pre),
             module.register_forward_hook(self._on_fwd_post),
         ]
         if self.with_backward:
-            handles.append(module.register_full_backward_hook(self._on_bwd))
+            handles.append(module.register_full_backward_pre_hook(self._on_bwd_pre))
+            handles.append(module.register_full_backward_hook(self._on_bwd_post))
         self._handles = handles
         return self
 
@@ -128,36 +143,52 @@ class TensorStatsHook:
         self._handles = []
         self._last_inp = None
         self._last_weight = None
+        if self._module is not None:
+            attr = getattr(self, "_module_attr", None)
+            if attr and hasattr(self._module, attr):
+                delattr(self._module, attr)
+            self._module = None
 
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
 
     def _on_fwd_pre(self, module, inputs):
+        """Before forward: print inp, weight."""
         self._step_count += 1
         if not self._should_capture():
             return
         inp = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-        # grab the weight (first Parameter on the module)
         weight = next((p for p in module.parameters(recurse=False)), None)
         self._last_inp = inp.detach()
         self._last_weight = weight.detach() if weight is not None else None
 
+        step = self._capture_count
+        lines = [f"[TensorStats] {self.label}  step={step}  fwd_pre"]
+        lines.append(_fmt_stats("inp",    _tensor_stats(self._last_inp)))
+        if self._last_weight is not None:
+            lines.append(_fmt_stats("weight", _tensor_stats(self._last_weight)))
+        print("\n".join(lines), flush=True)
+
     def _on_fwd_post(self, module, inputs, output):
+        """After forward: print inp, weight, output."""
         if not self._should_capture():
             return
-        inp = self._last_inp
-        weight = self._last_weight
         step = self._capture_count
-        lines = [f"[TensorStats] {self.label}  step={step}  fwd"]
-        if inp is not None:
-            lines.append(_fmt_stats("inp", _tensor_stats(inp)))
-        if weight is not None:
-            lines.append(_fmt_stats("weight", _tensor_stats(weight)))
+        lines = [f"[TensorStats] {self.label}  step={step}  fwd_post"]
+        if self._last_inp is not None:
+            lines.append(_fmt_stats("inp",    _tensor_stats(self._last_inp)))
+        if self._last_weight is not None:
+            lines.append(_fmt_stats("weight", _tensor_stats(self._last_weight)))
+        out = output[0] if isinstance(output, (tuple, list)) else output
+        if isinstance(out, torch.Tensor):
+            lines.append(_fmt_stats("output",  _tensor_stats(out)))
         print("\n".join(lines), flush=True)
         if self.dump_dir is not None:
-            self._dump(inp, f"step{step:04d}_inp")
-            self._dump(weight, f"step{step:04d}_weight")
+            self._dump(self._last_inp,    f"step{step:04d}_inp")
+            self._dump(self._last_weight, f"step{step:04d}_weight")
+            self._dump(out if isinstance(out, torch.Tensor) else None,
+                       f"step{step:04d}_output")
         if not self.with_backward:
             self._capture_count += 1
             self._last_inp = None
@@ -165,30 +196,43 @@ class TensorStatsHook:
             if self.done:
                 self.detach()
 
-    def _on_bwd(self, module, grad_input, grad_output):
+    def _on_bwd_pre(self, module, grad_output):
+        """Before backward: print dy (upstream gradient flowing in)."""
         if not self._should_capture():
             return
         step = self._capture_count
-        # grad_output[0] is dy (gradient w.r.t. module output)
-        # grad_input[0] is dgrad (gradient w.r.t. module input)
         dy = grad_output[0] if grad_output else None
-        dgrad = grad_input[0] if grad_input else None
-        lines = [f"[TensorStats] {self.label}  step={step}  bwd"]
+        lines = [f"[TensorStats] {self.label}  step={step}  bwd_pre"]
         if dy is not None:
             lines.append(_fmt_stats("dy", _tensor_stats(dy)))
+        print("\n".join(lines), flush=True)
+        if self.dump_dir is not None:
+            self._dump(dy, f"step{step:04d}_dy_pre")
+
+    def _on_bwd_post(self, module, grad_input, grad_output):
+        """After backward: print dy, dgrad, wgrad."""
+        if not self._should_capture():
+            return
+        step = self._capture_count
+        # grad_output[0] = dy  (upstream gradient, same as bwd_pre)
+        # grad_input[0]  = dgrad (gradient w.r.t. module input)
+        dy    = grad_output[0] if grad_output else None
+        dgrad = grad_input[0]  if grad_input  else None
+        lines = [f"[TensorStats] {self.label}  step={step}  bwd_post"]
+        if dy is not None:
+            lines.append(_fmt_stats("dy",    _tensor_stats(dy)))
         if dgrad is not None:
             lines.append(_fmt_stats("dgrad", _tensor_stats(dgrad)))
-        # wgrad is accessible via the weight's .grad at this point
         weight = self._last_weight
         if weight is not None:
             wg = weight.grad
             if wg is not None:
-                lines.append(_fmt_stats("wgrad", _tensor_stats(wg)))
+                lines.append(_fmt_stats("wgrad",      _tensor_stats(wg)))
             elif hasattr(weight, "main_grad") and weight.main_grad is not None:
                 lines.append(_fmt_stats("wgrad(main)", _tensor_stats(weight.main_grad)))
         print("\n".join(lines), flush=True)
         if self.dump_dir is not None:
-            self._dump(dy, f"step{step:04d}_dy")
+            self._dump(dy,    f"step{step:04d}_dy")
             self._dump(dgrad, f"step{step:04d}_dgrad")
             if weight is not None and weight.grad is not None:
                 self._dump(weight.grad, f"step{step:04d}_wgrad")
@@ -245,7 +289,8 @@ class LinearProfiler:
 
         self._capture_count = 0
         self._step_count = 0
-        self._module = None
+        self._module: torch.nn.Module | None = None
+        self._module_attr: str | None = None
         self._handles: list = []
         self._active_prof = None
 
@@ -255,7 +300,12 @@ class LinearProfiler:
 
     def attach(self, module: torch.nn.Module) -> "LinearProfiler":
         self.detach()
+        attr = f"_linear_profiler_{id(self)}"
+        if hasattr(module, attr):
+            return self  # already attached by this instance
+        setattr(module, attr, self)
         self._module = module
+        self._module_attr = attr
         if self.with_backward:
             self._handles = [
                 module.register_forward_hook(self._on_fwd_end),
@@ -278,7 +328,11 @@ class LinearProfiler:
             except Exception:
                 pass
             self._active_prof = None
-        self._module = None
+        if self._module is not None:
+            attr = getattr(self, "_module_attr", None)
+            if attr and hasattr(self._module, attr):
+                delattr(self._module, attr)
+            self._module = None
 
     @property
     def done(self) -> bool:

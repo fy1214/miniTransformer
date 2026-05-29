@@ -14,7 +14,7 @@ from miniTransformer.distributed.distributed import (
     set_tensor_model_parallel_attributes, get_distributed_world_size,
 )
 from miniTransformer.quantiztion import quantization
-from miniTransformer.utils.env import should_keep_backward_in_bf16
+from miniTransformer.utils.env import should_keep_backward_in_bf16, get_linear_profiler_config, get_linear_tensor_stats_config
 from miniTransformer.utils.utils import (
     is_rank_0,
     init_method_constant,
@@ -658,6 +658,43 @@ class Linear(LayerLinearBaseModule):
                      If not provided, currently it will be determined from ENV Variable `QAT_PARAMS`.
     """
 
+    _profiler_instance_count: int = 0
+    _stats_instance_count: int = 0
+
+    @classmethod
+    def _try_attach_profiler(cls, module: "Linear") -> None:
+        cfg = get_linear_profiler_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "linear":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._profiler_instance_count
+        cls._profiler_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearProfiler
+        label = module.layer_name or f"linear_{idx}"
+        LinearProfiler(label=label, **cfg).attach(module)
+        print(f"[LinearProfiler] attached to {cls.__name__} instance {idx} (label={label})", flush=True)
+
+    @classmethod
+    def _try_attach_tensor_stats(cls, module: "Linear") -> None:
+        cfg = get_linear_tensor_stats_config()
+        if cfg is None:
+            return
+        if cfg.pop("target_class") != "linear":
+            return
+        target = cfg.pop("target_instance")
+        idx = cls._stats_instance_count
+        cls._stats_instance_count += 1
+        if idx != target:
+            return
+        from miniTransformer.profiler import LinearStatsHook
+        label = module.layer_name or f"linear_{idx}"
+        LinearStatsHook(label=label, **cfg).attach(module)
+        print(f"[TensorStats] attached to {cls.__name__} instance {idx} (label={label})", flush=True)
+
     def __init__(
         self,
         in_features: int,
@@ -840,6 +877,9 @@ class Linear(LayerLinearBaseModule):
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
+
+        Linear._try_attach_profiler(self)
+        Linear._try_attach_tensor_stats(self)
 
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)

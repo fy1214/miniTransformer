@@ -238,7 +238,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_REF:
-        # Pertoken activation (Triton) + tensor-global weight + CuTeDSL grouped GEMM (SM100).
+        # Pertoken activation + tensor-global weight + CuTeDSL grouped GEMM (SM100).
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,

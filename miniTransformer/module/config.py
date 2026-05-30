@@ -14,6 +14,7 @@ from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2QuantizeOp as Nvfp4Cursor2CutlassQuantizeOp
 from miniTransformer.quantiztion.nvfp4_w4a16_op import Nvfp4W4A16QuantizeOp
+from miniTransformer.quantiztion.nvfp4_qdq_op import Nvfp4QdqOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType
 from miniTransformer.quantiztion import quantization
 import miniTransformer.utils.env as env
@@ -106,6 +107,8 @@ class QuantizeRecipe(enum.Enum):
     FP4_SUB_CHANNEL_CURSOR2_REF = "fp4_subchannel_scaling_cursor2_ref"
     FP4_SUB_CHANNEL_CURSOR2_CUTLASS = "fp4_subchannel_scaling_cursor2_cutlass"
     FP4_SUB_CHANNEL_W4A16 = "fp4_subchannel_scaling_w4a16"
+    FP4_QDQ_BLOCK = "fp4_qdq_block"
+    FP4_QDQ_PERTOKEN = "fp4_qdq_pertoken"
 
 
 def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
@@ -374,6 +377,68 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             quantize_op=Nvfp4QuartetQuantizeOp(),
             allgather_quantize=False,
         )
+    elif recipe == QuantizeRecipe.FP4_QDQ_BLOCK:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Nvfp4QdqOp(mode="block"),
+            allgather_quantize=False,
+        )
+    elif recipe == QuantizeRecipe.FP4_QDQ_PERTOKEN:
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Nvfp4QdqOp(mode="pertoken"),
+            allgather_quantize=False,
+        )
     else:
         raise ValueError(f"Unsupported quantize recipe: {recipe}")
 
@@ -419,5 +484,9 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_W4A16
         )
+    if qat_params_idx == 10:
+        return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_QDQ_BLOCK)
+    if qat_params_idx == 11:
+        return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_QDQ_PERTOKEN)
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

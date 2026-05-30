@@ -19,7 +19,7 @@ import torch
 import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
 
-from _quant_utils import (
+from miniTransformer.ops.exp.quant_utils import (
     cast_to_e4m3, quant_dequant_block, quant_dequant_pertoken,
     _quantize_e4m1, _quantize_e2m3, _quantize_e2m1,
     print_metrics, print_summary_table, make_test_tensor,

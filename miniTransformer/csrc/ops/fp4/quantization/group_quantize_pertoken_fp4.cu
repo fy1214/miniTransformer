@@ -409,9 +409,6 @@ __global__ void fp4_group_tensor_global_kernel(
     int    total_rows,
     int    grid_stride)
 {
-    // smem_f[local_row * 2 + 0] = scale, smem_f[local_row * 2 + 1] = global_encode_scale
-    extern __shared__ float smem_f[];
-
     const int flat_tid    = static_cast<int>(threadIdx.x);
     const int warp_id     = flat_tid / 32;
     const int lane_id     = flat_tid % 32;
@@ -436,25 +433,23 @@ __global__ void fp4_group_tensor_global_kernel(
         const int     local_row_in_group = valid_row ? row - row_offsets[group_id] : 0;
         const int64_t sf_base            = valid_row ? scale_offsets[group_id] : 0;
 
-        // tid==0 of each row broadcasts per-group scale into smem.
-        if (valid_row && tid == 0) {
-            float group_amax = amax_ptr[group_id];
-            constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
-            constexpr float inv_six        = 1.f / 6.f;
-            float inv_val_max = scale_override * inv_six;
-            float s = (group_amax == 0.f) ? 1.f : group_amax * inv_scales_max * inv_val_max;
-            // Write global_scale once per group (on the first row of the group that this
-            // CTA processes; subsequent grid-stride visits to the same group are no-ops
-            // since the value is identical).
-            if (local_row_in_group == 0)
-                global_scale_ptr[group_id] = s;
-            smem_f[local_row * 2 + 0] = s;
-        }
-        __syncthreads();
-
         if (!valid_row) continue;
 
-        const float scale = smem_f[local_row * 2 + 0];
+        // Each thread reads the per-group scale directly from global memory.
+        // Previously this was broadcast via smem from tid==0, but that pattern
+        // allowed NVCC to legally hoist the smem read above __syncthreads()
+        // (no write-to-read dependence visible for tid!=0 threads), causing
+        // stale values from the prior grid-stride iteration to be used when
+        // multiple expert groups are processed by the same CTA.
+        constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
+        constexpr float inv_six        = 1.f / 6.f;
+        float group_amax = amax_ptr[group_id];
+        float scale = (group_amax == 0.f) ? 1.f : group_amax * inv_scales_max * (scale_override * inv_six);
+
+        // Write global_scale once per group (first row of the group in this CTA;
+        // subsequent grid-stride visits to the same group write the same value).
+        if (local_row_in_group == 0 && tid == 0)
+            global_scale_ptr[group_id] = scale;
 
         // Load 8 bf16 values (OOB threads load zero).
         bf16x8 x{};
@@ -474,7 +469,6 @@ __global__ void fp4_group_tensor_global_kernel(
         // Quantize using reciprocal_approximate_ftz path (bit-exact with rtn_fp4).
         QuantResultGP res;
         if constexpr (NumCandidates == 1) {
-            constexpr float inv_six = 1.f / 6.f;
             res = quantize_tg(full_abs_max, scale_override * inv_six, scale, x);
         } else {
             float candidates[2]    = {6.f, 4.f};
@@ -537,16 +531,14 @@ static void launch_fp4_group_tensor_global(
     const int grid_dim       = min(natural_grid, MAX_BLOCKS_GP);
     const int grid_stride    = grid_dim * rows_per_block;
     const int cdiv16         = static_cast<int>(cols / 16);
-    // smem: rows_per_block * 2 floats (scale + ges per row).
-    const size_t smem = static_cast<size_t>(rows_per_block) * 2 * sizeof(float);
 
     if (num_candidates == 2)
-        fp4_group_tensor_global_kernel<2><<<grid_dim, block_dim, smem, stream>>>(
+        fp4_group_tensor_global_kernel<2><<<grid_dim, block_dim, 0, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups,
             nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);
     else
-        fp4_group_tensor_global_kernel<1><<<grid_dim, block_dim, smem, stream>>>(
+        fp4_group_tensor_global_kernel<1><<<grid_dim, block_dim, 0, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr,
             row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups,
             nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);

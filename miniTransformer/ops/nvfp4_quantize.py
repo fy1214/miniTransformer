@@ -243,10 +243,14 @@ def dequantize_nvfp4_pertoken(result: quantization.QuantizeResult) -> torch.Tens
     global_scale = result.tensor_scale
 
     grid = _get_fp4_grid(data.device)
-    fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)           # [m, n]
-    scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)  # [m, n]
-    gs = global_scale.to(torch.float32).unsqueeze(1)               # [m, 1]
-    return (fp4_vals * scale_expanded * gs).to(torch.bfloat16)
+    fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)      # [m, n]
+    gs = global_scale.to(torch.float32).unsqueeze(1)           # [m, 1]
+    # merge scale at [m, n//16] granularity before expanding, matching golden formula:
+    # actual_scale = fp8_scale * global_decode_scale, then broadcast over 16 elements
+    actual_scale = scale.to(torch.float32) * gs                # [m, n//16]
+    m = data.shape[0]
+    n = data.shape[1] * 2
+    return (fp4_vals.view(m, n // 16, 16) * actual_scale.unsqueeze(-1)).view(m, n).to(torch.bfloat16)
 
 
 def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> torch.Tensor:
@@ -270,9 +274,9 @@ def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> t
     scale_rm = _unswizzle_scale(result.scale.to(torch.float32), m, n)  # [m, n//16]
     grid = _get_fp4_grid(data.device)
     fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)               # [m, n]
-    scale_expanded = scale_rm.repeat_interleave(16, dim=1)             # [m, n]
     gs = global_scale.to(torch.float32).unsqueeze(1)                   # [m, 1]
-    return (fp4_vals * scale_expanded * gs).to(torch.bfloat16)
+    actual_scale = scale_rm * gs                                        # [m, n//16]
+    return (fp4_vals.view(m, n // 16, 16) * actual_scale.unsqueeze(-1)).view(m, n).to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +362,28 @@ def quantize_weight_nvfp4_swizzled(
     t._cute_fp4 = cute_fp4
     t._cute_sfb = cute_sfb
     return t
+
+
+def dequantize_weight_nvfp4_swizzled(t: "TensorGlobalNvfp4Tensor") -> torch.Tensor:
+    """Dequantize the output of :func:`quantize_weight_nvfp4_swizzled` back to BF16.
+
+    Args:
+        t: TensorGlobalNvfp4Tensor with data_uint8 [N, K//2], block_scale_fp8
+           [N_padded*K//16] swizzled, and amax [1] (raw global amax).
+
+    Returns:
+        Reconstructed BF16 tensor of shape [N, K].
+    """
+    data = t.data_uint8
+    n, nhalf = data.shape
+    k = nhalf * 2
+    n_padded = ((n + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    scale_rm = _unswizzle_scale(t.block_scale_fp8.to(torch.float32), n_padded, k)[:n]
+    grid = _get_fp4_grid(data.device)
+    fp4_vals = grid[_unpack_fp4(data)].to(torch.float32)
+    global_decode_scale = t.amax.to(torch.float32) / (448.0 * 6.0)  # scalar
+    actual_scale = scale_rm * global_decode_scale                    # [n, k//16]
+    return (fp4_vals.view(n, k // 16, 16) * actual_scale.unsqueeze(-1)).view(n, k).to(torch.bfloat16)
 
 
 def group_quantize_nvfp4_pertoken_swizzled(
@@ -448,6 +474,47 @@ def group_quantize_nvfp4_pertoken_swizzled(
         scale_offsets=scale_offsets,
         row_offsets=row_offsets,
     )
+
+
+def dequantize_group_nvfp4_pertoken_swizzled(result: GroupQuantizeSwizzledResult) -> torch.Tensor:
+    """Dequantize the output of :func:`group_quantize_nvfp4_pertoken_swizzled` back to BF16.
+
+    Each group has its own swizzled scale block padded to the next 128-row boundary
+    independently; this function unswizzles and dequantizes per group then concatenates.
+
+    Args:
+        result: GroupQuantizeSwizzledResult from group_quantize_nvfp4_pertoken_swizzled.
+
+    Returns:
+        Reconstructed BF16 tensor of shape [total_m, k].
+    """
+    total_m, nhalf = result.data.shape
+    k = nhalf * 2
+    device = result.data.device
+
+    if total_m == 0:
+        return torch.empty((0, k), dtype=torch.bfloat16, device=device)
+
+    grid = _get_fp4_grid(device)
+    parts = []
+    for g in range(len(result.row_offsets) - 1):
+        r0, r1 = result.row_offsets[g], result.row_offsets[g + 1]
+        m_i = r1 - r0
+        if m_i == 0:
+            parts.append(torch.empty((0, k), dtype=torch.bfloat16, device=device))
+            continue
+        m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+        s0, s1 = result.scale_offsets[g], result.scale_offsets[g + 1]
+        scale_rm = _unswizzle_scale(result.scale_flat[s0:s1].to(torch.float32), m_padded, k)[:m_i]
+        data_g = result.data[r0:r1]
+        gs = result.global_scale[r0:r1].to(torch.float32).unsqueeze(1)
+        fp4_vals = grid[_unpack_fp4(data_g)].to(torch.float32)
+        actual_scale = scale_rm * gs
+        parts.append(
+            (fp4_vals.view(m_i, k // 16, 16) * actual_scale.unsqueeze(-1))
+            .view(m_i, k).to(torch.bfloat16)
+        )
+    return torch.cat(parts, dim=0)
 
 
 @dataclass
@@ -563,3 +630,46 @@ def group_quantize_nvfp4_tensor_global_packed(
         scale_offsets=scale_offsets,
         row_offsets=row_offsets,
     )
+
+
+def dequantize_group_nvfp4_tensor_global_packed(result: GroupWeightQuantizeResult) -> torch.Tensor:
+    """Dequantize the output of :func:`group_quantize_nvfp4_tensor_global_packed` back to BF16.
+
+    Each expert has its own tensor-global amax stored in global_scale[g] as
+    alpha = amax / (448*6).  Scale layout per expert is tcgen05 swizzled,
+    padded to the next 128-row boundary independently.
+
+    Args:
+        result: GroupWeightQuantizeResult from group_quantize_nvfp4_tensor_global_packed.
+
+    Returns:
+        Reconstructed BF16 tensor of shape [total_n, k].
+    """
+    total_n, nhalf = result.data.shape
+    k = nhalf * 2
+    device = result.data.device
+    num_experts = len(result.row_offsets) - 1
+
+    if total_n == 0:
+        return torch.empty((0, k), dtype=torch.bfloat16, device=device)
+
+    grid = _get_fp4_grid(device)
+    parts = []
+    for g in range(num_experts):
+        r0, r1 = result.row_offsets[g], result.row_offsets[g + 1]
+        n_i = r1 - r0
+        if n_i == 0:
+            parts.append(torch.empty((0, k), dtype=torch.bfloat16, device=device))
+            continue
+        n_padded = ((n_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+        s0, s1 = result.scale_offsets[g], result.scale_offsets[g + 1]
+        scale_rm = _unswizzle_scale(result.scale_flat[s0:s1].to(torch.float32), n_padded, k)[:n_i]
+        data_g = result.data[r0:r1]
+        gs = result.global_scale[g].to(torch.float32)          # scalar alpha = amax/(448*6)
+        fp4_vals = grid[_unpack_fp4(data_g)].to(torch.float32)
+        actual_scale = scale_rm * gs                            # [n_i, k//16]
+        parts.append(
+            (fp4_vals.view(n_i, k // 16, 16) * actual_scale.unsqueeze(-1))
+            .view(n_i, k).to(torch.bfloat16)
+        )
+    return torch.cat(parts, dim=0)

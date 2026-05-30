@@ -191,7 +191,7 @@ class Nvfp4W4A16QuantizeOp(quantization.QuantizeOpBase):
                 quantize_tensor_list_forward.append(w_q.dequantize())
                 quantize_tensor_list_backward.append(w_q)
 
-                return GroupQuantizeResult(
+            return GroupQuantizeResult(
                     data=quantize_tensor_list_forward,
                     data_t=quantize_tensor_list_backward,
                     scale=quantize_tensor_list_forward,

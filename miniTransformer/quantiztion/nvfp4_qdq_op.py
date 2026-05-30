@@ -1,19 +1,17 @@
-"""NVFP4 QDQ quantize op backed by quant_utils pure-Python simulation.
+"""NVFP4 QDQ op — X forward uses quant_utils QDQ simulation; all other paths use NVFP4.
 
-This op performs quantize-dequantize (QDQ) simulation using the lookup-table
-quantizers from miniTransformer.ops.exp.quant_utils.  It supports two modes
-selected at construction time:
-
-  mode="block"    – quant_dequant_block   (single-level per-block scaling)
-  mode="pertoken" – quant_dequant_pertoken (two-level per-token + per-block)
-
-The GEMM itself runs in BF16 (torch.matmul) after QDQ, making this a W4A4
-simulation rather than a hardware FP4 path.  It is intended for precision
-experiments and ablations, not production throughput.
+X forward applies quant_dequant_block or quant_dequant_pertoken (controlled by `mode`),
+making forward GEMMs simulate FP4 activation precision while weight quantization,
+backward, and grouped GEMM remain on the standard NVFP4 hardware path.
 """
 
 import torch
 from typing import Callable, List, Literal, Optional, Tuple
+
+import transformer_engine.pytorch.cpp_extensions as tex
+from transformer_engine.pytorch import NVFP4Quantizer
+from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 from miniTransformer.ops.exp.quant_utils import (
     ScaleType,
@@ -37,15 +35,14 @@ _NORM_MAX     = default_norm_max(_SCALE_TYPE)
 
 
 class Nvfp4QdqOp(quantization.QuantizeOpBase):
-    """QDQ-simulation quantize op using quant_utils lookup quantizers.
+    """NVFP4 op where X forward uses Python QDQ simulation; all other paths are NVFP4.
 
     Args:
-        mode:        "block" or "pertoken" – selects the QDQ function.
-        block_size:  Number of elements per quantization block (default 16).
-        scale_type:  Scale format for the block scale, "e4m3" or "e8m0".
-        quantize_fn: Lookup quantizer to use (default: _quantize_e2m1).
-                     Pass any function with signature (x: Tensor) -> Tensor.
-        norm_max:    Normalisation constant for pertoken mode (default 448.0).
+        mode:        "block" or "pertoken" – selects the X-forward QDQ function.
+        block_size:  Quantization block size (default 16).
+        scale_type:  Scale format for the block scale.
+        quantize_fn: Lookup quantizer (default: _quantize_e2m1).
+        norm_max:    Normalisation constant for pertoken mode.
     """
 
     should_update_quantize_weights = True
@@ -62,18 +59,18 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
         if mode not in ("block", "pertoken"):
             raise ValueError(f"mode must be 'block' or 'pertoken', got {mode!r}")
 
-        self.mode       = mode
-        self.block_size = block_size
-        self.scale_type = ScaleType(scale_type)
+        self.mode        = mode
+        self.block_size  = block_size
+        self.scale_type  = ScaleType(scale_type)
         self.quantize_fn = quantize_fn if quantize_fn is not None else _QUANTIZE_FN
-        self.fp_max     = _FP4_E2M1_MAX
-        self.norm_max   = norm_max
+        self.fp_max      = _FP4_E2M1_MAX
+        self.norm_max    = norm_max
 
     @property
     def supports_allgather(self) -> bool:
         return False
 
-    # ── QDQ dispatch ──────────────────────────────────────────────────────────
+    # ── X-forward QDQ ────────────────────────────────────────────────────────
 
     def _qdq(self, x: torch.Tensor) -> torch.Tensor:
         """Apply QDQ to a 2D tensor and return BF16 dequantized result."""
@@ -96,6 +93,30 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
                 norm_max=self.norm_max,
             )
 
+    # ── NVFP4 helper (weight / grad / X backward) ────────────────────────────
+
+    def _quantize_nvfp4(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        return_transpose: bool,
+    ):
+        M, N = x.shape
+        quantizer = NVFP4Quantizer(
+            rowwise=True,
+            columnwise=return_transpose,
+            with_amax_reduction=False,
+            amax_reduction_group=None,
+            with_rht=qparams.with_rht,
+            with_post_rht_amax=qparams.with_rht,
+            with_2d_quantization=qparams.with_2d_quantization,
+            stochastic_rounding=qparams.stochastic_rounding,
+        )
+        nvfp4_tensor = quantizer.make_empty(
+            (M, N), dtype=x.dtype, device=x.device, requires_grad=False
+        )
+        return quantizer.update_quantized(x, nvfp4_tensor)
+
     # ── quantize ──────────────────────────────────────────────────────────────
 
     def quantize(
@@ -107,30 +128,33 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> quantization.QuantizeResult:
-        assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES, \
-            f"Unsupported input dtype: {x.dtype}"
+        assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES, "Unsupported input dtype."
+        assert qparams.quant_tile_shape is not None
+        assert len(qparams.quant_tile_shape) == 2
 
-        orig_shape = x.shape
-        x2d = x.view(-1, orig_shape[-1])
-
-        x_qdq = self._qdq(x2d).view(orig_shape)
-
-        # Scale and transposed tensors are unused by the BF16 GEMM path; fill
-        # with empty sentinels so callers that read .scale / .data_t don't crash.
-        empty = torch.empty(0, device=x.device)
-
-        if return_transpose:
-            x_qdq_t = self._qdq(x2d.t().contiguous()).view(orig_shape[-1], -1)
+        if qparams.param_type == qparams.param_type.X:
+            # Forward: QDQ simulation
+            x_qdq = self._qdq(x.view(-1, x.shape[-1])).view(x.shape)
+            # Backward: NVFP4 columnwise tensor for dgrad
+            nvfp4_tensor = self._quantize_nvfp4(x, qparams, return_transpose=return_transpose)
             return quantization.QuantizeResult(
-                data=x_qdq, scale=empty,
-                data_t=x_qdq_t, scale_t=empty,
-                tensor_scale=empty, tensor_scale_t=empty,
+                data=x_qdq, scale=x_qdq,
+                data_t=nvfp4_tensor, scale_t=nvfp4_tensor,
+            )
+
+        # WEIGHT and Y: standard NVFP4
+        nvfp4_tensor = self._quantize_nvfp4(x, qparams, return_transpose=return_transpose)
+
+        if qparams.param_type == qparams.param_type.WEIGHT:
+            w_qdq = nvfp4_tensor.dequantize()
+            return quantization.QuantizeResult(
+                data=w_qdq, scale=w_qdq,
+                data_t=nvfp4_tensor, scale_t=nvfp4_tensor,
             )
 
         return quantization.QuantizeResult(
-            data=x_qdq, scale=empty,
-            data_t=None, scale_t=None,
-            tensor_scale=empty, tensor_scale_t=empty,
+            data=nvfp4_tensor, scale=nvfp4_tensor,
+            data_t=nvfp4_tensor, scale_t=nvfp4_tensor,
         )
 
     # ── qgemm ─────────────────────────────────────────────────────────────────
@@ -152,33 +176,28 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
         global_amax_qw: Optional[torch.Tensor] = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
-        custom_gemm_backend: str = "cublas",
+        custom_gemm_backend: str = "cutlass",
     ) -> torch.Tensor:
-        # qx and qw are already QDQ BF16 tensors from quantize().
-        # Run a plain BF16 matmul; layout "TN" means qw is [N, K].
-        qx_f = qx.to(out_dtype)
-        qw_f = qw.to(out_dtype)
-
-        if layout == "TN":
-            y = torch.nn.functional.linear(qx_f, qw_f, bias=bias.to(out_dtype) if bias is not None else None)
-        elif layout == "NN":
-            # dgrad: qx is [M, N], qw is [N, K] -> out [M, K]
-            y = torch.matmul(qx_f, qw_f)
-            if bias is not None:
-                y = y + bias.to(out_dtype)
-        elif layout == "NT":
-            # wgrad: qx is [K, M], qw is [K, N] -> out [M, N] = qx.T @ qw
-            y = torch.matmul(qx_f.t(), qw_f)
-            if bias is not None:
-                y = y + bias.to(out_dtype)
-        else:
-            raise ValueError(f"Unsupported layout: {layout!r}")
-
-        if accumulate:
-            assert out is not None, "out must be provided when accumulate=True"
-            out.add_(y)
-            return out
-        return y
+        return general_gemm(
+            A=qw,
+            B=qx,
+            out_dtype=out_dtype,
+            quantization_params=None,
+            gelu=False,
+            gelu_in=None,
+            alpha=1.0,
+            beta=None,
+            accumulate=accumulate,
+            layout=layout,
+            out=out,
+            bias=bias,
+            use_split_accumulator=False,
+            grad=grad,
+            ub=None,
+            ub_type=None,
+            extra_output=None,
+            bulk_overlap=False,
+        )[0]
 
     # ── group_quantize ────────────────────────────────────────────────────────
 
@@ -192,39 +211,75 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> GroupQuantizeResult:
-        """
-        Split x and apply QDQ to each shard.
+        num_gemms = len(m_splits)
 
-        param_type == WEIGHT : x is [num_gemms, N, K]; each x[i] is [N, K].
-        param_type == X / Y  : x is [M_sum, K]; split by m_splits.
-        """
         if qparams.param_type == qparams.param_type.WEIGHT:
-            shards = [x[i] for i in range(x.shape[0])]
-        else:
+            forward_list, backward_list = [], []
+            for i in range(num_gemms):
+                w_quantizer = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=True,
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding,
+                )
+                w_q = w_quantizer.quantize(x[i])
+                forward_list.append(w_q.dequantize())
+                backward_list.append(w_q)
+            return GroupQuantizeResult(
+                data=forward_list, data_t=backward_list,
+                scale=forward_list, scale_t=backward_list,
+                tensor_scale=forward_list, tensor_scale_t=backward_list,
+            )
+
+        elif qparams.param_type == qparams.param_type.X:
+            # Forward: QDQ per shard
             shards = list(torch.split(x, m_splits))
-
-        forward_list: List[torch.Tensor] = []
-        backward_list: List[torch.Tensor] = []
-        empty = torch.empty(0, device=x.device)
-        empty_list = [empty] * len(shards)
-
-        for xi in shards:
-            xi_qdq = self._qdq(xi.view(-1, xi.shape[-1])).view(xi.shape)
-            forward_list.append(xi_qdq)
+            forward_list = [
+                self._qdq(xi.view(-1, xi.shape[-1])).view(xi.shape)
+                for xi in shards
+            ]
+            # Backward: NVFP4 columnwise via split_quantize
+            backward_list = []
             if return_transpose:
-                xi_qdq_t = self._qdq(xi.view(-1, xi.shape[-1]).t().contiguous())
-                backward_list.append(xi_qdq_t)
-            else:
-                backward_list.append(xi_qdq)
+                quantizers = [
+                    NVFP4Quantizer(
+                        rowwise=False, columnwise=True,
+                        with_amax_reduction=False, amax_reduction_group=None,
+                        with_rht=qparams.with_rht, with_post_rht_amax=qparams.with_rht,
+                        with_2d_quantization=qparams.with_2d_quantization,
+                        stochastic_rounding=qparams.stochastic_rounding,
+                    )
+                    for _ in range(num_gemms)
+                ]
+                backward_list = tex.split_quantize(x, m_splits, quantizers)
+            return GroupQuantizeResult(
+                data=forward_list, data_t=backward_list,
+                scale=forward_list, scale_t=backward_list,
+                tensor_scale=forward_list, tensor_scale_t=backward_list,
+            )
 
-        return GroupQuantizeResult(
-            data=forward_list,
-            data_t=backward_list,
-            scale=empty_list,
-            scale_t=empty_list,
-            tensor_scale=empty_list,
-            tensor_scale_t=empty_list,
-        )
+        else:
+            # Y / grad: NVFP4 via split_quantize
+            quantizers = [
+                NVFP4Quantizer(
+                    rowwise=True, columnwise=return_transpose,
+                    with_amax_reduction=False, amax_reduction_group=None,
+                    with_rht=qparams.with_rht, with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding,
+                )
+                for _ in range(num_gemms)
+            ]
+            quantize_tensor_list = tex.split_quantize(x, m_splits, quantizers)
+            return GroupQuantizeResult(
+                data=quantize_tensor_list, data_t=quantize_tensor_list,
+                scale=quantize_tensor_list, scale_t=quantize_tensor_list,
+                tensor_scale=quantize_tensor_list, tensor_scale_t=quantize_tensor_list,
+            )
 
     # ── grouped_gemm ──────────────────────────────────────────────────────────
 
@@ -249,18 +304,32 @@ class Nvfp4QdqOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
         extra_info_A: Optional[dict] = None,
         extra_info_B: Optional[dict] = None,
-    ) -> torch.Tensor:
-        results = []
-        for i in range(len(m_splits)):
-            b = bias[i] if (use_bias and bias is not None) else None
-            o = out[i] if (accumulate and out is not None) else None
-            results.append(
-                self.qgemm(
-                    A[i], B[i], None, out_dtype,
-                    sA[i], sB[i], b, o,
-                    grad, accumulate, layout,
-                    global_amax_A[i], global_amax_B[i],
-                    qparams_x, qparams_w,
-                )
-            )
-        return torch.cat(results, dim=0)
+    ) -> Tuple[List[torch.Tensor], ...]:
+        activation_dtype = out_dtype
+        a0 = A[0]
+        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
+        if grad:
+            if layout == "NN":
+                n_cols = B[0]._rowwise_data.size(1) * 2 if is_quantized else B[0].size(1)
+                out = [torch.empty(
+                    [sum(m_splits), n_cols], dtype=activation_dtype, device=B[0].device
+                )]
+        else:
+            n_cols = B[0]._rowwise_data.size(0) if is_quantized else B[0].size(0)
+            out = [torch.empty(
+                [sum(m_splits), n_cols], dtype=activation_dtype, device=B[0].device
+            )]
+
+        general_grouped_gemm(
+            A=B, B=A, out=out, out_dtype=activation_dtype,
+            layout=layout, m_splits=m_splits,
+            single_output=False if (grad and layout == "NT") else True,
+            grad=grad, bias=bias, use_bias=use_bias,
+            use_split_accumulator=False, accumulate=accumulate,
+        )
+
+        if grad and layout == "NT":
+            return out
+        else:
+            return out[0]

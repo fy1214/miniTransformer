@@ -36,7 +36,7 @@ def _grouped_gemm_cutedsl(
     return grouped_gemm_cutedsl(A, B, m_splits, out_dtype)
 
 
-class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
+class Nvfp4W4A16QuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
         self.should_update_quantize_weights = True
@@ -191,7 +191,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
                 quantize_tensor_list_forward.append(w_q.dequantize())
                 quantize_tensor_list_backward.append(w_q)
 
-                return GroupQuantizeResult(
+            return GroupQuantizeResult(
                     data=quantize_tensor_list_forward,
                     data_t=quantize_tensor_list_backward,
                     scale=quantize_tensor_list_forward,

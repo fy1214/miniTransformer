@@ -278,6 +278,75 @@ def quant_dequant_nvfp4_ref_standalone(
         out=None,
     )
 
+def quantize_nvfp4_ref_global_amax(
+    x: torch.Tensor,
+    *,
+    quant_tile_shape: Tuple[int, int] = (1, 16),
+    out_qx: Optional[torch.Tensor] = None,
+    out_sx: Optional[torch.Tensor] = None,
+    out_global_amax: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    NVFP4 tensor-global amax quantize (reference path).
+
+    Returns
+    -------
+    qx          : torch.uint8,        shape [M, K//2]
+    sx          : torch.float8_e4m3fn, shape [M, K//tile]
+    global_amax : torch.float32,      shape [1]
+    """
+    assert x.ndim == 2, "NVFP4 ref expects a 2D tensor [M, K]"
+    assert quant_tile_shape in ((1, 16), (16, 16))
+
+    m, n = int(x.shape[0]), int(x.shape[1])
+    global_amax = torch.max(torch.abs(x)).to(torch.float32).view(1)
+
+    x_padded = _pad_tensor(x, row_divisor=quant_tile_shape[0], col_divisor=quant_tile_shape[1])
+    qx, sx = _quantize_blockwise_reference(
+        x_padded, global_amax, quant_tile_shape[1], quant_tile_shape[0],
+        pow_2_scales=False, with_2d_quantization=False,
+    )
+    qx = _rm_pad_tensor(qx, (m, n // 2))
+    sx = sx[:m, :].contiguous()
+
+    if out_qx is not None:
+        out_qx.copy_(qx); qx = out_qx
+    if out_sx is not None:
+        out_sx.copy_(sx); sx = out_sx
+    if out_global_amax is not None:
+        out_global_amax.copy_(global_amax); global_amax = out_global_amax
+    return qx, sx, global_amax
+
+
+def dequantize_nvfp4_ref_global_amax(
+    qx: torch.Tensor,
+    sx: torch.Tensor,
+    global_amax: torch.Tensor,
+    *,
+    quant_tile_shape: Tuple[int, int] = (1, 16),
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dequantize NVFP4 tensors produced by ``quantize_nvfp4_ref_global_amax``."""
+    assert qx.ndim == 2 and sx.ndim == 2
+    assert global_amax.numel() == 1
+    assert quant_tile_shape in ((1, 16), (16, 16))
+
+    m = int(qx.shape[0])
+    n = int(qx.shape[1]) * 2
+    global_decode_scale = global_amax.to(torch.float32) / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+    actual_scale = sx.to(torch.float32) * global_decode_scale
+    return _dequantize_blockwise_reference(
+        qx, actual_scale, original_shape=(m, n),
+        tile_len_x=quant_tile_shape[1], tile_len_y=quant_tile_shape[0],
+        out_dtype=out_dtype, out=out,
+    )
+
+
+'''
+GOLDEN PERTOKEN NVFP4 QUANTIZE
+'''
+
 def quantize_nvfp4_ref_pertoken_amax(
     x: torch.Tensor,
     *,

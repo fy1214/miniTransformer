@@ -13,7 +13,7 @@ Metrics: MAE / Mean Rel Err / SNR / Rel_L2
 """
 import torch
 
-from _quant_utils import (
+from miniTransformer.ops.exp.quant_utils import (
     fp_format_max, quant_dequant_pertoken,
     _quantize_e2m4, _quantize_e2m3, _quantize_e2m2, _quantize_e2m1,
     print_metrics, print_summary_table, make_test_tensor,

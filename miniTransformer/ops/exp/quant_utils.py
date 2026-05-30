@@ -1,4 +1,5 @@
 """Shared utilities for quantization precision experiments."""
+import enum
 import torch
 
 # Lazy device cache for lookup tables — CUDA Graph compatible.
@@ -106,6 +107,24 @@ def fp_format_max(e_bits: int, m_bits: int) -> float:
     max_exp = (1 << e_bits) - 1
     m_max = 1 << m_bits
     return (2.0 ** (max_exp - bias)) * (1.0 + (m_max - 1) / m_max)
+
+
+class ScaleType(str, enum.Enum):
+    """Storage format for quantization block scales."""
+    E4M3 = "e4m3"
+    E8M0 = "e8m0"
+
+
+def default_norm_max(scale_type: ScaleType) -> float:
+    """Default norm_max for pertoken two-level quantization, determined by scale storage format.
+
+    norm_max caps the per-block decode_scale so it fits within the scale format's range.
+    """
+    if scale_type == "e4m3":
+        return fp_format_max(4, 3)   # 448.0
+    elif scale_type == "e8m0":
+        return 2.0 ** 127
+    raise ValueError(f"unknown scale_type: {scale_type!r}")
 
 
 def cast_to_e8m0(scale: torch.Tensor) -> torch.Tensor:

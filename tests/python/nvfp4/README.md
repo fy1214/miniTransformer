@@ -1,0 +1,77 @@
+test_grouped_cutlass_gemm_per_token_scale.py: 测试QAT_PARAM=8中的算子，
+包括grouped_cutlass_gemm_v2和group_quantize_nvfp4_pertoken_swizzled
+
+
+[test_nvfp4_pertoken.py](quantize_nvfp4_pertoken/test_nvfp4_pertoken.py)：
+测试QAT_PARAM=6中的quant算子，即quantize_nvfp4_pertoken 和 quantize_nvfp4_pertoken_swizzled
+
+对比内容：
+1、与pytorch golden比较：test_pertoken_rowmajor_vs_golden_rtn
+2、与two-pass比较：test_fused_linear_bit_exact
+
+合成输入 pytest 结果（B300，sm_100）：
+- test_pertoken_rowmajor_vs_golden_rtn   : 13/13 PASSED（含 cols>8192 two-pass 路径）
+- test_pertoken_rowmajor_vs_golden_foursix: 13/13 PASSED
+- test_fused_linear_vs_golden            : 11/11 PASSED，2 SKIPPED（cols>8192，预期）
+- test_twopass_linear_vs_golden          : 13/13 PASSED
+
+---
+
+实际输入测试（/tmp/dump/fc1_step0000_inp.pt）：
+脚本：eval_nvfp4_pertoken_real_input.py（依赖 real_input_eval_utils.py）
+
+输入规格：
+- shape: [148480, 2048]，bfloat16，MoE fc1 层真实激活
+- 动态范围：min=-3.30，max=3.42，abs_mean=0.080，abs_std=0.114
+- 行间动态范围均匀：per-token amax 均值 2.08，标准差 0.44
+
+1. Bit-exact 对比（CUDA kernel vs Python golden，同一真实输入）
+   - FP4 data  bit-exact: True
+   - FP8 scale bit-exact: True
+   结论：kernel 量化结果与 Python 参考实现逐 bit 对齐。
+
+2. 量化精度（RTN，反量化后与原始输入对比）
+   - Effective bitwidth : 3.47（阈值 3.3，通过）
+   - Mean MSE           : 1.62e-4
+   - Mean cosine sim    : 0.9897
+   - Mean row rel-L2    : 9.0%
+   注：99% 行的 rel-L2 > 5% 是 FP4 E2M1 格式固有特性（行内小值相对于行最大值粒度粗），
+       effective bitwidth 是正确的整体精度指标。
+
+3. global amax vs per-token amax 对比（Python ref，同一输入）
+   | 方法            | Eff-bits | Mean cosine | Mean MSE  |
+   |-----------------|----------|-------------|-----------|
+   | Global amax     |  3.4570  |  0.989665   | 1.64e-4   |
+   | Per-token amax  |  3.4658  |  0.989705   | 1.62e-4   |
+   | 差值             | +0.009   | +4.1e-5     | -1.9e-6   |
+
+   per-row 胜负：62.8% per-token 更好，36.0% per-token 更差，1.2% 相同
+   更差行的 cos 平均降低 9.1e-5（噪声量级）
+
+   结论：两种策略精度等价。原因是该输入行间动态范围均匀（amax std/mean≈21%），
+         per-token 没有发挥空间；36% 行更差源于 FP8 scale 量化舍入方向差异，非策略缺陷。
+
+4. RTN vs Round-4-or-6
+   - RTN eff-bits: 3.4658
+   - 4/6 eff-bits: 3.5198，提升 +0.054 bit
+
+---
+
+实际输入测试复用说明：
+新的量化算子只需新建一个 eval 脚本，修改 Section A 的 wrapper 即可，其余不变：
+
+  Section A（唯一需要改的部分）：
+    def my_op(x):                        # fn(x) -> x_dq，同 shape/device
+        res = my_quantize(x, ...)
+        return my_dequantize(res)
+
+  Section B（可选）：bit-exact 对比，各算子自定义
+  Section C：调用 run_quant_eval()，完全复用
+
+    run_quant_eval(x, {"RTN": my_op_rtn, "4/6": my_op_46}, title="My Op")
+
+公共工具：real_input_eval_utils.py
+  - load_real_input()   — 加载 dump，flatten 到 2D
+  - run_quant_eval()    — 主入口，接收 {label: fn}，输出指标表 + per-row 胜负
+  - compute_metrics()   — 返回 eff-bits / MSE / cosine / rel-L2 字典
+  - print_metrics_table() / print_row_comparison() — 格式化输出

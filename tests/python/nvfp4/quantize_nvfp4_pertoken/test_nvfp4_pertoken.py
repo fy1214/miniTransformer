@@ -11,6 +11,9 @@ Precision methodology
 Per-token kernels: dequantize output and compute effective bit-width.
 Fused vs two-pass: results must be bit-exact.
 All kernels vs Python golden: bit-exact FP4 data and FP8 scale.
+Swizzled vs golden: unswizzle scale and compare bit-exact to Python golden.
+scale_override != 1.0: global scale must scale proportionally.
+Large-cols (>8192) two-pass path: bit-exact vs Python golden.
 
 Performance methodology
 -----------------------

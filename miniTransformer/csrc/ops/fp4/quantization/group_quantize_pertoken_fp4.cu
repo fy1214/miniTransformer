@@ -32,6 +32,7 @@
 #include <cuda_fp4.h>
 #include <stdexcept>
 #include <cstdint>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
@@ -383,32 +384,52 @@ void four_six_fp4_group_pertoken_binding(
 
 // ── Grouped tensor-global FP4 quantization ────────────────────────────────────
 //
-// Like fp4_group_pertoken_kernel but the amax is per-group (tensor-global),
-// not per-row.  Each block reads amax_ptr[group_id] instead of doing a
-// shared-memory row reduce.  This makes it suitable for weight quantization
-// where all rows in a group (one MoE expert) share a single amax.
+// Grid/block assignment (group-aligned):
+//   For each group g: ctas_g = ceil(m_g / rows_per_block)
+//   group_cta_offsets[g] = prefix sum of ctas_g
+//   gridDim = group_cta_offsets[num_groups]   (no cap — no grid-stride loop)
+//   blockDim = rows_per_block * warps_per_row * 32
 //
-// Grid/block assignment follows the same pattern as fp4_group_pertoken_kernel.
-// Shared memory: float[rows_per_block * 2] — [scale, global_encode_scale] per row.
+// Each CTA owns exactly one group: no inter-group row traversal.
+// Binary search on group_cta_offsets replaces the O(G) linear scan per thread.
+// amax is pre-computed by the caller (one Python op) and passed in directly.
 
+// ---- shared helper: binary search to find which group owns blockIdx.x ----
+__device__ __forceinline__ int tg_find_group(const int32_t* cta_offsets, int num_groups)
+{
+    // Find largest g such that cta_offsets[g] <= blockIdx.x.
+    int lo = 0, hi = num_groups - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (cta_offsets[mid] <= static_cast<int>(blockIdx.x)) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
+// ---- Kernel: quantize using caller-supplied per-group amax -------------------
 template<int NumCandidates>
 __global__ void fp4_group_tensor_global_kernel(
     __nv_fp4x4_e2m1*    __restrict__ y_ptr,
     __nv_fp8_e4m3*      __restrict__ scale_ptr,
     float*              __restrict__ global_scale_ptr,
     const nv_bfloat16*  __restrict__ x_ptr,
-    const int32_t*      __restrict__ row_offsets,    // [num_groups+1]
-    const int64_t*      __restrict__ scale_offsets,  // [num_groups+1]
-    const float*        __restrict__ amax_ptr,       // [num_groups]
+    const int32_t*      __restrict__ group_cta_offsets,// [num_groups+1]
+    const int32_t*      __restrict__ row_offsets,      // [num_groups+1]
+    const int64_t*      __restrict__ scale_offsets,    // [num_groups+1]
+    const float*        __restrict__ amax_ptr,         // [num_groups]
     float  scale_override,
     int    cols_div16,
     int    num_groups,
     int    nvecs_per_row,
     int    warps_per_row,
-    int    rows_per_block,
-    int    total_rows,
-    int    grid_stride)
+    int    rows_per_block)
 {
+    const int group_id    = tg_find_group(group_cta_offsets, num_groups);
+    const int local_block = static_cast<int>(blockIdx.x) - group_cta_offsets[group_id];
+    const int group_row0  = row_offsets[group_id];
+    const int m_g         = row_offsets[group_id + 1] - group_row0;
+
     const int flat_tid    = static_cast<int>(threadIdx.x);
     const int warp_id     = flat_tid / 32;
     const int lane_id     = flat_tid % 32;
@@ -416,109 +437,92 @@ __global__ void fp4_group_tensor_global_kernel(
     const int warp_in_row = warp_id % warps_per_row;
     const int tid         = warp_in_row * 32 + lane_id;
 
-    for (int base_row = blockIdx.x * rows_per_block;
-         base_row < total_rows;
-         base_row += grid_stride)
-    {
-        const int  row       = base_row + local_row;
-        const bool valid_row = row < total_rows;
-        const bool valid_vec = valid_row && (tid < nvecs_per_row);
+    const int  row_in_g  = local_block * rows_per_block + local_row;
+    const int  row       = group_row0 + row_in_g;
+    const bool valid_row = row_in_g < m_g;
+    const bool valid_vec = valid_row && (tid < nvecs_per_row);
 
-        // Find group owning this row.
-        int group_id = 0;
-        if (valid_row) {
-            while (group_id < num_groups - 1 && row >= row_offsets[group_id + 1])
-                ++group_id;
-        }
-        const int     local_row_in_group = valid_row ? row - row_offsets[group_id] : 0;
-        const int64_t sf_base            = valid_row ? scale_offsets[group_id] : 0;
+    if (!valid_row) return;
 
-        if (!valid_row) continue;
+    const int     local_row_in_group = row_in_g;
+    const int64_t sf_base            = scale_offsets[group_id];
 
-        // Each thread reads the per-group scale directly from global memory.
-        // Previously this was broadcast via smem from tid==0, but that pattern
-        // allowed NVCC to legally hoist the smem read above __syncthreads()
-        // (no write-to-read dependence visible for tid!=0 threads), causing
-        // stale values from the prior grid-stride iteration to be used when
-        // multiple expert groups are processed by the same CTA.
-        constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
-        constexpr float inv_six        = 1.f / 6.f;
-        float group_amax = amax_ptr[group_id];
-        float scale = (group_amax == 0.f) ? 1.f : group_amax * inv_scales_max * (scale_override * inv_six);
+    constexpr float inv_scales_max = (NumCandidates > 1) ? (1.f / 256.f) : (1.f / 448.f);
+    constexpr float inv_six        = 1.f / 6.f;
+    float group_amax = amax_ptr[group_id];
+    float scale = (group_amax == 0.f) ? 1.f : group_amax * inv_scales_max * (scale_override * inv_six);
 
-        // Write global_scale once per group (first row of the group in this CTA;
-        // subsequent grid-stride visits to the same group write the same value).
-        if (local_row_in_group == 0 && tid == 0)
-            global_scale_ptr[group_id] = scale;
+    // Write global_scale once per group: only the first CTA's first thread.
+    if (local_block == 0 && local_row == 0 && tid == 0)
+        global_scale_ptr[group_id] = scale;
 
-        // Load 8 bf16 values (OOB threads load zero).
-        bf16x8 x{};
-        nv_bfloat16 local_abs_max = __float2bfloat16(0.f);
-        if (valid_vec) {
-            x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
-            local_abs_max = vecReduceAbsMax(x);
-        }
+    // Load 8 bf16 values.
+    bf16x8 x{};
+    nv_bfloat16 local_abs_max = __float2bfloat16(0.f);
+    if (valid_vec) {
+        x = bf16x8::load(x_ptr + 8 * (row * nvecs_per_row + tid));
+        local_abs_max = vecReduceAbsMax(x);
+    }
 
-        // Per-group-of-16 abs-max: must be called by all warp threads uniformly.
-        // OOB threads contribute 0 (neutral for max), so valid threads are unaffected.
-        nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
-        float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
+    // Per-group-of-16 abs-max (must be called uniformly by all warp threads).
+    nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
+    float full_abs_max = static_cast<float>(__hmax(local_abs_max, other_abs_max));
 
-        if (!valid_vec) continue;
+    if (!valid_vec) return;
 
-        // Quantize using reciprocal_approximate_ftz path (bit-exact with rtn_fp4).
-        QuantResultGP res;
-        if constexpr (NumCandidates == 1) {
-            res = quantize_tg(full_abs_max, scale_override * inv_six, scale, x);
-        } else {
-            float candidates[2]    = {6.f, 4.f};
-            QuantResultGP results[2];
-            float scores[2];
-            float best = __builtin_inff();
-            for (int i = 0; i < 2; ++i) {
-                float inv_cand = 1.f / candidates[i];
-                results[i] = quantize_tg(full_abs_max, scale_override * inv_cand, scale, x);
-                const float descale = static_cast<float>(results[i].fp8s) * scale;
-                float2 sum = {0.f, 0.f};
-                const float2 dsv = {-descale, -descale};
-                for (int j = 0; j < 4; ++j) {
-                    float2 dq = __nv_cvt_fp4x2_to_float2(results[i].bits[j]);
-                    float2 xv = {static_cast<float>(x[2*j]), static_cast<float>(x[2*j+1])};
-                    float2 d  = __ffma2_rn(dq, dsv, xv);
-                    sum = __ffma2_rn(d, d, sum);
-                }
-                float local_err = sum.x + sum.y;
-                local_err += __shfl_xor_sync(0xffffffff, local_err, 1);
-                scores[i] = local_err;
-                if (scores[i] < best) { best = scores[i]; res = results[i]; }
+    // Quantize.
+    QuantResultGP res;
+    if constexpr (NumCandidates == 1) {
+        res = quantize_tg(full_abs_max, scale_override * inv_six, scale, x);
+    } else {
+        float candidates[2] = {6.f, 4.f};
+        QuantResultGP results[2];
+        float scores[2];
+        float best = __builtin_inff();
+        for (int i = 0; i < 2; ++i) {
+            float inv_cand = 1.f / candidates[i];
+            results[i] = quantize_tg(full_abs_max, scale_override * inv_cand, scale, x);
+            const float descale = static_cast<float>(results[i].fp8s) * scale;
+            float2 sum = {0.f, 0.f};
+            const float2 dsv = {-descale, -descale};
+            for (int j = 0; j < 4; ++j) {
+                float2 dq = __nv_cvt_fp4x2_to_float2(results[i].bits[j]);
+                float2 xv = {static_cast<float>(x[2*j]), static_cast<float>(x[2*j+1])};
+                float2 d  = __ffma2_rn(dq, dsv, xv);
+                sum = __ffma2_rn(d, d, sum);
             }
+            float local_err = sum.x + sum.y;
+            local_err += __shfl_xor_sync(0xffffffff, local_err, 1);
+            scores[i] = local_err;
+            if (scores[i] < best) { best = scores[i]; res = results[i]; }
         }
+    }
 
-        // Store packed FP4.
-        const int global_vec_idx = row * nvecs_per_row + tid;
-        res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
+    // Store packed FP4.
+    const int global_vec_idx = row * nvecs_per_row + tid;
+    res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
 
-        // Store FP8 scale with per-group swizzle.
-        if (tid % 2 == 0) {
-            const int     col      = tid / 2;
-            const int     numKTiles = cols_div16 / 4;
-            const int64_t tgt = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, numKTiles);
-            scale_ptr[sf_base + tgt] = res.fp8s;
-        }
-    } // end grid-stride loop
+    // Store FP8 scale with per-group swizzle.
+    if (tid % 2 == 0) {
+        const int     col       = tid / 2;
+        const int     numKTiles = cols_div16 / 4;
+        const int64_t tgt = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, numKTiles);
+        scale_ptr[sf_base + tgt] = res.fp8s;
+    }
 }
 
+// ---- Launch helper ----------------------------------------------------------
 static void launch_fp4_group_tensor_global(
     int num_candidates,
     __nv_fp4x4_e2m1*   y_ptr,
     __nv_fp8_e4m3*     scale_ptr,
     float*             global_scale_ptr,
     const nv_bfloat16* x_ptr,
-    const int32_t*     row_offsets,
-    const int64_t*     scale_offsets,
-    const float*       amax_ptr,
+    const int32_t*     row_offsets_gpu,
+    const int64_t*     scale_offsets_gpu,
+    const float*       amax_ptr,          // [num_groups], caller-computed
+    const int32_t*     row_offsets_host,  // CPU mirror for CTA offset construction
     float  scale_override,
-    long   total_rows,
     long   cols,
     int    num_groups,
     cudaStream_t stream)
@@ -527,33 +531,51 @@ static void launch_fp4_group_tensor_global(
     const int warps_per_row  = (nvecs_per_row + 31) / 32;
     const int rows_per_block = max(1, 1024 / (warps_per_row * 32));
     const int block_dim      = rows_per_block * warps_per_row * 32;
-    const int natural_grid   = (static_cast<int>(total_rows) + rows_per_block - 1) / rows_per_block;
-    const int grid_dim       = min(natural_grid, MAX_BLOCKS_GP);
-    const int grid_stride    = grid_dim * rows_per_block;
     const int cdiv16         = static_cast<int>(cols / 16);
 
-    if (num_candidates == 2)
-        fp4_group_tensor_global_kernel<2><<<grid_dim, block_dim, 0, stream>>>(
-            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
-            row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);
-    else
-        fp4_group_tensor_global_kernel<1><<<grid_dim, block_dim, 0, stream>>>(
-            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
-            row_offsets, scale_offsets, amax_ptr, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block, total_rows, grid_stride);
+    // Build group_cta_offsets on the host (O(G) integer arithmetic).
+    std::vector<int32_t> h_cta_offsets(static_cast<size_t>(num_groups) + 1);
+    h_cta_offsets[0] = 0;
+    for (int g = 0; g < num_groups; ++g) {
+        int m_g = row_offsets_host[g + 1] - row_offsets_host[g];
+        h_cta_offsets[g + 1] = h_cta_offsets[g] + (m_g + rows_per_block - 1) / rows_per_block;
+    }
+    const int total_ctas = h_cta_offsets[num_groups];
 
+    // Upload group_cta_offsets to GPU (async, same stream).
+    auto cta_offsets_t = torch::empty(
+        {num_groups + 1},
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    CUDA_CHECK(cudaMemcpyAsync(
+        cta_offsets_t.data_ptr<int32_t>(),
+        h_cta_offsets.data(),
+        static_cast<size_t>(num_groups + 1) * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    const int32_t* cta_offsets_ptr = cta_offsets_t.data_ptr<int32_t>();
+
+    if (num_candidates == 2)
+        fp4_group_tensor_global_kernel<2><<<total_ctas, block_dim, 0, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            cta_offsets_ptr, row_offsets_gpu, scale_offsets_gpu,
+            amax_ptr, scale_override, cdiv16, num_groups,
+            nvecs_per_row, warps_per_row, rows_per_block);
+    else
+        fp4_group_tensor_global_kernel<1><<<total_ctas, block_dim, 0, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            cta_offsets_ptr, row_offsets_gpu, scale_offsets_gpu,
+            amax_ptr, scale_override, cdiv16, num_groups,
+            nvecs_per_row, warps_per_row, rows_per_block);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void rtn_fp4_group_tensor_global_binding(
-    at::Tensor&       out,           // [total_n, cols/2]  uint8
-    at::Tensor&       scales,        // flat FP8 scale buffer, pre-zeroed
-    at::Tensor&       global_scale,  // [num_groups]  float32
-    const at::Tensor& inp,           // [total_n, cols]  bfloat16  (experts stacked)
-    const at::Tensor& row_offsets,   // [num_groups+1]  int32  (on GPU)
-    const at::Tensor& scale_offsets, // [num_groups+1]  int64  (on GPU)
-    const at::Tensor& amax,          // [num_groups]  float32  (per-expert abs-max)
+    at::Tensor&       out,
+    at::Tensor&       scales,
+    at::Tensor&       global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
     float             scale_override)
 {
     TORCH_CHECK(inp.dtype()      == at::kBFloat16, "inp must be bfloat16");
@@ -562,15 +584,17 @@ void rtn_fp4_group_tensor_global_binding(
     TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
     TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
     TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
-    TORCH_CHECK(amax.dtype()     == at::kFloat,    "amax must be float32");
     TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
     TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
+    TORCH_CHECK(amax.dtype()          == at::kFloat, "amax must be float32");
     const int ngroups = static_cast<int>(row_offsets.numel()) - 1;
     TORCH_CHECK(global_scale.numel() == ngroups,   "global_scale must have num_groups elements");
     TORCH_CHECK(amax.numel()         == ngroups,   "amax must have num_groups elements");
 
-    const long total_n = inp.size(0);
-    const long cols    = inp.size(1);
+    const long cols = inp.size(1);
+
+    at::Tensor row_offsets_cpu = row_offsets.cpu();
+    const int32_t* row_offsets_host = row_offsets_cpu.data_ptr<int32_t>();
 
     launch_fp4_group_tensor_global(
         1,
@@ -581,7 +605,8 @@ void rtn_fp4_group_tensor_global_binding(
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
         reinterpret_cast<const float*>(amax.data_ptr()),
-        scale_override, total_n, cols, ngroups,
+        row_offsets_host,
+        scale_override, cols, ngroups,
         at::cuda::getCurrentCUDAStream());
 }
 
@@ -601,15 +626,17 @@ void four_six_fp4_group_tensor_global_binding(
     TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
     TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
     TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
-    TORCH_CHECK(amax.dtype()     == at::kFloat,    "amax must be float32");
     TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
     TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
+    TORCH_CHECK(amax.dtype()          == at::kFloat, "amax must be float32");
     const int ngroups = static_cast<int>(row_offsets.numel()) - 1;
     TORCH_CHECK(global_scale.numel() == ngroups,   "global_scale must have num_groups elements");
     TORCH_CHECK(amax.numel()         == ngroups,   "amax must have num_groups elements");
 
-    const long total_n = inp.size(0);
-    const long cols    = inp.size(1);
+    const long cols = inp.size(1);
+
+    at::Tensor row_offsets_cpu = row_offsets.cpu();
+    const int32_t* row_offsets_host = row_offsets_cpu.data_ptr<int32_t>();
 
     launch_fp4_group_tensor_global(
         2,
@@ -620,6 +647,7 @@ void four_six_fp4_group_tensor_global_binding(
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
         reinterpret_cast<const float*>(amax.data_ptr()),
-        scale_override, total_n, cols, ngroups,
+        row_offsets_host,
+        scale_override, cols, ngroups,
         at::cuda::getCurrentCUDAStream());
 }

@@ -1,6 +1,7 @@
 import torch
 import fp4_gemm
 from typing import Optional, List, Tuple, Union
+from torch.profiler import record_function
 
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.quantization import GroupQuantizeResult
@@ -180,17 +181,18 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.WEIGHT:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_tensor_global_packed
 
-            gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1], skip_cute_data=True)
-            device = gw.data.device
+            with record_function("sq_w_nvfp4_pack"):
+                gw = group_quantize_nvfp4_tensor_global_packed(x, x.shape[1], skip_cute_data=True)
             n, k = x.shape[1], x.shape[2]
 
             if return_transpose:
                 w_out_splits = [x[i].shape[0] for i in range(num_gemms)]
-                quantize_tensor_list_transpose = tex.split_quantize(
-                    x.reshape(-1, x.shape[-1]),
-                    w_out_splits,
-                    self._w_quantizers_fp8,
-                )
+                with record_function("sq_w_split_quantize_fp8"):
+                    quantize_tensor_list_transpose = tex.split_quantize(
+                        x.reshape(-1, x.shape[-1]),
+                        w_out_splits,
+                        self._w_quantizers_fp8,
+                    )
             else:
                 quantize_tensor_list_transpose = []
 
@@ -205,8 +207,8 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "data":          gw.data,
                     "scale_flat":    gw.scale_flat,
                     "global_scale":  gw.global_scale,
-                    "row_offsets":   torch.tensor(gw.row_offsets,   dtype=torch.int32, device=device),
-                    "scale_offsets": torch.tensor(gw.scale_offsets, dtype=torch.int64, device=device),
+                    "row_offsets":   gw.row_offsets_gpu,
+                    "scale_offsets": gw.scale_offsets_gpu,
                     "n": n,
                     "k": k,
                 },
@@ -215,11 +217,12 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
         if qparams.param_type == qparams.param_type.X:
             from miniTransformer.ops.nvfp4_quantize import group_quantize_nvfp4_pertoken_swizzled
 
-            gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits, skip_scale_views=True)
-            device = gq.data.device
+            with record_function("sq_x_nvfp4_pertoken"):
+                gq = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
 
             if return_transpose:
-                quantize_tensor_list = tex.split_quantize(x, m_splits, self._x_quantizers)
+                with record_function("sq_x_split_quantize_fp8"):
+                    quantize_tensor_list = tex.split_quantize(x, m_splits, self._x_quantizers)
             else:
                 quantize_tensor_list = []
             return GroupQuantizeResult(
@@ -233,17 +236,18 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
                     "data":          gq.data,
                     "scale_flat":    gq.scale_flat,
                     "global_scale":  gq.global_scale,
-                    "row_offsets":   torch.tensor(gq.row_offsets,   dtype=torch.int32, device=device),
-                    "scale_offsets": torch.tensor(gq.scale_offsets, dtype=torch.int64, device=device),
+                    "row_offsets":   gq.row_offsets_gpu,
+                    "scale_offsets": gq.scale_offsets_gpu,
                 },
             )
 
         # Dy: MXFP8 quant for backward
-        quantize_tensor_list = tex.split_quantize(
-            x,
-            m_splits,
-            self._dy_quantizers,
-        )
+        with record_function("sq_dy_split_quantize_fp8"):
+            quantize_tensor_list = tex.split_quantize(
+                x,
+                m_splits,
+                self._dy_quantizers,
+            )
         return GroupQuantizeResult(
             data=quantize_tensor_list,
             scale=quantize_tensor_list,
@@ -334,20 +338,21 @@ class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
             )
             out = [out]
 
-        general_grouped_gemm(
-            A=B,
-            B=A,
-            out=out,
-            out_dtype=activation_dtype,
-            layout=layout,
-            m_splits=m_splits,
-            single_output=False if (grad and layout == "NT") else True,
-            grad=grad,
-            bias=bias,
-            use_bias=use_bias,
-            use_split_accumulator=False,
-            accumulate=accumulate
-        )
+        with record_function(f"gg_te_grouped_gemm_{layout}_grad{grad}"):
+            general_grouped_gemm(
+                A=B,
+                B=A,
+                out=out,
+                out_dtype=activation_dtype,
+                layout=layout,
+                m_splits=m_splits,
+                single_output=False if (grad and layout == "NT") else True,
+                grad=grad,
+                bias=bias,
+                use_bias=use_bias,
+                use_split_accumulator=False,
+                accumulate=accumulate
+            )
 
         if grad and layout == "NT":
             return out

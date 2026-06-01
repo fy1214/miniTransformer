@@ -108,6 +108,26 @@ def _unswizzle_scale(scale_flat: torch.Tensor, rows: int, cols: int) -> torch.Te
     return s.permute(0, 2, 1, 3).reshape(rows, nKT * 4)
 
 
+def _get_scale_views(gw) -> list:
+    """Build per-expert scale_views from GroupWeightQuantizeResult fields.
+
+    Returns a list of tensors with shape (32,4,nMT,4,nKT,1) — the CUTE swizzled
+    layout matching quantize_weight_nvfp4_swizzled's _cute_sfb.
+    """
+    num_experts  = gw.global_scale.shape[0]
+    n_per_expert = int(gw.row_offsets_gpu[1].item())
+    k            = gw.data.shape[1] * 2
+    sf_stride    = int(gw.scale_offsets_gpu[1].item())
+    n_padded     = ((n_per_expert + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    nMT          = n_padded // _MMA_TILE_ROWS
+    nKT          = k // 64
+    views = []
+    for g in range(num_experts):
+        s = gw.scale_flat[g * sf_stride:(g + 1) * sf_stride]
+        views.append(s.view(1, nMT, nKT, 32, 4, 4).permute(3, 4, 1, 5, 2, 0))
+    return views
+
+
 def _dequant_swizzled_group(
     data: torch.Tensor,
     scale_view: torch.Tensor,    # (32,4,nMT,4,nKT,1) — from scale_views[g]
@@ -142,10 +162,11 @@ def _eff_bitwidth(x: torch.Tensor, x_dq: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 
 def _ref_per_group(x: torch.Tensor, m_splits: List[int]):
-    """Reference: call fp4_gemm.rtn_fp4_pertoken once per group.
+    """Reference: call fp4_gemm.rtn_fp4_group_pertoken once per group.
 
-    Scale buffer is zero-initialized and padded to ceil(m_i/128)*128 * k//16
-    to avoid buffer overflow from the swizzle addressing formula.
+    Uses the same kernel as group_quantize_nvfp4_pertoken_swizzled so results
+    are bit-exact (rtn_fp4_pertoken uses a different quantize path).
+    Scale buffer is zero-initialized and padded to ceil(m_i/128)*128 * k//16.
     """
     total_m, k = x.shape
     device = x.device
@@ -161,17 +182,39 @@ def _ref_per_group(x: torch.Tensor, m_splits: List[int]):
         m_pad    = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
         sf_size  = m_pad * k // 16
         scale_i  = torch.zeros(sf_size, dtype=torch.float8_e4m3fn, device=device)
-        fp4_gemm.rtn_fp4_pertoken(
+        row_off_g   = torch.tensor([0, m_i], dtype=torch.int32, device=device)
+        scale_off_g = torch.tensor([0, sf_size], dtype=torch.int64, device=device)
+        fp4_gemm.rtn_fp4_group_pertoken(
             data_ref[offset:offset + m_i],
-            scale_i,          # padded buffer: kernel writes up to sf_size-1
+            scale_i,
             gs_ref[offset:offset + m_i],
             x[offset:offset + m_i].contiguous(),
-            x[offset:offset + m_i].abs().amax(dim=1).to(torch.float32),
+            row_off_g,
+            scale_off_g,
             1.0,
         )
         scales_ref.append(scale_i)
         offset += m_i
     return data_ref, gs_ref, scales_ref
+
+
+def _get_swizzled_scale_views(res, m_splits: List[int], k: int) -> list:
+    """Build per-group scale_views from GroupQuantizeSwizzledResult fields.
+
+    Returns a list of tensors with shape (32,4,nMT,4,nKT,1), or None for empty groups.
+    """
+    nKT = k // 64
+    views = []
+    for g, m_i in enumerate(m_splits):
+        if m_i == 0:
+            views.append(None)
+            continue
+        s0  = int(res.scale_offsets_gpu[g].item())
+        s1  = int(res.scale_offsets_gpu[g + 1].item())
+        nMT = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS)
+        s   = res.scale_flat[s0:s1]
+        views.append(s.view(1, nMT, nKT, 32, 4, 4).permute(3, 4, 1, 5, 2, 0))
+    return views
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +276,9 @@ def test_scale_matches_reference(num_groups: int, m_per_group: int, k: int):
 
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
     _, _, scales_ref = _ref_per_group(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
 
-    for g, (sv, sr) in enumerate(zip(res.scale_views, scales_ref)):
+    for g, (sv, sr) in enumerate(zip(scale_views, scales_ref)):
         if sv is None:
             continue
         m_i  = m_splits[g]
@@ -258,17 +302,18 @@ def test_dequant_precision(num_groups: int, m_per_group: int, k: int):
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
     res  = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
 
     offset = 0
     all_bits: List[float] = []
     for g, m_i in enumerate(m_splits):
-        if m_i == 0 or res.scale_views[g] is None:
+        if m_i == 0 or scale_views[g] is None:
             offset += m_i
             continue
         xi     = x[offset:offset + m_i]
         di     = res.data[offset:offset + m_i]
         gsi    = res.global_scale[offset:offset + m_i]
-        xi_dq  = _dequant_swizzled_group(di, res.scale_views[g], gsi, m_i, k)
+        xi_dq  = _dequant_swizzled_group(di, scale_views[g], gsi, m_i, k)
         all_bits.append(_eff_bitwidth(xi, xi_dq))
         offset += m_i
 
@@ -288,17 +333,18 @@ def test_dequant_precision_rl_splits():
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
 
     offset = 0
     all_bits: List[float] = []
     for g, m_i in enumerate(m_splits):
-        if m_i == 0 or res.scale_views[g] is None:
+        if m_i == 0 or scale_views[g] is None:
             offset += m_i
             continue
         xi     = x[offset:offset + m_i]
         di     = res.data[offset:offset + m_i]
         gsi    = res.global_scale[offset:offset + m_i]
-        xi_dq  = _dequant_swizzled_group(di, res.scale_views[g], gsi, m_i, k)
+        xi_dq  = _dequant_swizzled_group(di, scale_views[g], gsi, m_i, k)
         all_bits.append(_eff_bitwidth(xi, xi_dq))
         offset += m_i
 
@@ -331,12 +377,13 @@ def test_empty_groups_handled():
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
 
-    assert res.scale_views[1] is None, "group 1 (m=0) must have None scale_view"
-    assert res.scale_views[3] is None, "group 3 (m=0) must have None scale_view"
-    assert res.scale_views[0] is not None
-    assert res.scale_views[2] is not None
-    assert res.scale_views[4] is not None
+    assert scale_views[1] is None, "group 1 (m=0) must have None scale_view"
+    assert scale_views[3] is None, "group 3 (m=0) must have None scale_view"
+    assert scale_views[0] is not None
+    assert scale_views[2] is not None
+    assert scale_views[4] is not None
     assert res.data.shape    == (total_m, k // 2)
     assert res.global_scale.shape == (total_m,)
 
@@ -349,8 +396,9 @@ def test_all_zeros_stable():
     x = torch.zeros(total_m, k, dtype=torch.bfloat16, device="cuda")
 
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
     assert torch.isfinite(res.global_scale).all(), "NaN/Inf in global_scale"
-    for sv in res.scale_views:
+    for sv in scale_views:
         if sv is not None:
             assert torch.isfinite(sv.to(torch.float32)).all(), "NaN/Inf in scale_view"
 
@@ -363,10 +411,11 @@ def test_scale_view_shape():
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+    scale_views = _get_swizzled_scale_views(res, m_splits, k)
 
     nKT = k // 64
     for g, m_i in enumerate(m_splits):
-        sv  = res.scale_views[g]
+        sv  = scale_views[g]
         nMT = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS)
         expected = (32, 4, nMT, 4, nKT, 1)
         assert sv.shape == expected, (
@@ -384,19 +433,19 @@ def test_scale_offsets_row_offsets_correct():
     res = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
 
     # row_offsets
-    assert res.row_offsets[0] == 0
+    assert res.row_offsets_gpu[0].item() == 0
     expected_row = 0
     for i, m_i in enumerate(m_splits):
         expected_row += m_i
-        assert res.row_offsets[i + 1] == expected_row
+        assert res.row_offsets_gpu[i + 1].item() == expected_row
 
     # scale_offsets: each group occupies ceil(m_i/128)*128 * k//16
-    assert res.scale_offsets[0] == 0
+    assert res.scale_offsets_gpu[0].item() == 0
     expected_sf = 0
     for i, m_i in enumerate(m_splits):
         m_pad = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
         expected_sf += m_pad * k // 16
-        assert res.scale_offsets[i + 1] == expected_sf
+        assert res.scale_offsets_gpu[i + 1].item() == expected_sf
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +556,7 @@ if __name__ == "__main__":
         x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
         res      = group_quantize_nvfp4_pertoken_swizzled(x, m_splits)
+        scale_views = _get_swizzled_scale_views(res, m_splits, k)
         data_ref, gs_ref, _ = _ref_per_group(x, m_splits)
 
         data_match = torch.equal(res.data, data_ref)
@@ -515,13 +565,13 @@ if __name__ == "__main__":
         offset = 0
         bits_list: List[float] = []
         for g, m_i in enumerate(m_splits):
-            if m_i == 0 or res.scale_views[g] is None:
+            if m_i == 0 or scale_views[g] is None:
                 offset += m_i
                 continue
             xi    = x[offset:offset + m_i]
             dq    = _dequant_swizzled_group(
                 res.data[offset:offset + m_i],
-                res.scale_views[g],
+                scale_views[g],
                 res.global_scale[offset:offset + m_i],
                 m_i, k,
             )
@@ -570,9 +620,19 @@ _WEIGHT_SHAPES = [
     (4,  256, 512),
 ]
 
+try:
+    import cutlass as _cutlass_mod  # noqa: F401
+    _cutlass_available = True
+except ImportError:
+    _cutlass_available = False
+
 _skip_weight = pytest.mark.skipif(
-    group_quantize_nvfp4_tensor_global_packed is None,
-    reason="group_quantize_nvfp4_tensor_global_packed not importable",
+    group_quantize_nvfp4_tensor_global_packed is None or not _cutlass_available,
+    reason=(
+        "group_quantize_nvfp4_tensor_global_packed not importable"
+        if group_quantize_nvfp4_tensor_global_packed is None
+        else "cutlass Python module not installed"
+    ),
 )
 
 
@@ -618,10 +678,11 @@ def test_weight_packed_scale_view_matches_per_expert(num_experts: int, n: int, k
     torch.manual_seed(42)
     x = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
     gw = group_quantize_nvfp4_tensor_global_packed(x, n)
+    scale_views = _get_scale_views(gw)
 
     for g in range(num_experts):
         ref = quantize_weight_nvfp4_swizzled(x[g])
-        sv  = gw.scale_views[g].contiguous()
+        sv  = scale_views[g].contiguous()
         rv  = ref._cute_sfb.contiguous()
         assert sv.shape == rv.shape, (
             f"expert {g}: scale_view shape mismatch {sv.shape} vs {rv.shape}"
@@ -645,9 +706,9 @@ def test_weight_packed_cute_fp4_slice_matches_per_expert(num_experts: int, n: in
         cute_data=gw.cute_data,
         scale_flat=gw.scale_flat,
         global_scale=gw.global_scale,
-        scale_views=gw.scale_views,
-        scale_offsets=gw.scale_offsets,
-        row_offsets=gw.row_offsets,
+        scale_views=_get_scale_views(gw),
+        scale_offsets=gw.scale_offsets_gpu,
+        row_offsets=gw.row_offsets_gpu,
         n_per_expert=n,
         k=k,
     )

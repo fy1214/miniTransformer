@@ -194,7 +194,8 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             ctx.save_for_backward(*weights)
 
         if (parallel_mode == "row") and (tp_size > 1):
-            y, _ = allreduce(y, tp_group)
+            with record_function("allreduce_output"):
+                y, _ = allreduce(y, tp_group)
 
         return y.view(-1, *x_shape[1:-1], y.shape[-1])
 
@@ -236,25 +237,27 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         if ctx.disable_backward_quant:
             # BF16 path: dgrad = dy @ w.T (layout NN)
             dy_splits = list(torch.split(dy, ctx.m_splits, dim=0))
-            dgrad = ctx.quantize_op.grouped_gemm(
-                A=dy_splits,
-                B=weights,
-                sA=None, sB=None,
-                global_amax_A=None, global_amax_B=None,
-                out=None,
-                out_dtype=out_dtype_dgrad,
-                layout="NN",
-                m_splits=ctx.m_splits,
-                grad=True,
-            )
+            with record_function("grouped_dgrad"):
+                dgrad = ctx.quantize_op.grouped_gemm(
+                    A=dy_splits,
+                    B=weights,
+                    sA=None, sB=None,
+                    global_amax_A=None, global_amax_B=None,
+                    out=None,
+                    out_dtype=out_dtype_dgrad,
+                    layout="NN",
+                    m_splits=ctx.m_splits,
+                    grad=True,
+                )
         else:
             # Quantized path: quantize dy and compute dgrad via quantized grouped GEMM
-            qresult_dy_list = ctx.quantize_op.group_quantize(
-                dy,
-                ctx.qlinear_params.g_params,
-                m_splits=ctx.m_splits,
-                return_transpose=True,
-            )
+            with record_function("group_quantize_dy"):
+                qresult_dy_list = ctx.quantize_op.group_quantize(
+                    dy,
+                    ctx.qlinear_params.g_params,
+                    m_splits=ctx.m_splits,
+                    return_transpose=True,
+                )
             qdy, sdy, tdy, qdy_t, sdy_t, tdy_t = (qresult_dy_list.data,
                                                    qresult_dy_list.scale,
                                                    qresult_dy_list.tensor_scale,
@@ -262,26 +265,28 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                                                    qresult_dy_list.scale_t,
                                                    qresult_dy_list.tensor_scale_t)
 
-            dgrad = ctx.quantize_op.grouped_gemm(
-                A=qdy,
-                B=qw_t,
-                sA=sdy,
-                sB=sw_t,
-                global_amax_A=tdy,
-                global_amax_B=tw_t,
-                out=None,
-                out_dtype=out_dtype_dgrad,
-                layout="NN",
-                m_splits=ctx.m_splits,
-                grad=True,
-                qparams_x=ctx.qlinear_params.g_params,
-                qparams_w=ctx.qlinear_params.w_params
-            )
+            with record_function("grouped_dgrad"):
+                dgrad = ctx.quantize_op.grouped_gemm(
+                    A=qdy,
+                    B=qw_t,
+                    sA=sdy,
+                    sB=sw_t,
+                    global_amax_A=tdy,
+                    global_amax_B=tw_t,
+                    out=None,
+                    out_dtype=out_dtype_dgrad,
+                    layout="NN",
+                    m_splits=ctx.m_splits,
+                    grad=True,
+                    qparams_x=ctx.qlinear_params.g_params,
+                    qparams_w=ctx.qlinear_params.w_params
+                )
 
         # AllReduce for TP
         handle = None
         if (ctx.parallel_mode == "column") and (ctx.tp_size > 1):
-            dgrad, handle = allreduce(dgrad, ctx.tp_group, True)
+            with record_function("allreduce_dgrad"):
+                dgrad, handle = allreduce(dgrad, ctx.tp_group, True)
 
         # TODO: support it?
         if ctx.is_first_microbatch is not None:
@@ -301,35 +306,37 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         if ctx.disable_backward_quant:
             # BF16 path: wgrad = dy.T @ x (layout NT); dy_splits already computed in dgrad path
-            wgrad = ctx.quantize_op.grouped_gemm(
-                A=dy_splits,
-                B=ctx.x_bf16_list,
-                sA=None, sB=None,
-                global_amax_A=None, global_amax_B=None,
-                out=wgrad_list,
-                out_dtype=ctx.activation_dtype,
-                layout="NT",
-                m_splits=ctx.m_splits,
-                grad=True,
-                accumulate=accumulate_wgrad_into_param_main_grad,
-            )
+            with record_function("grouped_wgrad"):
+                wgrad = ctx.quantize_op.grouped_gemm(
+                    A=dy_splits,
+                    B=ctx.x_bf16_list,
+                    sA=None, sB=None,
+                    global_amax_A=None, global_amax_B=None,
+                    out=wgrad_list,
+                    out_dtype=ctx.activation_dtype,
+                    layout="NT",
+                    m_splits=ctx.m_splits,
+                    grad=True,
+                    accumulate=accumulate_wgrad_into_param_main_grad,
+                )
         else:
-            wgrad = ctx.quantize_op.grouped_gemm(
-                A=qdy_t,
-                B=qx_t,
-                sA=sdy_t,
-                sB=sx_t,
-                global_amax_A=tdy_t,
-                global_amax_B=tx_t,
-                out=wgrad_list,
-                out_dtype=ctx.activation_dtype,
-                layout="NT",
-                m_splits=ctx.m_splits,
-                grad=True,
-                accumulate=accumulate_wgrad_into_param_main_grad,
-                qparams_x=ctx.qlinear_params.g_params,
-                qparams_w=ctx.qlinear_params.x_params
-            )
+            with record_function("grouped_wgrad"):
+                wgrad = ctx.quantize_op.grouped_gemm(
+                    A=qdy_t,
+                    B=qx_t,
+                    sA=sdy_t,
+                    sB=sx_t,
+                    global_amax_A=tdy_t,
+                    global_amax_B=tx_t,
+                    out=wgrad_list,
+                    out_dtype=ctx.activation_dtype,
+                    layout="NT",
+                    m_splits=ctx.m_splits,
+                    grad=True,
+                    accumulate=accumulate_wgrad_into_param_main_grad,
+                    qparams_x=ctx.qlinear_params.g_params,
+                    qparams_w=ctx.qlinear_params.x_params
+                )
 
         def handle_custom_ddp_from_mcore(weight, wgrad):
             if ctx.weights_requires_grad:
@@ -661,14 +668,15 @@ class GroupedLinear(LayerLinearBaseModule):
 
         if self.gemm_bias_unfused_add:
             out_shape = out.shape
-            out = torch.cat(
-                [
-                    o + cast_if_needed(b, self.activation_dtype)
-                    for o, b in zip(
-                        torch.split(out.view(-1, self.out_features), m_splits), bias_tensors
-                    )
-                ]
-            ).view(out_shape)
+            with record_function("bias_add"):
+                out = torch.cat(
+                    [
+                        o + cast_if_needed(b, self.activation_dtype)
+                        for o, b in zip(
+                            torch.split(out.view(-1, self.out_features), m_splits), bias_tensors
+                        )
+                    ]
+                ).view(out_shape)
 
         if self.return_bias:
             return out, [cast_if_needed(b, self.activation_dtype) for b in bias_tensors]

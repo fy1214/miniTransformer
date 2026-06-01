@@ -236,7 +236,7 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
     # Expand per-expert weight scale to per-row, then fold in activation scale.
     # act_ts = amax_row / (448*6), wgt_ts = amax_expert / (448*6) — both already normalized.
     # group_sizes is derived on-device from a_rows; no CPU→GPU copy.
-    group_sizes = (inputs.a_rows[1:] - inputs.a_rows[:-1]).to(torch.int64)
+    group_sizes = inputs.a_rows[1:] - inputs.a_rows[:-1]
     ts_b    = torch.repeat_interleave(
         inputs.wgt_ts,
         group_sizes,

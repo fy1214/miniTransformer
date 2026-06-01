@@ -3,7 +3,7 @@ import torch
 import fp4_gemm
 from typing import Optional, List, Tuple
 from scipy.linalg import hadamard
-from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+from miniTransformer.ops._te_compat import general_grouped_gemm
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 from miniTransformer.ops.nvfp4_gemm_backend import dispatch_gemm_backend

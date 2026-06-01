@@ -10,7 +10,7 @@ from typing import Callable, List, Literal, Optional, Tuple
 
 import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm, general_grouped_gemm
+from miniTransformer.ops._te_compat import general_gemm, general_grouped_gemm
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
 from miniTransformer.ops.exp.quant_utils import (

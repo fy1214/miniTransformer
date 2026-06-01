@@ -83,8 +83,8 @@ def build_extensions() -> list[setuptools.Extension]:
     csrc_dir = ROOT_DIR / "miniTransformer" / "csrc"
     cutlass_dir = ROOT_DIR / "third-party" / "cutlass"
     sources = (
-        glob.glob(str(csrc_dir / "**/*.cpp"), recursive=True)
-        + glob.glob(str(csrc_dir / "**/*.cu"), recursive=True)
+        [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cpp"), recursive=True)]
+        + [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cu"), recursive=True)]
     )
     include_dirs = [
         str(csrc_dir),

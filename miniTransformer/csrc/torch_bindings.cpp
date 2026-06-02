@@ -35,6 +35,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_cutlass_gemm_v2",
           &grouped_cutlass_gemm_v2,
           "FP4 grouped GEMM v2: zero-overhead, pre-allocated buffers (CUDA)");
+    m.def("mxfp8_grouped_gemm_buffer_sizes",
+          &mxfp8_grouped_gemm_buffer_sizes,
+          "Return (ptrs_bytes, strides_bytes, layouts_bytes) for MXFP8 grouped GEMM pre-allocation");
+    m.def("mxfp8_grouped_gemm",
+          &mxfp8_grouped_gemm,
+          "MXFP8 grouped GEMM (CUTLASS SM100): zero-overhead, 1SM/2SM selectable (CUDA)");
+    m.def("mxfp8_grouped_quantize",
+          &mxfp8_grouped_quantize_binding,
+          pybind11::arg("out"), pybind11::arg("sf"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
+          "MXFP8 grouped rowwise quantization (BF16→FP8 E4M3 + E8M0 SF, SM100 swizzled layout)");
 
 
     // quarter quantization

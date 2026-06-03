@@ -29,10 +29,10 @@
  *   b_sf_offsets[g]   : element index into B_sf for group g    (len = groups+1)
  *
  * Persistent device buffers (pre-allocated by caller, never freed between calls):
- *   buf_ptrs          : [7 * max_groups]  int64  (6 data ptrs + tokens_per_expert ptr slot)
+ *   buf_ptrs          : [6 * max_groups]  uint8 (6 data ptr arrays)
  *   buf_strides       : [max_groups * (4 * sizeof(StrideA))]  uint8
  *   buf_layouts       : [max_groups * (2 * sizeof(LayoutSFA))]  uint8
- *   buf_problem_sizes : [max_groups * 3]  int32  (device copy)
+ *   buf_problem_sizes : [max_groups * 3]  int32  (device copy of per-group (M_g,N_g,K))
  *
  * problem_sizes_host  : CPU tensor [groups * 3]  int32
  *   CUTLASS's grouped TMA kernel requires host-side problem sizes during
@@ -95,7 +95,7 @@ static constexpr int AlignmentB = 16;
 static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-using ProblemShape = cutlass::gemm::MoEProblemShape<Shape<int, int, int>>;
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 using ClusterShape = Shape<int32_t, int32_t, _1>;
 
 // 1SM config
@@ -183,8 +183,6 @@ __global__ void fill_mxfp8_grouped_gemm_args_kernel(
     StrideD*   stride_D,
     // Problem sizes (device copy)
     typename ProblemShape::UnderlyingProblemShape* problem_sizes_dev,
-    // tokens_per_expert for MoEProblemShape (= N_g)
-    int32_t*              tokens_per_expert_dev,
     // Base data pointers
     const ArrayElementA*  a_base,
     const ArrayElementB*  b_base,
@@ -222,7 +220,6 @@ __global__ void fill_mxfp8_grouped_gemm_args_kernel(
     layout_SFB[g] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(shape_g);
 
     problem_sizes_dev[g]    = cute::make_shape(M_g, N_g, K);
-    tokens_per_expert_dev[g] = N_g;
 }
 
 } // namespace mxfp8
@@ -250,7 +247,6 @@ std::vector<int64_t> mxfp8_grouped_gemm_buffer_sizes(int max_groups)
 {
     using namespace mxfp8;
     // ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_C, ptr_D  (6 ptr arrays)
-    // + tokens_per_expert_dev (1 int32 array packed after problem_sizes_dev by caller)
     int64_t ptrs_bytes    = (int64_t)6 * max_groups * sizeof(void*);
     int64_t strides_bytes = (int64_t)max_groups *
                             (sizeof(StrideA) + sizeof(StrideB) +
@@ -316,11 +312,9 @@ void mxfp8_grouped_gemm(
     auto* layout_SFA = reinterpret_cast<LayoutSFA*>(raw_layouts);
     auto* layout_SFB = reinterpret_cast<LayoutSFB*>(layout_SFA + num_groups);
 
-    // problem_sizes_dev: [groups*3] int32, then tokens_per_expert: [groups] int32
-    // Pack both into buf_problem_sizes_dev which is [groups*3 + groups] = [groups*4] int32
+    // problem_sizes_dev: [groups*3] int32 — one (M_g, N_g, K) per group
     auto* prob_dev  = reinterpret_cast<typename ProblemShape::UnderlyingProblemShape*>(
                           buf_problem_sizes_dev.data_ptr());
-    auto* tpe_dev   = reinterpret_cast<int32_t*>(prob_dev + num_groups);
     auto* prob_host = reinterpret_cast<const typename ProblemShape::UnderlyingProblemShape*>(
                           problem_sizes_host.data_ptr());
 
@@ -330,7 +324,7 @@ void mxfp8_grouped_gemm(
     fill_mxfp8_grouped_gemm_args_kernel<<<1, num_groups, 0, stream>>>(
         ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_C, ptr_D,
         stride_A, stride_B, layout_SFA, layout_SFB, stride_C, stride_D,
-        prob_dev, tpe_dev,
+        prob_dev,
         static_cast<const ArrayElementA*>(A.data_ptr()),
         static_cast<const ArrayElementB*>(B.data_ptr()),
         static_cast<const ElementSF*>(A_sf.data_ptr()),
@@ -352,19 +346,15 @@ void mxfp8_grouped_gemm(
     hw_info.cluster_shape          = use_2sm ? dim3(2, 1, 1) : dim3(1, 1, 1);
     hw_info.cluster_shape_fallback = use_2sm ? dim3(2, 1, 1) : dim3(1, 1, 1);
 
-    // MoEProblemShape args: {M_total, N_total, K, groups, tokens_per_expert_ptr}
-    // M_total / N_total are not directly used by MoEProblemShape; groups and
-    // tokens_per_expert are the authoritative shape info.
-    int total_M = static_cast<int>(A.size(0));
-    int total_N = static_cast<int>(B.size(0));
-
+    // GroupProblemShape args: {num_groups, prob_dev (device), prob_host (host)}
+    // prob_dev[g] = {M_g, N_g, K} per group, filled by GPU micro-kernel above.
     int64_t key = mxfp8_cache_key(num_groups, A.device().index());
     auto& entry = s_mxfp8_gemm_cache[key];
 
     if (use_2sm) {
         typename Gemm2SM::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGrouped,
-            {total_M, total_N, K, num_groups, tpe_dev, prob_dev, prob_host},
+            {num_groups, prob_dev, prob_host},
             {
                 ptr_A,    stride_A,
                 ptr_B,    stride_B,
@@ -390,7 +380,7 @@ void mxfp8_grouped_gemm(
     } else {
         typename Gemm1SM::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGrouped,
-            {total_M, total_N, K, num_groups, tpe_dev, prob_dev, prob_host},
+            {num_groups, prob_dev, prob_host},
             {
                 ptr_A,    stride_A,
                 ptr_B,    stride_B,

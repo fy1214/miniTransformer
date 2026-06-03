@@ -6,7 +6,7 @@ Mirrors the structure of nvfp4_grouped_cutlass_gemm.py (v2 portion).
 Differences from the FP4 v2:
   - No per-token / per-expert second-level scale (MXFP8 has no secondary scale).
   - Scale factors are E8M0 (uint8), one byte per 32 K-elements.
-  - buf_psizes requires groups*4 int32 (groups*3 problem_sizes + groups tokens_per_expert).
+  - buf_psizes requires groups*3 int32 (groups × (M_g, N_g, K) problem sizes).
   - use_2sm flag selects 1SM or 2SM CUTLASS schedule.
 
 Activations and weights are pre-packed into contiguous flat buffers by
@@ -39,7 +39,7 @@ def _get_v2_buffers(max_groups: int, device):
             torch.empty(ptrs_b,           dtype=torch.uint8, device=device),  # pointer table
             torch.empty(strides_b,        dtype=torch.uint8, device=device),  # stride table
             torch.empty(layouts_b,        dtype=torch.uint8, device=device),  # layout table
-            torch.empty(max_groups * 4,   dtype=torch.int32, device=device),  # problem_sizes + tokens_per_expert
+            torch.empty(max_groups * 3,   dtype=torch.int32, device=device),  # problem_sizes (M_g, N_g, K) per group
             torch.empty(4 * 1024 * 1024,  dtype=torch.uint8, device=device),  # workspace
         )
     return _v2_buf_cache[key]

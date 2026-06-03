@@ -2,7 +2,7 @@ import math
 import torch
 from typing import List, Optional, Tuple
 
-import miniTransformer._C as _C
+import fp4_gemm
 
 
 def _sf_size_per_group(m_g: int, K: int) -> int:
@@ -64,7 +64,7 @@ def mxfp8_grouped_quantize(
     out = torch.empty((total_M, K), dtype=torch.uint8, device=inp.device)
     sf  = torch.zeros(total_sf, dtype=torch.uint8, device=inp.device)
 
-    _C.mxfp8_grouped_quantize(out, sf, inp, row_offsets, sf_offsets)
+    fp4_gemm.mxfp8_grouped_quantize(out, sf, inp, row_offsets, sf_offsets)
 
     return out, sf, row_offsets, sf_offsets
 
@@ -114,7 +114,7 @@ def mxfp8_grouped_transpose_quantize(
     out_T = torch.empty((K, total_M), dtype=torch.uint8, device=inp.device)
     sf    = torch.zeros(total_sf, dtype=torch.uint8, device=inp.device)
 
-    _C.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets)
+    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets)
 
     return out_T, sf, row_offsets, sf_offsets
 

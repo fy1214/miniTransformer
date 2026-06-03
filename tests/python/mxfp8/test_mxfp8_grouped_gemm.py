@@ -1,5 +1,5 @@
 """
-Correctness tests for mxfp8_grouped_gemm_v2 (CUTLASS SM100, zero-overhead).
+Correctness tests for mxfp8_grouped_gemm (CUTLASS SM100, zero-overhead).
 
 Reference: dequantize A/B from MXFP8 + E8M0 scale factors to FP32, then
            run fp32 matmul group-by-group. Compare against CUTLASS BF16 output.
@@ -21,7 +21,7 @@ if ROOT_DIR not in sys.path:
 pytest.importorskip("fp4_gemm")
 
 from miniTransformer.ops.mxfp8_quantize import mxfp8_grouped_quantize, _sf_size_per_group
-from miniTransformer.ops.mxfp8_grouped_cutlass_gemm import MxFP8V2GemmInputs, mxfp8_grouped_gemm_v2
+from miniTransformer.ops.mxfp8_grouped_cutlass_gemm import MxFP8GemmInputs, mxfp8_grouped_gemm
 
 
 # ---------------------------------------------------------------------------
@@ -100,12 +100,12 @@ def _mxfp8_ref(
 
 def _build_inputs(shapes, seed=42, device="cuda"):
     """
-    Build MxFP8V2GemmInputs for mxfp8_grouped_gemm_v2.
+    Build MxFP8GemmInputs for mxfp8_grouped_gemm.
 
     shapes: list of (M_g, N_g, K) — K must be the same for all groups.
 
     Returns:
-        inputs        : MxFP8V2GemmInputs ready for mxfp8_grouped_gemm_v2
+        inputs        : MxFP8GemmInputs ready for mxfp8_grouped_gemm
         per_group_info: list of (m_g, n_g, K, a_sf_g, b_sf_g) for reference checks
     """
     K = shapes[0][2]
@@ -135,7 +135,7 @@ def _build_inputs(shapes, seed=42, device="cuda"):
         prob_host[i * 3 + 1] = n
         prob_host[i * 3 + 2] = k
 
-    inputs = MxFP8V2GemmInputs(
+    inputs = MxFP8GemmInputs(
         act_data=A,
         act_sf=A_sf_flat,
         a_rows=a_row_offsets,
@@ -226,7 +226,7 @@ class TestMxfp8GroupedGemmCorrectness:
 
         inputs, per_group_info = _build_inputs(shapes, seed=seed, device=device)
 
-        D = mxfp8_grouped_gemm_v2(inputs, out_dtype=torch.bfloat16, use_2sm=use_2sm)
+        D = mxfp8_grouped_gemm(inputs, out_dtype=torch.bfloat16, use_2sm=use_2sm)
         torch.cuda.synchronize()
 
         a_row_offsets = inputs.a_rows
@@ -271,7 +271,7 @@ class TestMxfp8GroupedGemmCorrectness:
         inputs, _ = _build_inputs(shapes, seed=0, device=device)
         total_M = int(inputs.act_data.size(0))
 
-        D = mxfp8_grouped_gemm_v2(inputs, out_dtype=torch.bfloat16, use_2sm=False)
+        D = mxfp8_grouped_gemm(inputs, out_dtype=torch.bfloat16, use_2sm=False)
         torch.cuda.synchronize()
 
         assert D.dtype == torch.bfloat16
@@ -287,7 +287,7 @@ class TestMxfp8GroupedGemmCorrectness:
 
         inputs, per_group_info = _build_inputs(shapes, seed=seed, device=device)
 
-        D = mxfp8_grouped_gemm_v2(inputs, out_dtype=torch.bfloat16, use_2sm=False)
+        D = mxfp8_grouped_gemm(inputs, out_dtype=torch.bfloat16, use_2sm=False)
         torch.cuda.synchronize()
 
         a_row_offsets = inputs.a_rows
@@ -355,7 +355,7 @@ class TestMxfp8GroupedGemmBenchmark:
         inputs, _ = _build_inputs(shapes, seed=42, device=device)
 
         def fn():
-            mxfp8_grouped_gemm_v2(inputs, out_dtype=torch.bfloat16, use_2sm=use_2sm)
+            mxfp8_grouped_gemm(inputs, out_dtype=torch.bfloat16, use_2sm=use_2sm)
 
         # warmup + first run to trigger CUTLASS initialize
         fn()

@@ -11,18 +11,21 @@ SF layout (roles swapped vs rowwise):
 """
 
 import math
+import os
 import struct
-import pytest
-import torch
+import sys
 from typing import List
 
+import pytest
+import torch
 
-def _import_module():
-    try:
-        import miniTransformer._C as _C
-        return _C
-    except ImportError:
-        return None
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+pytest.importorskip("fp4_gemm")
+
+from miniTransformer.ops.mxfp8_quantize import mxfp8_grouped_transpose_quantize
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +51,18 @@ def _cvt_sf_offset(mIdx: int, kIdx: int, numKTiles: int) -> int:
 
 
 def _float_to_e8m0(v: float) -> int:
+    """OCP MXFP8 / TransformerEngine recipe: normalize by FP8 E4M3 max norm
+    (448), then round exponent UP on nonzero mantissa.  Mirrors the CUDA
+    transpose kernel mxfp8t_float_to_e8m0 and TE ptx.cuh software fallback."""
     if v == 0.0:
         return 0
-    bits = int.from_bytes(struct.pack('>f', abs(v)), 'big')
-    biased_exp = (bits >> 23) & 0xFF   # IEEE-754 biased exp = unbiased+127 = E8M0
-    return max(0, min(254, biased_exp))
+    val = abs(v) * (1.0 / 448.0)
+    bits = int.from_bytes(struct.pack('>f', val), 'big')
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    if (mantissa > 0 and exponent != 0xFE) and not (exponent == 0 and mantissa <= 0x400000):
+        exponent += 1
+    return exponent
 
 
 def _e8m0_to_scale(e8m0: int) -> float:
@@ -130,40 +140,16 @@ def skip_if_no_cuda():
         pytest.skip("CUDA not available")
 
 
-@pytest.fixture(autouse=True)
-def skip_if_no_module():
-    if _import_module() is None:
-        pytest.skip("miniTransformer._C not available (not compiled)")
-
-
 # ---------------------------------------------------------------------------
-# Helper: run kernel + reference
+# Helper: run kernel (wrapped interface) + reference
 # ---------------------------------------------------------------------------
 
 def _run(m_splits: List[int], K: int, seed: int = 42):
-    _C = _import_module()
     torch.manual_seed(seed)
     total_M = sum(m_splits)
     inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
-    num_groups = len(m_splits)
-    m_splits_t = torch.tensor(m_splits, dtype=torch.int64, device="cuda")
-
-    row_offsets = torch.empty(num_groups + 1, dtype=torch.int32, device="cuda")
-    row_offsets[0] = 0
-    row_offsets[1:] = torch.cumsum(m_splits_t.int(), dim=0)
-
-    m_k_groups = (m_splits_t + 31) // 32
-    sf_sizes   = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
-    sf_offsets = torch.empty(num_groups + 1, dtype=torch.int64, device="cuda")
-    sf_offsets[0] = 0
-    sf_offsets[1:] = torch.cumsum(sf_sizes, dim=0)
-
-    total_sf = int(sf_offsets[-1].item())
-    out_T = torch.empty(K, total_M, dtype=torch.uint8, device="cuda")
-    out_sf = torch.zeros(total_sf, dtype=torch.uint8, device="cuda")
-
-    _C.mxfp8_grouped_transpose_quantize(out_T, out_sf, inp, row_offsets, sf_offsets)
+    out_T, out_sf, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
     torch.cuda.synchronize()
 
     ref_T, ref_sf, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -222,7 +208,6 @@ class TestMxFP8GroupedTransposeQuantize:
 
     def test_gpu_tensor_m_splits(self):
         """m_splits passed as a GPU int tensor instead of a Python list."""
-        _C = _import_module()
         torch.manual_seed(0)
         m_splits = [64, 96]
         K = 128
@@ -230,23 +215,7 @@ class TestMxFP8GroupedTransposeQuantize:
         inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
         m_splits_gpu = torch.tensor(m_splits, dtype=torch.int64, device="cuda")
-        num_groups = 2
-
-        row_offsets = torch.empty(num_groups + 1, dtype=torch.int32, device="cuda")
-        row_offsets[0] = 0
-        row_offsets[1:] = torch.cumsum(m_splits_gpu.int(), dim=0)
-
-        m_k_groups = (m_splits_gpu + 31) // 32
-        sf_sizes   = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
-        sf_offsets = torch.empty(num_groups + 1, dtype=torch.int64, device="cuda")
-        sf_offsets[0] = 0
-        sf_offsets[1:] = torch.cumsum(sf_sizes, dim=0)
-
-        total_sf = int(sf_offsets[-1].item())
-        out_T  = torch.empty(K, total_M, dtype=torch.uint8, device="cuda")
-        out_sf = torch.zeros(total_sf, dtype=torch.uint8, device="cuda")
-
-        _C.mxfp8_grouped_transpose_quantize(out_T, out_sf, inp, row_offsets, sf_offsets)
+        out_T, _, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits_gpu)
         torch.cuda.synchronize()
 
         ref_T, ref_sf, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -254,21 +223,13 @@ class TestMxFP8GroupedTransposeQuantize:
 
     def test_transposed_layout(self):
         """Verify out_T[k, m] corresponds to inp[m, k] after scaling."""
-        _C = _import_module()
         torch.manual_seed(7)
         m_splits = [64]
         K = 128
         total_M = 64
         inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
-        m_splits_t = torch.tensor(m_splits, dtype=torch.int64, device="cuda")
-        row_offsets = torch.tensor([0, total_M], dtype=torch.int32, device="cuda")
-        sf_size = _sf_size_T_per_group(total_M, K)
-        sf_offsets = torch.tensor([0, sf_size], dtype=torch.int64, device="cuda")
-
-        out_T  = torch.empty(K, total_M, dtype=torch.uint8, device="cuda")
-        out_sf = torch.zeros(sf_size, dtype=torch.uint8, device="cuda")
-        _C.mxfp8_grouped_transpose_quantize(out_T, out_sf, inp, row_offsets, sf_offsets)
+        out_T, _, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
         torch.cuda.synchronize()
 
         ref_T, _, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -276,21 +237,14 @@ class TestMxFP8GroupedTransposeQuantize:
         assert torch.all(out_T.cpu() == ref_T), "Transposed layout mismatch"
 
     def test_zero_input(self):
-        """All-zero input → all-zero FP8 output, SF=0."""
-        _C = _import_module()
+        """All-zero input -> all-zero FP8 output, SF=0."""
         m_splits = [64]
         K = 128
         total_M = 64
         inp = torch.zeros(total_M, K, dtype=torch.bfloat16).cuda()
 
-        row_offsets = torch.tensor([0, total_M], dtype=torch.int32, device="cuda")
-        sf_size = _sf_size_T_per_group(total_M, K)
-        sf_offsets = torch.tensor([0, sf_size], dtype=torch.int64, device="cuda")
-
-        out_T  = torch.empty(K, total_M, dtype=torch.uint8, device="cuda")
-        out_sf = torch.zeros(sf_size, dtype=torch.uint8, device="cuda")
-        _C.mxfp8_grouped_transpose_quantize(out_T, out_sf, inp, row_offsets, sf_offsets)
+        out_T, out_sf, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
         torch.cuda.synchronize()
 
-        assert torch.all(out_T == 0), "Zero input should produce zero FP8"
-        assert torch.all(out_sf == 0), "Zero input should produce zero SF"
+        assert torch.all(out_T.cpu() == 0), "Zero input should produce zero FP8"
+        assert torch.all(out_sf.cpu() == 0), "Zero input should produce zero SF"

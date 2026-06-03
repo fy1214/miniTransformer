@@ -7,6 +7,7 @@ Each 32 elements share one E8M0 scale (MXFP8 SFVecSize=32).
 """
 
 import math
+import struct
 import pytest
 import torch
 from typing import List
@@ -14,7 +15,7 @@ from typing import List
 
 def _import_module():
     try:
-        import miniTransformer._C as _C
+        import fp4_gemm as _C
         return _C
     except ImportError:
         return None
@@ -40,19 +41,22 @@ def _cvt_sf_offset(m_idx: int, k_idx: int, num_k_tiles: int) -> int:
 
 
 def _float_to_e8m0(v: float) -> int:
+    """OCP MXFP8 / TransformerEngine recipe: normalize by FP8 E4M3 max norm
+    (448), then round exponent UP on nonzero mantissa.  Mirrors the CUDA
+    kernel float_to_e8m0 and TE ptx.cuh software fallback."""
     if v == 0.0:
         return 0
-    bits = int.from_bytes(struct.pack('>f', abs(v)), 'big')  # type: ignore[name-defined]
-    unbiased_exp = ((bits >> 23) & 0xFF) - 127
-    biased = unbiased_exp + 127
-    return max(0, min(254, biased))
+    val = abs(v) * (1.0 / 448.0)
+    bits = int.from_bytes(struct.pack('>f', val), 'big')
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    if (mantissa > 0 and exponent != 0xFE) and not (exponent == 0 and mantissa <= 0x400000):
+        exponent += 1
+    return exponent
 
 
 def _e8m0_to_scale(e8m0: int) -> float:
     return math.ldexp(1.0, e8m0 - 127)
-
-
-import struct
 
 
 def _reference_quantize(inp: torch.Tensor, m_splits: List[int]):
@@ -111,7 +115,7 @@ def skip_if_no_cuda():
 @pytest.fixture(autouse=True)
 def skip_if_no_module():
     if _import_module() is None:
-        pytest.skip("miniTransformer._C not available (not compiled)")
+        pytest.skip("fp4_gemm not available (not compiled)")
 
 
 class TestMxFP8GroupedQuantize:

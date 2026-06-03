@@ -44,11 +44,20 @@
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ uint8_t mxfp8t_float_to_e8m0(float amax) {
+    // OCP MXFP8 / TransformerEngine recipe: normalize amax by FP8 E4M3 max
+    // norm (448), then round exponent UP on nonzero mantissa.  Identical to
+    // the rowwise kernel; mirrors TE ptx.cuh float_to_e8m0 software path.
     if (amax == 0.0f) return 0u;
-    uint32_t bits = __float_as_uint(amax);
-    int biased = (int)((bits >> 23) & 0xFF);   // IEEE-754 biased exp = unbiased+127 = E8M0 value
-    biased = max(0, min(254, biased));
-    return static_cast<uint8_t>(biased);
+    constexpr float max_norm_rcp = 1.0f / 448.0f;   // E4M3 max_norm reciprocal
+    const float val = amax * max_norm_rcp;
+    const uint32_t bits     = __float_as_uint(val);
+    uint32_t       exponent = (bits >> 23) & 0xFF;  // IEEE-754 biased exp
+    const uint32_t mantissa = bits & 0x7FFFFFu;
+    if ((mantissa > 0u && exponent != 0xFEu) &&
+        !(exponent == 0u && mantissa <= 0x400000u)) {
+        ++exponent;
+    }
+    return static_cast<uint8_t>(exponent);
 }
 
 __device__ __forceinline__ float mxfp8t_e8m0_to_scale(uint8_t e8m0) {

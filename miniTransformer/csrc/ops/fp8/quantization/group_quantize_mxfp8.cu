@@ -44,17 +44,24 @@
 // E8M0: unsigned 8-bit, value = 2^(byte - 127).  No NaN/Inf (values 0..254).
 // For amax==0 we store 0 (= 2^(-127)) and the quant val is 0 anyway.
 __device__ __forceinline__ uint8_t float_to_e8m0(float amax) {
+    // OCP MXFP8 / TransformerEngine recipe: normalize amax by the FP8 E4M3
+    // max norm (448), then round the resulting exponent UP whenever the
+    // mantissa is nonzero.  This maps the block's max element to ~448 (full
+    // FP8 dynamic range) instead of [1,2).  Mirrors TE's software fallback in
+    // transformer_engine/common/util/ptx.cuh (float_to_e8m0).
     if (amax == 0.0f) return 0u;
-    // E8M0 exponent = floor(log2(amax)) + 127 (bias).
-    // Extract IEEE-754 biased exponent from float bit pattern:
-    //   float biased exp = bits[30:23], unbiased = biased_exp - 127
-    // floor(log2(amax)) = unbiased_exp  (for normal floats)
-    uint32_t bits = __float_as_uint(amax);
-    int unbiased_exp = (int)((bits >> 23) & 0xFF) - 127;
-    // E8M0 bias = 127
-    int biased = unbiased_exp + 127;
-    biased = max(0, min(254, biased));
-    return static_cast<uint8_t>(biased);
+    constexpr float max_norm_rcp = 1.0f / 448.0f;   // E4M3 max_norm reciprocal
+    const float val = amax * max_norm_rcp;
+    const uint32_t bits     = __float_as_uint(val);
+    uint32_t       exponent = (bits >> 23) & 0xFF;  // IEEE-754 biased exp
+    const uint32_t mantissa = bits & 0x7FFFFFu;
+    // Round exponent up on nonzero mantissa, guarding against satfinite
+    // (0xFE) overflow and the subnormal boundary (exp==0 && mant<=0x400000).
+    if ((mantissa > 0u && exponent != 0xFEu) &&
+        !(exponent == 0u && mantissa <= 0x400000u)) {
+        ++exponent;
+    }
+    return static_cast<uint8_t>(exponent);
 }
 
 __device__ __forceinline__ float e8m0_to_scale(uint8_t e8m0) {

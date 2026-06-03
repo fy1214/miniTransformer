@@ -109,9 +109,18 @@ void mxfp8_grouped_gemm(
 );
 
 
-// MXFP8 grouped quantization
+// MXFP8 grouped quantization (rowwise)
 void mxfp8_grouped_quantize_binding(
     at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
+
+// MXFP8 grouped transpose quantization (colwise: output is [K, total_M])
+void mxfp8_grouped_transpose_quantize_binding(
+    at::Tensor&       out_T,
     at::Tensor&       sf,
     const at::Tensor& inp,
     const at::Tensor& row_offsets,

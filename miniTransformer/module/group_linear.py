@@ -87,7 +87,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                     w,
                     qlinear_params.w_params,
                     m_splits=m_splits,
-                    return_transpose=(not disable_backward_quant)
+                    return_transpose=(is_grad_enabled and not disable_backward_quant)
                 )
             qw = qresult_w_list.data
             sw = qresult_w_list.scale
@@ -102,7 +102,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                     w,
                     qlinear_params.w_params,
                     m_splits=m_splits,
-                    return_transpose=(not disable_backward_quant)
+                    return_transpose=(is_grad_enabled and not disable_backward_quant)
                 )
             sw = weight_qresult_cache.scale = qresult_w_list.scale
             qw = weight_qresult_cache.data = qresult_w_list.data

@@ -6,27 +6,35 @@
 // expected by `gemm_mxfp8_grouped_cutlass.cu`.
 //
 // Layout recap (SFVecSize=32, Blk_MN=128, Blk_SF=4):
-//   SF[mIdx, kIdx]  →  offset = cvt_quant_to_fp4_get_sf_out_offset(mIdx, kIdx, numKTiles)
+//   SF[mIdx, kIdx]  ->  offset = cvt_quant_to_fp4_get_sf_out_offset(mIdx, kIdx, numKTiles)
 //   where  kIdx    = element_index / 32        (k-group index)
 //          numKTiles = ceil(K/32 / 4)           (number of 4-kgroup tiles)
 //
 // The same formula is already implemented in utils.cuh for FP4; it is
 // directly reusable here (same SfAtom structure, different SFVecSize).
 //
-// Grid / block:
-//   threads_per_row = K / 32   (each thread owns 32 consecutive BF16 → 1 E8M0 SF)
-//   warps_per_row   = ceil(threads_per_row / 32)
-//   rows_per_block  = max(1, 32 / warps_per_row)
-//   blockDim        = rows_per_block * warps_per_row * 32
-//   gridDim         = total_ctas (from group_cta_offsets, one CTA per rows_per_block slice)
+// Performance design (mirrors fp4_group_pertoken_kernel):
+//   - Each thread owns ONE bf16x8 vec = 8 contiguous elements -> consecutive
+//     lanes touch consecutive 16-byte chunks -> fully coalesced loads/stores.
+//   - Values are kept in registers and reused for the quantize pass (no
+//     second global read).
+//   - A 32-element MXFP8 block = 4 bf16x8 vecs = 4 adjacent lanes; the block
+//     abs-max is reduced with two __shfl_xor (mask 1, then mask 2).  No shared
+//     memory is needed (each block is independent -- pure block quantization).
+//   - Flat grid + grid-stride loop with GPU-side group lookup -> no host sync,
+//     no cudaMalloc per call.
 //
-// Shared memory:
-//   uint32_t amax_scratch[rows_per_block]  — for cross-warp amax reduction
+// Grid / block:
+//   nvecs_per_row  = K / 8
+//   warps_per_row  = ceil(nvecs_per_row / 32)
+//   rows_per_block = max(1, 1024 / (warps_per_row * 32))
+//   blockDim       = rows_per_block * warps_per_row * 32
+//   gridDim        = min(ceil(total_rows / rows_per_block), MAX_BLOCKS)
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
-#include <vector>
+#include <algorithm>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
@@ -35,12 +43,15 @@
 
 #include "../../../ops.h"
 #include "../../../util/quarter/utils.cuh"
+#include "../../../util/quarter/vec.cuh"
+
+using bf16x8 = GenericVector<nv_bfloat16, 8>;
 
 // ---------------------------------------------------------------------------
 // E8M0 scale computation
 // ---------------------------------------------------------------------------
 
-// Returns (E8M0 biased exponent, float scale value = 2^exp).
+// Returns the E8M0 biased exponent.
 // E8M0: unsigned 8-bit, value = 2^(byte - 127).  No NaN/Inf (values 0..254).
 // For amax==0 we store 0 (= 2^(-127)) and the quant val is 0 anyway.
 __device__ __forceinline__ uint8_t float_to_e8m0(float amax) {
@@ -73,121 +84,101 @@ __device__ __forceinline__ float e8m0_to_scale(uint8_t e8m0) {
 // Kernel
 // ---------------------------------------------------------------------------
 
+static constexpr int MAX_BLOCKS = 1024;
+
 __global__ void mxfp8_group_quantize_kernel(
     uint8_t*            __restrict__ y_ptr,           // [total_rows, K]  FP8 E4M3
     uint8_t*            __restrict__ sf_ptr,          // flat swizzled E8M0 SF buffer
     const nv_bfloat16*  __restrict__ x_ptr,           // [total_rows, K]  BF16 input
-    const int32_t*      __restrict__ group_cta_offsets, // [num_groups+1]  prefix-sum of CTAs per group
-    const int32_t*      __restrict__ row_offsets,       // [num_groups+1]  row index per group
-    const int64_t*      __restrict__ sf_offsets,        // [num_groups+1]  SF element offset per group
+    const int32_t*      __restrict__ row_offsets,     // [num_groups+1]  row index per group
+    const int64_t*      __restrict__ sf_offsets,      // [num_groups+1]  SF element offset per group
     int    K,                // number of columns
     int    K_groups,         // K / 32
     int    num_groups,
+    int    nvecs_per_row,    // K / 8  (one bf16x8 vec per thread-in-row)
     int    warps_per_row,
     int    rows_per_block,
-    int    num_k_tiles)      // ceil(K_groups / 4)  — used in SF offset formula
+    int    num_k_tiles,      // ceil(K_groups / 4)  -- used in SF offset formula
+    int    total_rows,
+    int    grid_stride)      // gridDim.x * rows_per_block
 {
-    // ---- Shared memory: one uint32 per row for amax atomic reduce ----
-    extern __shared__ uint32_t smem_amax[];   // [rows_per_block]
-
     const int flat_tid    = static_cast<int>(threadIdx.x);
     const int warp_id     = flat_tid >> 5;
     const int lane_id     = flat_tid & 31;
     const int local_row   = warp_id / warps_per_row;
     const int warp_in_row = warp_id % warps_per_row;
-    // thread-in-row index (0 .. warps_per_row*32 - 1)
-    const int tir         = warp_in_row * 32 + lane_id;  // = thread-in-row
+    // vec-in-row index (0 .. nvecs_per_row-1); each thread owns one bf16x8.
+    const int tid         = warp_in_row * 32 + lane_id;
 
-    // ---- Binary search: find group_id for this CTA ----
-    // group_cta_offsets[g] <= blockIdx.x < group_cta_offsets[g+1]
-    int group_id;
+    // Outer grid-stride loop over row slices.
+    for (int base_row = blockIdx.x * rows_per_block;
+         base_row < total_rows;
+         base_row += grid_stride)
     {
-        int lo = 0, hi = num_groups - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) >> 1;
-            if (group_cta_offsets[mid] <= (int)blockIdx.x) lo = mid;
-            else hi = mid - 1;
+        const int  row       = base_row + local_row;
+        const bool valid_row = row < total_rows;
+        const bool valid_vec = valid_row && (tid < nvecs_per_row);
+
+        // ---- GPU-side group lookup (linear scan; row_offsets is tiny/cached) ----
+        int group_id = 0;
+        if (valid_row) {
+            while (group_id < num_groups - 1 && row >= row_offsets[group_id + 1])
+                ++group_id;
         }
-        group_id = lo;
-    }
+        const int     local_row_in_group = valid_row ? row - row_offsets[group_id] : 0;
+        const int64_t sf_base            = valid_row ? sf_offsets[group_id] : 0;
 
-    const int local_cta       = (int)blockIdx.x - group_cta_offsets[group_id];
-    const int group_row0      = row_offsets[group_id];
-    const int m_g             = row_offsets[group_id + 1] - group_row0;
-    const int64_t sf_base     = sf_offsets[group_id];
-
-    const int base_row_in_g   = local_cta * rows_per_block;
-    const int abs_row_base    = group_row0 + base_row_in_g;
-
-    // ---- Initialize smem amax to 0 ----
-    if (flat_tid < rows_per_block)
-        smem_amax[flat_tid] = 0u;
-    __syncthreads();
-
-    // ---- Per-thread: owns 32 BF16 elements (1 MXFP8 block) ----
-    // thread tir in a row covers K elements [tir*32 .. (tir+1)*32)
-    // but actually each warp handles 32 contiguous k-groups (32*32=1024 elems).
-    // Each thread handles exactly one k-group: k_group = tir (if tir < K_groups).
-
-    const int row_in_g  = base_row_in_g + local_row;
-    const int global_row = abs_row_base + local_row;
-    const bool valid_row = (row_in_g < m_g);
-    const bool valid_kgroup = valid_row && (tir < K_groups);
-
-    // Load 32 BF16 elements → compute abs_max for this k-group (pass 1)
-    float local_amax = 0.0f;
-
-    if (valid_kgroup) {
-        const nv_bfloat16* row_ptr = x_ptr + (int64_t)global_row * K + tir * 32;
-        #pragma unroll 4
-        for (int i = 0; i < 32; i++) {
-            float av = fabsf(__bfloat162float(row_ptr[i]));
-            local_amax = fmaxf(local_amax, av);
+        // ---- Vectorized load of 8 BF16 + per-vec abs-max (single global read) ----
+        // One bf16x8 = 16-byte coalesced load; values stay in registers and are
+        // reused by the quantize pass below (no second global read).
+        bf16x8 x{};
+        float  local_amax = 0.0f;
+        if (valid_vec) {
+            x = bf16x8::load(x_ptr + 8 * ((int64_t)row * nvecs_per_row + tid));
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(x[i])));
         }
-    }
 
-    // ---- Warp-level reduce of local_amax across threads of same row ----
-    // All warps belonging to the same row reduce together via smem atomicMax.
-    // Step 1: warp reduce within each warp (only rows contribute one warp,
-    //         but multiple warps per row need cross-warp reduce).
-    // warp reduce:
-    #pragma unroll
-    for (int mask = 16; mask >= 1; mask >>= 1)
-        local_amax = fmaxf(local_amax, __shfl_xor_sync(0xffffffff, local_amax, mask));
-    // lane 0 of each warp has the warp's max → atomicMax to smem
-    if (lane_id == 0 && valid_row) {
-        atomicMax(&smem_amax[local_row], __float_as_uint(local_amax));
-    }
-    __syncthreads();
+        // ---- 4-lane reduce: one E8M0 scale per 32 elems = 4 adjacent bf16x8 ----
+        // mask 1 merges lane pairs; mask 2 merges groups of 4. K%32==0 keeps the
+        // valid-lane count a multiple of 4, so each group-of-4 is wholly valid or
+        // wholly invalid and never straddles the boundary.
+        float blk_amax = local_amax;
+        blk_amax = fmaxf(blk_amax, __shfl_xor_sync(0xffffffff, blk_amax, 1));
+        blk_amax = fmaxf(blk_amax, __shfl_xor_sync(0xffffffff, blk_amax, 2));
 
-    if (!valid_kgroup) return;
+        if (!valid_vec) continue;
 
-    // ---- Broadcast row amax from smem, compute E8M0 scale ----
-    const float row_amax     = __uint_as_float(smem_amax[local_row]);
-    const uint8_t e8m0_val   = float_to_e8m0(row_amax);
-    const float   scale_fp   = (e8m0_val == 0u) ? 1.0f : e8m0_to_scale(e8m0_val);
-    const float   inv_scale  = (scale_fp == 0.0f) ? 0.0f : 1.0f / scale_fp;
+        // ---- E8M0 scale ----
+        const uint8_t e8m0_val  = float_to_e8m0(blk_amax);
+        const float   scale_fp  = (e8m0_val == 0u) ? 1.0f : e8m0_to_scale(e8m0_val);
+        const float   inv_scale = (scale_fp == 0.0f) ? 0.0f : 1.0f / scale_fp;
 
-    // ---- Quantize 32 BF16 → 32 FP8 E4M3 (pass 2: re-read from global memory) ----
-    const int64_t out_base  = (int64_t)global_row * K + tir * 32;
-    constexpr float clamp_v = 448.0f;
-    {
-        const nv_bfloat16* row_ptr = x_ptr + (int64_t)global_row * K + tir * 32;
-        #pragma unroll 4
-        for (int i = 0; i < 32; i++) {
-            float scaled = __bfloat162float(row_ptr[i]) * inv_scale;
+        // ---- Quantize 8 BF16 -> 8 FP8 E4M3 in registers (no re-read) ----
+        constexpr float clamp_v = 448.0f;
+        GenericVector<uint8_t, 8> fp8_out;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float scaled = __bfloat162float(x[i]) * inv_scale;
             scaled = fminf(fmaxf(scaled, -clamp_v), clamp_v);
-            y_ptr[out_base + i] = static_cast<uint8_t>(static_cast<__nv_fp8_e4m3>(scaled));
+            // Extract the E4M3 storage byte directly: static_cast<uint8_t>(e4m3)
+            // would value-convert (via operator float), not reinterpret the bits.
+            __nv_fp8_e4m3 q = static_cast<__nv_fp8_e4m3>(scaled);
+            fp8_out[i] = q.__x;
         }
-    }
 
-    // ---- Write E8M0 scale factor to swizzled SF layout ----
-    // kIdx = tir (= k_group index within the row)
-    // mIdx = row_in_g (local row within group, 0-based)
-    // Swizzled offset formula (same as FP4 SfKMajorAtom):
-    //   numKTiles = ceil(K_groups / 4)
-    const int64_t sf_offset = cvt_quant_to_fp4_get_sf_out_offset(row_in_g, tir, num_k_tiles);
-    sf_ptr[sf_base + sf_offset] = e8m0_val;
+        // ---- Coalesced vectorized store (8 bytes) via aligned vector store ----
+        fp8_out.store(y_ptr + (int64_t)row * K + 8 * tid);
+
+        // ---- Write E8M0 SF to swizzled layout (one thread per 32-elem block) ----
+        // kIdx = col = k_group index; mIdx = local_row_in_group.
+        if ((tid & 3) == 0) {
+            const int     col    = tid >> 2;
+            const int64_t sf_off = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, num_k_tiles);
+            sf_ptr[sf_base + sf_off] = e8m0_val;
+        }
+    } // end grid-stride loop
 }
 
 // ---------------------------------------------------------------------------
@@ -200,47 +191,31 @@ static void launch_mxfp8_group_quantize(
     const nv_bfloat16* x_ptr,
     int                num_groups,
     int                K,
+    int                total_rows,
     const int32_t*     row_offsets_gpu,     // [num_groups+1] on GPU
     const int64_t*     sf_offsets_gpu,      // [num_groups+1] on GPU
-    const int32_t*     row_offsets_host,    // [num_groups+1] on host
     cudaStream_t       stream)
 {
-    const int K_groups       = K / 32;
-    const int threads_per_row = K_groups;  // one thread per k-group
-    const int warps_per_row   = (threads_per_row + 31) / 32;
-    // Target ~32 warps per block for good occupancy; allow up to 1024 threads.
-    const int max_warps_per_block = 32;
-    const int rows_per_block  = max(1, max_warps_per_block / warps_per_row);
-    const int block_dim       = rows_per_block * warps_per_row * 32;
+    if (total_rows == 0) return;
 
-    // Build group_cta_offsets on host
-    std::vector<int32_t> h_cta_offsets(num_groups + 1);
-    h_cta_offsets[0] = 0;
-    for (int g = 0; g < num_groups; g++) {
-        const int m_g = row_offsets_host[g + 1] - row_offsets_host[g];
-        h_cta_offsets[g + 1] = h_cta_offsets[g] +
-            (m_g + rows_per_block - 1) / rows_per_block;
-    }
-    const int total_ctas = h_cta_offsets[num_groups];
-    if (total_ctas == 0) return;
-
-    // Copy group_cta_offsets to device
-    int32_t* d_cta_offsets = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_cta_offsets,
-        (num_groups + 1) * sizeof(int32_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_cta_offsets, h_cta_offsets.data(),
-        (num_groups + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-
+    const int K_groups      = K / 32;
+    const int nvecs_per_row = K / 8;
+    const int warps_per_row = (nvecs_per_row + 31) / 32;
+    // Target ~1024 threads per block for good occupancy.
+    const int rows_per_block = max(1, 1024 / (warps_per_row * 32));
+    const int block_dim      = rows_per_block * warps_per_row * 32;
     const int num_k_tiles    = (K_groups + 3) / 4;
-    const size_t smem_bytes  = (size_t)rows_per_block * sizeof(uint32_t);
 
-    mxfp8_group_quantize_kernel<<<total_ctas, block_dim, smem_bytes, stream>>>(
+    const int natural_grid = (total_rows + rows_per_block - 1) / rows_per_block;
+    const int grid_dim     = min(natural_grid, MAX_BLOCKS);
+    const int grid_stride  = grid_dim * rows_per_block;
+
+    mxfp8_group_quantize_kernel<<<grid_dim, block_dim, 0, stream>>>(
         y_ptr, sf_ptr, x_ptr,
-        d_cta_offsets, row_offsets_gpu, sf_offsets_gpu,
-        K, K_groups, num_groups, warps_per_row, rows_per_block,
-        num_k_tiles);
+        row_offsets_gpu, sf_offsets_gpu,
+        K, K_groups, num_groups, nvecs_per_row, warps_per_row, rows_per_block,
+        num_k_tiles, total_rows, grid_stride);
 
-    CUDA_CHECK(cudaFreeAsync(d_cta_offsets, stream));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -270,18 +245,181 @@ void mxfp8_grouped_quantize_binding(
     TORCH_CHECK(out.numel()  == (int64_t)total_rows * K, "out size mismatch");
     TORCH_CHECK(out.dtype()  == at::kByte, "out must be uint8");
 
-    // D2H copy of row_offsets for host-side CTA offset computation (small, num_groups+1 ints).
-    at::Tensor row_offsets_cpu = row_offsets.cpu();
-    const int32_t* h_row_off = reinterpret_cast<const int32_t*>(row_offsets_cpu.data_ptr());
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(inp.device().index());
     launch_mxfp8_group_quantize(
         reinterpret_cast<uint8_t*>(out.data_ptr()),
         reinterpret_cast<uint8_t*>(sf.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
-        num_groups, K,
+        num_groups, K, total_rows,
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(sf_offsets.data_ptr()),
-        h_row_off,
+        stream);
+}
+
+// ===========================================================================
+// Hardware-cvt variant (SM100): full hardware path for E8M0 + FP8 pack.
+//
+//   E8M0 scale : cvt.rp.satfinite.ue8m0x2.f32   (__nv_cvt_float2_to_e8m0x2)
+//   FP8  pack  : cvt.rn.satfinite.e4m3x2.f32    (__nv_cvt_float2_to_fp8x2)
+//
+// Identical scheduling / memory layout to mxfp8_group_quantize_kernel above;
+// only the per-element math is swapped to single-instruction packed cvts.
+// May NOT be bit-exact vs the software path at E8M0 rounding boundaries
+// (hardware cvt.rp vs hand-tuned float_to_e8m0). Intended as a fast
+// inference-grade operator when that small SF-rounding delta is acceptable.
+// ===========================================================================
+
+__global__ void mxfp8_group_quantize_hw_kernel(
+    uint8_t*            __restrict__ y_ptr,
+    uint8_t*            __restrict__ sf_ptr,
+    const nv_bfloat16*  __restrict__ x_ptr,
+    const int32_t*      __restrict__ row_offsets,
+    const int64_t*      __restrict__ sf_offsets,
+    int    K,
+    int    K_groups,
+    int    num_groups,
+    int    nvecs_per_row,
+    int    warps_per_row,
+    int    rows_per_block,
+    int    num_k_tiles,
+    int    total_rows,
+    int    grid_stride)
+{
+    const int flat_tid    = static_cast<int>(threadIdx.x);
+    const int warp_id     = flat_tid >> 5;
+    const int lane_id     = flat_tid & 31;
+    const int local_row   = warp_id / warps_per_row;
+    const int warp_in_row = warp_id % warps_per_row;
+    const int tid         = warp_in_row * 32 + lane_id;
+
+    for (int base_row = blockIdx.x * rows_per_block;
+         base_row < total_rows;
+         base_row += grid_stride)
+    {
+        const int  row       = base_row + local_row;
+        const bool valid_row = row < total_rows;
+        const bool valid_vec = valid_row && (tid < nvecs_per_row);
+
+        int group_id = 0;
+        if (valid_row) {
+            while (group_id < num_groups - 1 && row >= row_offsets[group_id + 1])
+                ++group_id;
+        }
+        const int     local_row_in_group = valid_row ? row - row_offsets[group_id] : 0;
+        const int64_t sf_base            = valid_row ? sf_offsets[group_id] : 0;
+
+        bf16x8 x{};
+        float  local_amax = 0.0f;
+        if (valid_vec) {
+            x = bf16x8::load(x_ptr + 8 * ((int64_t)row * nvecs_per_row + tid));
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(x[i])));
+        }
+
+        float blk_amax = local_amax;
+        blk_amax = fmaxf(blk_amax, __shfl_xor_sync(0xffffffff, blk_amax, 1));
+        blk_amax = fmaxf(blk_amax, __shfl_xor_sync(0xffffffff, blk_amax, 2));
+
+        if (!valid_vec) continue;
+
+        // ---- E8M0 scale via hardware cvt.rp.satfinite.ue8m0x2 ----
+        // Feed amax/448 so the chosen 2^e maps the block max to E4M3 max_norm.
+        // cvt.rp (round toward +inf) == smallest 2^e >= amax/448, matching the
+        // OCP MX scale recipe. Low byte holds the E8M0 for x.x.
+        constexpr float max_norm_rcp = 1.0f / 448.0f;
+        const float norm_amax = blk_amax * max_norm_rcp;
+        const __nv_fp8x2_storage_t e8_pair =
+            __nv_cvt_float2_to_e8m0x2(make_float2(norm_amax, norm_amax),
+                                      __NV_SATFINITE, cudaRoundPosInf);
+        const uint8_t e8m0_val  = static_cast<uint8_t>(e8_pair & 0xFFu);
+        const float   scale_fp  = (e8m0_val == 0u) ? 1.0f : e8m0_to_scale(e8m0_val);
+        const float   inv_scale = (scale_fp == 0.0f) ? 0.0f : 1.0f / scale_fp;
+
+        // ---- Quantize 8 BF16 -> 8 FP8 E4M3 via 4x packed cvt.rn.satfinite.e4m3x2 ----
+        // satfinite handles the 448 clamp in hardware (no manual fminf/fmaxf).
+        GenericVector<uint8_t, 8> fp8_out;
+        #pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+            const float2 s2 = make_float2(__bfloat162float(x[i])     * inv_scale,
+                                          __bfloat162float(x[i + 1]) * inv_scale);
+            const __nv_fp8x2_storage_t p =
+                __nv_cvt_float2_to_fp8x2(s2, __NV_SATFINITE, __NV_E4M3);
+            fp8_out[i]     = static_cast<uint8_t>(p & 0xFFu);  // low byte = s2.x
+            fp8_out[i + 1] = static_cast<uint8_t>(p >> 8);     // high byte = s2.y
+        }
+        fp8_out.store(y_ptr + (int64_t)row * K + 8 * tid);
+
+        if ((tid & 3) == 0) {
+            const int     col    = tid >> 2;
+            const int64_t sf_off = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, num_k_tiles);
+            sf_ptr[sf_base + sf_off] = e8m0_val;
+        }
+    }
+}
+
+static void launch_mxfp8_group_quantize_hw(
+    uint8_t*           y_ptr,
+    uint8_t*           sf_ptr,
+    const nv_bfloat16* x_ptr,
+    int                num_groups,
+    int                K,
+    int                total_rows,
+    const int32_t*     row_offsets_gpu,
+    const int64_t*     sf_offsets_gpu,
+    cudaStream_t       stream)
+{
+    if (total_rows == 0) return;
+
+    const int K_groups      = K / 32;
+    const int nvecs_per_row = K / 8;
+    const int warps_per_row = (nvecs_per_row + 31) / 32;
+    const int rows_per_block = max(1, 1024 / (warps_per_row * 32));
+    const int block_dim      = rows_per_block * warps_per_row * 32;
+    const int num_k_tiles    = (K_groups + 3) / 4;
+
+    const int natural_grid = (total_rows + rows_per_block - 1) / rows_per_block;
+    const int grid_dim     = min(natural_grid, MAX_BLOCKS);
+    const int grid_stride  = grid_dim * rows_per_block;
+
+    mxfp8_group_quantize_hw_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        y_ptr, sf_ptr, x_ptr,
+        row_offsets_gpu, sf_offsets_gpu,
+        K, K_groups, num_groups, nvecs_per_row, warps_per_row, rows_per_block,
+        num_k_tiles, total_rows, grid_stride);
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void mxfp8_grouped_quantize_hw_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets)
+{
+    TORCH_CHECK(inp.dtype()  == at::kBFloat16, "inp must be bfloat16");
+    TORCH_CHECK(inp.is_cuda(),                 "inp must be CUDA");
+    TORCH_CHECK(inp.is_contiguous(),           "inp must be contiguous");
+    TORCH_CHECK(inp.dim() == 2,                "inp must be 2D [total_rows, K]");
+    TORCH_CHECK(inp.size(1) % 32 == 0,         "K must be divisible by 32");
+    TORCH_CHECK(row_offsets.dtype()  == at::kInt,  "row_offsets must be int32");
+    TORCH_CHECK(sf_offsets.dtype()   == at::kLong, "sf_offsets must be int64");
+
+    const int num_groups = static_cast<int>(row_offsets.numel()) - 1;
+    const int total_rows = static_cast<int>(inp.size(0));
+    const int K          = static_cast<int>(inp.size(1));
+
+    TORCH_CHECK(out.numel()  == (int64_t)total_rows * K, "out size mismatch");
+    TORCH_CHECK(out.dtype()  == at::kByte, "out must be uint8");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(inp.device().index());
+    launch_mxfp8_group_quantize_hw(
+        reinterpret_cast<uint8_t*>(out.data_ptr()),
+        reinterpret_cast<uint8_t*>(sf.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        num_groups, K, total_rows,
+        reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(sf_offsets.data_ptr()),
         stream);
 }

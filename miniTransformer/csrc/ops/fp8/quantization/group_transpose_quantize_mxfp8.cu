@@ -173,7 +173,8 @@ mxfp8_group_transpose_quantize_kernel(
             if ((m_offset + m) < m_g) {
                 float s = vals[m] * inv_scale;
                 s = fminf(fmaxf(s, -clamp_v), clamp_v);
-                y_T_ptr[out_base + m] = static_cast<uint8_t>(static_cast<__nv_fp8_e4m3>(s));
+                __nv_fp8_e4m3 q = static_cast<__nv_fp8_e4m3>(s);
+                y_T_ptr[out_base + m] = q.__x;
             }
         }
 

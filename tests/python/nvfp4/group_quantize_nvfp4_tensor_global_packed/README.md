@@ -61,30 +61,29 @@
      0.01 阈值相对 floor 有足够余量，不会误报正常的 rcp_approx_ftz 差异。
    ─────────────────────────────────────────────────────────────────
 
-2. global_scale 粒度对比（per-expert vs 全 tensor）
+2. global_scale 粒度对比（per-expert vs 全 tensor，基于 fc1_step0000_inp.pt 实测）
    - per-expert: min=0.000907  max=0.001273  mean=0.001156
    - 全 tensor:  0.001273（等于 per-expert 的最大值，由最大 amax expert 决定）
+   注：以上数值依赖输入数据分布，仅供参考。
 
-3. 量化精度（RTN vs Round-4-or-6）
+3. 量化精度（RTN vs Round-4-or-6，基于 fc1_step0000_inp.pt 实测）
    | 方法             | Eff-bits | Mean MSE | Mean cosine |
    |------------------|----------|----------|-------------|
    | group_weight RTN |  3.4597  | 1.63e-4  |  0.989676   |
    | group_weight 4/6 |  3.5131  | 1.51e-4  |  0.989964   |
-   per-row：4/6 在 91.7% 行更好，提升 +0.053 eff-bit。
+   注：以上数值依赖输入数据分布，仅供参考。
 
-4. CUDA vs Python golden（per-expert global amax）
+4. CUDA vs Python golden（per-expert global amax，基于 fc1_step0000_inp.pt 实测）
    | 方法                  | Eff-bits | Mean MSE | Mean cosine |
    |-----------------------|----------|----------|-------------|
    | group_weight RTN      |  3.4597  | 1.63e-4  |  0.989676   |
    | ref global (per-exp)  |  3.4599  | 1.63e-4  |  0.989677   |
-   per-row：72.3% 行完全相同，差值在噪声量级（eff-bits 差 0.0002）。
-   结论：CUDA 实现精度与 Python golden 等价。
+   结论：CUDA 实现精度与 Python golden 等价（eff-bits 差 0.0002，噪声量级）。
 
-5. per-expert amax vs 全 tensor amax（精度策略对比）
+5. per-expert amax vs 全 tensor amax（精度策略对比，基于 fc1_step0000_inp.pt 实测）
    | 方法                  | Eff-bits | Mean MSE | Mean cosine |
    |-----------------------|----------|----------|-------------|
    | group_weight RTN      |  3.4597  | 1.63e-4  |  0.989676   |
    | weight_swizzled RTN   |  3.4570  | 1.64e-4  |  0.989665   |
-   per-row：44.0% per-expert 更好，49.2% 更差，6.8% 相同。
-   结论：per-expert amax 整体略优（+0.003 eff-bit），但在该输入（experts 间
-   amax 差异较大，max/min≈1.4）优势有限；精度差异在噪声量级。
+   注：以上数值依赖输入数据分布，仅供参考。该输入 experts 间 amax 差异较大（max/min≈1.4），
+   per-expert amax 整体略优（+0.003 eff-bit）但优势有限；行间 amax 差异更大的输入上优势可能更明显。

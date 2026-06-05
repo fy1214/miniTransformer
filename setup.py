@@ -83,8 +83,8 @@ def build_extensions() -> list[setuptools.Extension]:
     csrc_dir = ROOT_DIR / "miniTransformer" / "csrc"
     cutlass_dir = ROOT_DIR / "third-party" / "cutlass"
     sources = (
-        glob.glob(str(csrc_dir / "**/*.cpp"), recursive=True)
-        + glob.glob(str(csrc_dir / "**/*.cu"), recursive=True)
+        [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cpp"), recursive=True)]
+        + [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cu"), recursive=True)]
     )
     include_dirs = [
         str(csrc_dir),
@@ -111,23 +111,8 @@ def get_cmdclass() -> dict:
         return {}
 
 
-def get_requirements() -> list[str]:
-    req_file = ROOT_DIR / "requirement.txt"
-    reqs = ["torch"]
-    if req_file.exists():
-        reqs += [
-            line.strip()
-            for line in req_file.read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-    return reqs
-
-
 setup(
-    name="miniTransformer",
-    version="1.0.0",
     packages=setuptools.find_packages(exclude=["tests*", "doc*"]),
-    install_requires=get_requirements(),
     ext_modules=build_extensions(),
     cmdclass=get_cmdclass(),
 )

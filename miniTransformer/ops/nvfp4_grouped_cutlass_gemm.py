@@ -227,16 +227,19 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
     _NVFP4_FACTOR division is applied here.
     The kernel applies pts_eff row-wise to the raw GEMM output before writing D.
     """
-    ng      = len(inputs.m_splits)
+    # Derive ng from a_rows (already on GPU) — avoids any Python list → GPU tensor copy.
+    ng      = inputs.a_rows.shape[0] - 1
     device  = inputs.act_data.device
     total_m = inputs.act_data.shape[0]
     n       = inputs.wgt_data.shape[0] // ng
 
     # Expand per-expert weight scale to per-row, then fold in activation scale.
     # act_ts = amax_row / (448*6), wgt_ts = amax_expert / (448*6) — both already normalized.
+    # group_sizes is derived on-device from a_rows; no CPU→GPU copy.
+    group_sizes = inputs.a_rows[1:] - inputs.a_rows[:-1]
     ts_b    = torch.repeat_interleave(
         inputs.wgt_ts,
-        torch.tensor(inputs.m_splits, device=device),
+        group_sizes,
         output_size=total_m,
     )
     pts_eff = (inputs.act_ts * ts_b).contiguous()

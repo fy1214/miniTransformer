@@ -37,30 +37,29 @@
    - tensor_scale ratio  : min=max=1.000000（与 Python golden amax/(448×6) 一致）
    结论：kernel 量化结果与 Python 参考实现逐 bit 对齐。
 
-2. 量化精度（RTN，反量化后与原始输入对比）
+2. 量化精度（RTN，反量化后与原始输入对比，基于 fc1_step0000_inp.pt 实测）
    - Effective bitwidth : 3.47（阈值 3.3，通过）
    - Mean MSE           : 1.62e-4
    - Mean cosine sim    : 0.9897
    - Mean row rel-L2    : 9.0%
-   注：99% 行的 rel-L2 > 5% 是 FP4 E2M1 格式固有特性（行内小值相对于行最大值粒度粗），
-       effective bitwidth 是正确的整体精度指标。
+   注：以上数值依赖输入数据分布，仅供参考。rel-L2 偏高是 FP4 E2M1 格式固有特性
+       （行内小值相对于行最大值粒度粗），effective bitwidth 是正确的整体精度指标。
 
-3. global amax vs per-token amax 对比（Python ref，同一输入）
+3. global amax vs per-token amax 对比（Python ref，基于 fc1_step0000_inp.pt 实测）
    | 方法            | Eff-bits | Mean cosine | Mean MSE  |
    |-----------------|----------|-------------|-----------|
    | Global amax     |  3.4570  |  0.989665   | 1.64e-4   |
    | Per-token amax  |  3.4658  |  0.989705   | 1.62e-4   |
    | 差值             | +0.009   | +4.1e-5     | -1.9e-6   |
 
-   per-row 胜负：62.8% per-token 更好，36.0% per-token 更差，1.2% 相同
-   更差行的 cos 平均降低 9.1e-5（噪声量级）
+   注：以上数值依赖输入数据分布，仅供参考。该输入行间动态范围均匀（amax std/mean≈21%），
+       per-token 优势有限；行间动态范围差异大的输入上 per-token 可能有更明显提升。
+       少数行 per-token 更差，来自 FP8 scale 量化舍入方向差异，非策略缺陷。
 
-   结论：两种策略精度等价。原因是该输入行间动态范围均匀（amax std/mean≈21%），
-         per-token 没有发挥空间；36% 行更差源于 FP8 scale 量化舍入方向差异，非策略缺陷。
-
-4. RTN vs Round-4-or-6
+4. RTN vs Round-4-or-6（基于 fc1_step0000_inp.pt 实测）
    - RTN eff-bits: 3.4658
    - 4/6 eff-bits: 3.5198，提升 +0.054 bit
+   注：以上数值依赖输入数据分布，仅供参考。
 
 
 公共工具：real_input_eval_utils.py

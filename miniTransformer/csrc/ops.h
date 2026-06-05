@@ -86,6 +86,77 @@ void grouped_cutlass_gemm_v2(
     const at::Tensor& per_token_scale
 );
 
+std::vector<int64_t> mxfp8_grouped_gemm_buffer_sizes(int max_groups);
+
+void mxfp8_grouped_gemm(
+    at::Tensor&        D,
+    const at::Tensor&  A,
+    const at::Tensor&  B,
+    const at::Tensor&  A_sf,
+    const at::Tensor&  B_sf,
+    const at::Tensor&  a_row_offsets,
+    const at::Tensor&  b_row_offsets,
+    const at::Tensor&  a_sf_offsets,
+    const at::Tensor&  b_sf_offsets,
+    int                num_groups,
+    at::Tensor&        buf_ptrs,
+    at::Tensor&        buf_strides,
+    at::Tensor&        buf_layouts,
+    at::Tensor&        buf_problem_sizes_dev,
+    const at::Tensor&  problem_sizes_host,
+    at::Tensor&        workspace,
+    bool               use_2sm
+);
+
+
+// MXFP8 grouped quantization (rowwise)
+void mxfp8_grouped_quantize_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
+
+// MXFP8 grouped quantization (rowwise) — full hardware-cvt path (SM100):
+// E8M0 via cvt.rp.ue8m0x2, FP8 via cvt.rn.satfinite.e4m3x2. Fast inference path.
+void mxfp8_grouped_quantize_hw_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
+
+// MXFP8 grouped transpose quantization (colwise: output is [K, total_M])
+void mxfp8_grouped_transpose_quantize_binding(
+    at::Tensor&       out_T,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
+
+// MXFP8 grouped quantization (rowwise) — per-CTA-chunk scheduling.
+// Each CTA owns a 128-row chunk; binary-searches the group table once per
+// chunk (broadcast via smem). Requires every group's M to be a multiple of
+// 128 (Megatron's Fp8Padding satisfies this).
+void mxfp8_grouped_quantize_chunked_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
+
+// MXFP8 grouped quantization (rowwise), chunked + hardware-cvt path (SM100).
+void mxfp8_grouped_quantize_chunked_hw_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets
+);
 
 // quarter quantization
 void four_six_fp4_binding(
@@ -192,6 +263,28 @@ void four_six_fp4_group_pertoken_binding(
     at::Tensor& global_scale,
     const at::Tensor& inp,
     const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override
+);
+
+void rtn_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override
+);
+
+void four_six_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override
 );

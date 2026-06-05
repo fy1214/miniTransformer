@@ -1,6 +1,0 @@
-nvtx
-scipy
-nvshmem4py-cu12
-nvidia-nvshmem-cu12
-cuda-core==0.7.0
-nvidia-cutlass-dsl==4.4.2

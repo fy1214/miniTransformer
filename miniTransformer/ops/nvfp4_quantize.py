@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 import fp4_gemm
@@ -287,22 +287,30 @@ def dequantize_nvfp4_pertoken_swizzled(result: quantization.QuantizeResult) -> t
 class GroupQuantizeSwizzledResult:
     """Output of group_quantize_nvfp4_pertoken_swizzled.
 
-    data          – [total_m, k//2] uint8, packed FP4x2, row-major.
-    global_scale  – [total_m] float32, per-row global scale.
-    scale_flat    – flat FP8 buffer; group g lives at
-                    scale_flat[scale_offsets[g]:scale_offsets[g+1]].
-    scale_views   – list[Tensor | None], one per group, shaped (32,4,nMT,4,nKT,1)
-                    matching the tensor returned by _make_cute_sf, ready for the
-                    Sm100 GEMM kernel.  None for empty groups (m_i == 0).
-    scale_offsets – list[int], len = num_groups+1, cumulative FP8 element counts.
-    row_offsets   – list[int], len = num_groups+1, cumulative row counts.
+    data              – [total_m, k//2] uint8, packed FP4x2, row-major.
+                        When ``fuse_pad=True`` was used, ``total_m`` is the
+                        *padded* row count (each group padded up to 128).
+    global_scale      – [total_m] float32, per-row global scale.
+    scale_flat        – flat FP8 buffer; group g lives at
+                        scale_flat[scale_offsets_gpu[g]:scale_offsets_gpu[g+1]].
+    row_offsets_gpu   – int32 CUDA tensor, len = num_groups+1, cumulative row
+                        counts that index into ``data`` / ``global_scale``.
+                        When ``fuse_pad=True`` these are the *padded* offsets
+                        (what the downstream grouped GEMM expects).
+    scale_offsets_gpu – int64 CUDA tensor, len = num_groups+1, cumulative FP8
+                        element counts.
+    unpadded_row_offsets_gpu – int32 CUDA tensor, only populated when
+                        ``fuse_pad=True``; cumulative *unpadded* token counts
+                        (i.e. the original ``m_splits`` passed in). Use this
+                        to slice the real-row regions out of the padded
+                        ``data`` / ``global_scale`` buffers.
     """
-    data:          torch.Tensor
-    global_scale:  torch.Tensor
-    scale_flat:    torch.Tensor
-    scale_views:   List[torch.Tensor]
-    scale_offsets: List[int]
-    row_offsets:   List[int]
+    data:              torch.Tensor
+    global_scale:      torch.Tensor
+    scale_flat:        torch.Tensor
+    row_offsets_gpu:   torch.Tensor
+    scale_offsets_gpu: torch.Tensor
+    unpadded_row_offsets_gpu: Optional[torch.Tensor] = None
 
 
 _SCALE_VIEW_PERM = (3, 4, 1, 5, 2, 0)   # matches mma_permute_order in nvfp4_qgemm.py
@@ -392,29 +400,39 @@ def group_quantize_nvfp4_pertoken_swizzled(
     *,
     four_six: bool = False,
     scale_override: float = 1.0,
-    skip_scale_views: bool = False,
+    fuse_pad: bool = False,
 ) -> GroupQuantizeSwizzledResult:
     """Grouped per-token NVFP4 quantization with per-group tcgen05 swizzled scales.
-
-    Replaces the D2H → CPU CuTeDSL layout-conversion → H2D path in
-    grouped_gemm_nvfp4_impl._make_cute_sf with a single GPU kernel launch.
 
     Args:
         x:              2-D BF16 tensor [total_m, k], contiguous, on CUDA.
                         k must be divisible by 128 and <= 4096.
-        m_splits:       Row counts per group; sum must equal x.shape[0].
+                        When ``fuse_pad=False`` (default): ``total_m`` is the
+                        actual row count and ``sum(m_splits) == total_m``.
+                        When ``fuse_pad=True``: ``x`` is the *unpadded* tensor
+                        (post-permute, pre-Fp8Padding) and
+                        ``sum(m_splits) == total_m`` still holds — but the
+                        output buffers are sized to the *padded* total
+                        ``sum(ceil(m_i/128)*128)``, with the kernel emitting
+                        bit-zero FP4/SF for the pad rows so the downstream
+                        grouped GEMM produces ``0·W = 0`` on those rows.
+        m_splits:       Per-group token counts. With ``fuse_pad=False`` these
+                        match rows in ``x`` (typical when caller already ran
+                        Fp8Padding). With ``fuse_pad=True`` these are the
+                        *unpadded* per-expert token counts and the wrapper
+                        derives padded offsets internally.
         four_six:       Round-4-or-6 if True; RTN otherwise (default).
         scale_override: Scalar multiplier for the per-row global scale.
+        fuse_pad:       If True, fuse Megatron's ``Fp8Padding`` D2D copy into
+                        the quantize kernel (per-CTA-chunk scheduling + binary
+                        search owning-group lookup). 3-6× faster end-to-end
+                        on Qwen3-30B-A3B shapes. Default False preserves the
+                        legacy per-row kernel.
 
     Returns:
-        GroupQuantizeSwizzledResult.  scale_views[g] is shaped (32,4,nMT,4,nKT,1)
-        and has the same memory layout as what _make_cute_sf returns, so it can
-        be passed directly to Sm100GroupedBlockScaledGemmKernel without changes.
-
-    Scale buffer sizing per group:
-        Each group allocates ceil(m_i/128)*128 * k//16 elements (zero-padded).
-        Padding to the next 128-row tile boundary is mandatory: the tcgen05
-        swizzle formula addresses the full tile even when m_i < 128.
+        GroupQuantizeSwizzledResult. When ``fuse_pad=True`` the result also
+        carries ``unpadded_row_offsets_gpu`` for slicing real rows back out
+        of the padded buffers.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16, "x must be a CUDA bfloat16 tensor"
     assert x.dim() == 2 and x.is_contiguous(), "x must be a contiguous 2-D tensor"
@@ -424,55 +442,77 @@ def group_quantize_nvfp4_pertoken_swizzled(
     device = x.device
 
     if total_m == 0:
-        nKT = k // 64
+        empty_off = torch.zeros(len(m_splits) + 1, dtype=torch.int32, device=device)
         return GroupQuantizeSwizzledResult(
             data=torch.empty((0, k // 2), dtype=nvfp4_output_t, device=device),
             global_scale=torch.empty(0, dtype=torch.float32, device=device),
             scale_flat=torch.empty(0, dtype=nvfp4_scale_t, device=device),
-            scale_views=[None] * len(m_splits),
-            scale_offsets=[0] * (len(m_splits) + 1),
-            row_offsets=[0] * (len(m_splits) + 1),
+            row_offsets_gpu=empty_off,
+            scale_offsets_gpu=torch.zeros(len(m_splits) + 1, dtype=torch.int64, device=device),
+            unpadded_row_offsets_gpu=empty_off.clone() if fuse_pad else None,
         )
 
-    row_offsets: List[int] = [0]
-    scale_offsets: List[int] = [0]
-    for m_i in m_splits:
-        row_offsets.append(row_offsets[-1] + m_i)
-        m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-        scale_offsets.append(scale_offsets[-1] + m_padded * k // 16)
+    # Padded per-group counts (only differ from m_splits when fuse_pad=True and
+    # some m_i is not 128-aligned).
+    m_splits_t = torch.tensor(m_splits, dtype=torch.int32, device=device)
+    m_padded_t = ((m_splits_t + (_MMA_TILE_ROWS - 1)) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
 
+    scale_flat_size = sum(
+        ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS * (k // 16)
+        for m_i in m_splits
+    )
+    scale_flat = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
+    scale_offsets_gpu = torch.cat([
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.cumsum(m_padded_t.to(torch.int64) * (k // 16), dim=0),
+    ])
+
+    if fuse_pad:
+        # Unpadded offsets index into x; padded offsets index into data / gs.
+        unpadded_row_offsets_gpu = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(m_splits_t, dim=0).to(torch.int32),
+        ])
+        padded_row_offsets_gpu = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(m_padded_t, dim=0).to(torch.int32),
+        ])
+        padded_total = int(padded_row_offsets_gpu[-1].item())
+        data         = torch.empty((padded_total, k // 2), dtype=nvfp4_output_t, device=device)
+        global_scale = torch.empty(padded_total, dtype=torch.float32, device=device)
+
+        fn = (fp4_gemm.four_six_fp4_group_pertoken_pad_fuse if four_six
+              else fp4_gemm.rtn_fp4_group_pertoken_pad_fuse)
+        fn(data, scale_flat, global_scale, x,
+           padded_row_offsets_gpu, unpadded_row_offsets_gpu,
+           scale_offsets_gpu, scale_override)
+
+        return GroupQuantizeSwizzledResult(
+            data=data,
+            global_scale=global_scale,
+            scale_flat=scale_flat,
+            row_offsets_gpu=padded_row_offsets_gpu,
+            scale_offsets_gpu=scale_offsets_gpu,
+            unpadded_row_offsets_gpu=unpadded_row_offsets_gpu,
+        )
+
+    # Legacy path: x already matches m_splits row-for-row (no fused padding).
     data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
-    scale_flat   = torch.zeros(scale_offsets[-1], dtype=nvfp4_scale_t, device=device)
-
-    row_offsets_gpu   = torch.tensor(row_offsets,   dtype=torch.int32, device=device)
-    scale_offsets_gpu = torch.tensor(scale_offsets, dtype=torch.int64, device=device)
+    row_offsets_gpu = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.cumsum(m_splits_t, dim=0).to(torch.int32),
+    ])
 
     fn = fp4_gemm.four_six_fp4_group_pertoken if four_six else fp4_gemm.rtn_fp4_group_pertoken
     fn(data, scale_flat, global_scale, x, row_offsets_gpu, scale_offsets_gpu, scale_override)
-
-    nKT = k // 64
-    if skip_scale_views:
-        scale_views = []
-    else:
-        scale_views: List[torch.Tensor] = []
-        for g, m_i in enumerate(m_splits):
-            if m_i == 0:
-                scale_views.append(None)
-                continue
-            m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-            nMT  = m_padded // _MMA_TILE_ROWS
-            sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
-            view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
-            scale_views.append(view)
 
     return GroupQuantizeSwizzledResult(
         data=data,
         global_scale=global_scale,
         scale_flat=scale_flat,
-        scale_views=scale_views,
-        scale_offsets=scale_offsets,
-        row_offsets=row_offsets,
+        row_offsets_gpu=row_offsets_gpu,
+        scale_offsets_gpu=scale_offsets_gpu,
     )
 
 
@@ -491,20 +531,22 @@ def dequantize_group_nvfp4_pertoken_swizzled(result: GroupQuantizeSwizzledResult
     total_m, nhalf = result.data.shape
     k = nhalf * 2
     device = result.data.device
+    row_offsets = result.row_offsets_gpu.tolist()
+    scale_offsets = result.scale_offsets_gpu.tolist()
 
     if total_m == 0:
         return torch.empty((0, k), dtype=torch.bfloat16, device=device)
 
     grid = _get_fp4_grid(device)
     parts = []
-    for g in range(len(result.row_offsets) - 1):
-        r0, r1 = result.row_offsets[g], result.row_offsets[g + 1]
+    for g in range(len(row_offsets) - 1):
+        r0, r1 = row_offsets[g], row_offsets[g + 1]
         m_i = r1 - r0
         if m_i == 0:
             parts.append(torch.empty((0, k), dtype=torch.bfloat16, device=device))
             continue
         m_padded = ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-        s0, s1 = result.scale_offsets[g], result.scale_offsets[g + 1]
+        s0, s1 = scale_offsets[g], scale_offsets[g + 1]
         scale_rm = _unswizzle_scale(result.scale_flat[s0:s1].to(torch.float32), m_padded, k)[:m_i]
         data_g = result.data[r0:r1]
         gs = result.global_scale[r0:r1].to(torch.float32).unsqueeze(1)
@@ -523,22 +565,17 @@ class GroupWeightQuantizeResult:
 
     data          – [total_n, k//2] uint8, packed FP4x2, all experts contiguous.
     cute_data     – [total_n * k] int8, CUTE-layout (first half data, second half zero padding).
-                    cute_fp4_for(g) slices this zero-copy.
     global_scale  – [num_experts] float32, per-expert alpha = amax / (448*6).
-                    Same value as TensorGlobalNvfp4Tensor._alpha_b_cached, ready to
-                    use directly as alpha_b_vec in grouped_gemm_cutedsl_pertoken.
-    scale_flat    – flat FP8 buffer; expert g lives at scale_flat[scale_offsets[g]:scale_offsets[g+1]].
-    scale_views   – list[Tensor], one per expert, shaped (32,4,nMT,4,nKT,1), CUTE-ready.
-    scale_offsets – list[int], len = num_experts+1, cumulative FP8 element counts.
-    row_offsets   – list[int], len = num_experts+1, cumulative row counts (fixed stride = n_per_expert).
+    scale_flat    – flat FP8 buffer; expert g lives at scale_flat[scale_offsets_gpu[g]:scale_offsets_gpu[g+1]].
+    row_offsets_gpu   – int32 CUDA tensor of row_offsets, ready for the GEMM kernel.
+    scale_offsets_gpu – int64 CUDA tensor of scale_offsets, ready for the GEMM kernel.
     """
-    data:          torch.Tensor
-    cute_data:     torch.Tensor
-    global_scale:  torch.Tensor
-    scale_flat:    torch.Tensor
-    scale_views:   List[torch.Tensor]
-    scale_offsets: List[int]
-    row_offsets:   List[int]
+    data:              torch.Tensor
+    cute_data:         torch.Tensor
+    global_scale:      torch.Tensor
+    scale_flat:        torch.Tensor
+    row_offsets_gpu:   torch.Tensor
+    scale_offsets_gpu: torch.Tensor
 
 
 _NVFP4_GLOBAL_SCALE_DENOM = 448.0 * 6.0
@@ -563,8 +600,6 @@ def group_quantize_nvfp4_tensor_global_packed(
 
     Returns:
         GroupWeightQuantizeResult with all experts packed into contiguous buffers.
-        scale_views[g] is shaped (32,4,nMT,4,nKT,1), directly usable by the
-        Sm100 grouped GEMM kernel.
     """
     assert x.is_cuda, "x must be a CUDA tensor."
     assert x.dtype == torch.bfloat16, "x must be bfloat16."
@@ -584,25 +619,18 @@ def group_quantize_nvfp4_tensor_global_packed(
     n_padded = ((n_per_expert + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
     sf_stride = n_padded * k // 16
 
-    row_offsets: List[int] = [i * n_per_expert for i in range(num_experts + 1)]
-    scale_offsets: List[int] = [i * sf_stride for i in range(num_experts + 1)]
-
     data         = torch.empty((total_n, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(num_experts, dtype=torch.float32, device=device)
-    scale_flat   = torch.zeros(scale_offsets[-1], dtype=nvfp4_scale_t, device=device)
+    scale_flat   = torch.zeros(num_experts * sf_stride, dtype=nvfp4_scale_t, device=device)
 
-    row_offsets_gpu   = torch.tensor(row_offsets,   dtype=torch.int32, device=device)
-    scale_offsets_gpu = torch.tensor(scale_offsets, dtype=torch.int64, device=device)
-
-    # Per-expert amax: one reduction per expert, fully on GPU.
-    amax = x.abs().amax(dim=(1, 2)).to(torch.float32).contiguous()
+    # Both offsets are uniform arithmetic sequences — construct directly on GPU, no CPU→GPU copy.
+    row_offsets_gpu   = torch.arange(num_experts + 1, dtype=torch.int32, device=device) * n_per_expert
+    scale_offsets_gpu = torch.arange(num_experts + 1, dtype=torch.int64, device=device) * sf_stride
 
     fn = fp4_gemm.four_six_fp4_group_tensor_global if four_six else fp4_gemm.rtn_fp4_group_tensor_global
+    amax = x_2d.abs().amax(dim=1).reshape(num_experts, n_per_expert).amax(dim=1).to(torch.float32).contiguous()
     fn(data, scale_flat, global_scale, x_2d, row_offsets_gpu, scale_offsets_gpu, amax, scale_override)
 
-    # Build one CUTE int8 buffer for all experts: [total_n * k] int8.
-    # Each expert occupies n_per_expert*k bytes: first half is FP4 data, second half zeros.
-    # cute_fp4_for(g) = cute_data[g*n*k : (g+1)*n*k], so each expert must be interleaved.
     if skip_cute_data:
         cute_data = None
     else:
@@ -613,22 +641,13 @@ def group_quantize_nvfp4_tensor_global_packed(
             dst_start = g * n_per_expert * k
             cute_data[dst_start: dst_start + n_per_expert * k // 2].copy_(src)
 
-    nMT = n_padded // _MMA_TILE_ROWS
-    nKT = k // 64
-    scale_views: List[torch.Tensor] = []
-    for g in range(num_experts):
-        sl   = scale_flat[scale_offsets[g]: scale_offsets[g + 1]]
-        view = sl.view(1, nMT, nKT, 32, 4, 4).permute(*_SCALE_VIEW_PERM)
-        scale_views.append(view)
-
     return GroupWeightQuantizeResult(
         data=data,
         cute_data=cute_data,
         global_scale=global_scale,
         scale_flat=scale_flat,
-        scale_views=scale_views,
-        scale_offsets=scale_offsets,
-        row_offsets=row_offsets,
+        row_offsets_gpu=row_offsets_gpu,
+        scale_offsets_gpu=scale_offsets_gpu,
     )
 
 
@@ -648,7 +667,9 @@ def dequantize_group_nvfp4_tensor_global_packed(result: GroupWeightQuantizeResul
     total_n, nhalf = result.data.shape
     k = nhalf * 2
     device = result.data.device
-    num_experts = len(result.row_offsets) - 1
+    row_offsets = result.row_offsets_gpu.tolist()
+    scale_offsets = result.scale_offsets_gpu.tolist()
+    num_experts = len(row_offsets) - 1
 
     if total_n == 0:
         return torch.empty((0, k), dtype=torch.bfloat16, device=device)
@@ -656,13 +677,13 @@ def dequantize_group_nvfp4_tensor_global_packed(result: GroupWeightQuantizeResul
     grid = _get_fp4_grid(device)
     parts = []
     for g in range(num_experts):
-        r0, r1 = result.row_offsets[g], result.row_offsets[g + 1]
+        r0, r1 = row_offsets[g], row_offsets[g + 1]
         n_i = r1 - r0
         if n_i == 0:
             parts.append(torch.empty((0, k), dtype=torch.bfloat16, device=device))
             continue
         n_padded = ((n_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-        s0, s1 = result.scale_offsets[g], result.scale_offsets[g + 1]
+        s0, s1 = scale_offsets[g], scale_offsets[g + 1]
         scale_rm = _unswizzle_scale(result.scale_flat[s0:s1].to(torch.float32), n_padded, k)[:n_i]
         data_g = result.data[r0:r1]
         gs = result.global_scale[g].to(torch.float32)          # scalar alpha = amax/(448*6)

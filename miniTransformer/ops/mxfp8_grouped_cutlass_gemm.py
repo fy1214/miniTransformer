@@ -18,7 +18,12 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
+
+# 1SM 的 M-tile=128，2SM 的 M-tile=256。每组平均 M ≤ 128 时 2SM tile 利用率不足
+# 一半，1SM 更快；超过则 2SM 吞吐占优。实测拐点在 128↔160 之间（M=128 时 1SM
+# 快 ~18%，M=160 时 2SM 快 ~15%），故以 128 为界自动选择 schedule。
+_AUTO_2SM_M_THRESHOLD = 128
 
 import fp4_gemm as _fp4_gemm
 from miniTransformer.ops.mxfp8_quantize import mxfp8_grouped_quantize
@@ -83,7 +88,7 @@ class MxFP8V2GemmInputs:
 def mxfp8_grouped_gemm_v2(
     inputs: MxFP8V2GemmInputs,
     out_dtype: torch.dtype = torch.bfloat16,
-    use_2sm: bool = False,
+    use_2sm: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     CUTLASS SM100 MXFP8 grouped GEMM (v2, zero-overhead).
@@ -92,7 +97,8 @@ def mxfp8_grouped_gemm_v2(
         inputs:   Pre-packed activation + weight tensors (see MxFP8V2GemmInputs).
         out_dtype: Output dtype, default bfloat16.
         use_2sm:  True → 2SM schedule (higher throughput, larger M);
-                  False → 1SM schedule (lower latency, small batch).
+                  False → 1SM schedule (lower latency, small batch);
+                  None → 自动按每组平均 M 选择（avg_M > 128 用 2SM，否则 1SM）。
 
     Returns:
         D : [total_M, N] out_dtype, where N = wgt_data.size(0) // ng.
@@ -101,6 +107,10 @@ def mxfp8_grouped_gemm_v2(
     device  = inputs.act_data.device
     total_m = inputs.act_data.shape[0]
     n       = inputs.wgt_data.shape[0] // ng
+
+    if use_2sm is None:
+        avg_m = total_m / ng
+        use_2sm = avg_m > _AUTO_2SM_M_THRESHOLD
 
     D = torch.empty(total_m, n, dtype=out_dtype, device=device)
 

@@ -46,11 +46,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("out"), pybind11::arg("sf"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
           "MXFP8 grouped rowwise quantization (BF16→FP8 E4M3 + E8M0 SF, SM100 swizzled layout)");
+    m.def("mxfp8_grouped_quantize_hw",
+          &mxfp8_grouped_quantize_hw_binding,
+          pybind11::arg("out"), pybind11::arg("sf"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
+          "MXFP8 grouped rowwise quantization, full hardware-cvt path (SM100 inference operator)");
     m.def("mxfp8_grouped_transpose_quantize",
           &mxfp8_grouped_transpose_quantize_binding,
           pybind11::arg("out_T"), pybind11::arg("sf"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
           "MXFP8 grouped colwise (transpose) quantization (BF16→[K,M] FP8 E4M3 + E8M0 SF)");
+    m.def("mxfp8_grouped_quantize_chunked",
+          &mxfp8_grouped_quantize_chunked_binding,
+          pybind11::arg("out"), pybind11::arg("sf"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
+          "MXFP8 grouped rowwise quantization, per-CTA-chunk scheduling (requires 128-row group alignment)");
+    m.def("mxfp8_grouped_quantize_chunked_hw",
+          &mxfp8_grouped_quantize_chunked_hw_binding,
+          pybind11::arg("out"), pybind11::arg("sf"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
+          "MXFP8 grouped rowwise quantization, per-CTA-chunk + hardware-cvt path (SM100 inference)");
 
 
     // quarter quantization
@@ -76,6 +91,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
           pybind11::arg("scale_override"),
           "Round-4-or-6 FP4 grouped per-token quantization with per-group swizzled SF layout (CUDA)");
+    m.def("rtn_fp4_group_pertoken_pad_fuse", &rtn_fp4_group_pertoken_pad_fuse_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"),
+          pybind11::arg("padded_row_offsets"), pybind11::arg("unpadded_row_offsets"),
+          pybind11::arg("scale_offsets"), pybind11::arg("scale_override"),
+          "RTN FP4 grouped per-token quantization, per-CTA-chunk + fused pad (requires 128-row padded alignment)");
+    m.def("four_six_fp4_group_pertoken_pad_fuse", &four_six_fp4_group_pertoken_pad_fuse_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"),
+          pybind11::arg("padded_row_offsets"), pybind11::arg("unpadded_row_offsets"),
+          pybind11::arg("scale_offsets"), pybind11::arg("scale_override"),
+          "Round-4-or-6 FP4 grouped per-token quantization, per-CTA-chunk + fused pad (requires 128-row padded alignment)");
     m.def("rtn_fp4_group_tensor_global", &rtn_fp4_group_tensor_global_binding,
           pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),

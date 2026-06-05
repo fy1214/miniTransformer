@@ -382,6 +382,354 @@ void four_six_fp4_group_pertoken_binding(
         at::cuda::getCurrentCUDAStream());
 }
 
+// ── Per-CTA-chunk pertoken kernel with fused pad ─────────────────────────────
+//
+// Same data path as fp4_group_pertoken_kernel (Step 1..5), but the scheduling
+// is per-CTA-chunk instead of per-row:
+//
+//   - Output / SF / global_scale buffers are sized for the *padded* total_M
+//     (each group's M rounded up to CHUNK_M=128 — produced upstream by
+//      Megatron Fp8Padding).
+//   - The input bf16 x_ptr is *unpadded* (the kernel reads only the real rows).
+//   - CHUNK_M=128 padded rows are owned by one CTA; thread-0 does a single
+//     O(log G) binary search on padded_row_offsets to find the owning group
+//     and broadcasts (padded_base_in_group, unpadded_base_global, m_unpadded,
+//     sf_base) via __shared__ to every other thread (eliminates the O(G)
+//     per-thread scan and the cost of materializing a padded bf16 view).
+//   - Pad rows (padded_row_in_group >= m_unpadded) skip the bf16 load
+//     (their abs_max stays 0); quantize_gp then naturally produces fp8s=0
+//     and bits=0 → output FP4 / SF for pad rows is exact zero. f(0)=0 holds
+//     for all common activations, so downstream MLP propagates zeros through.
+//
+// Precondition: padded_total_M (= out.size(0)) must be divisible by CHUNK_M=128,
+//               and each group's *padded* M must be 128-aligned (Megatron
+//               Fp8Padding satisfies both; the chunked kernel ERRORs out via
+//               TORCH_CHECK if not).
+template<int NumCandidates>
+__global__ void fp4_group_pertoken_pad_fuse_kernel(
+    __nv_fp4x4_e2m1*    __restrict__ y_ptr,
+    __nv_fp8_e4m3*      __restrict__ scale_ptr,
+    float*              __restrict__ global_scale_ptr,
+    const nv_bfloat16*  __restrict__ x_ptr,                  // [unpadded_total_M, cols]
+    const int32_t*      __restrict__ padded_row_offsets,     // [num_groups+1], 128-aligned
+    const int32_t*      __restrict__ unpadded_row_offsets,   // [num_groups+1]
+    const int64_t*      __restrict__ scale_offsets,          // [num_groups+1]
+    float  scale_override,
+    int    cols_div16,
+    int    num_groups,
+    int    nvecs_per_row,
+    int    warps_per_row,
+    int    rows_per_block,      // power-of-2 divisor of CHUNK_M=128
+    int    total_chunks,        // padded_total_M / 128
+    int    grid_stride_chunks,  // = gridDim.x
+    int    bf16_region_floats)
+{
+    constexpr int CHUNK_M = 128;
+
+    extern __shared__ float smem_raw[];
+    nv_bfloat16* bf16_smem = reinterpret_cast<nv_bfloat16*>(smem_raw);
+    float*        f_smem   = smem_raw + bf16_region_floats;
+
+    __shared__ int     s_padded_base_in_group;
+    __shared__ int     s_m_unpadded;
+    __shared__ int     s_unpadded_base_global;
+    __shared__ int64_t s_sf_base;
+
+    const int flat_tid    = static_cast<int>(threadIdx.x);
+    const int warp_id     = flat_tid / 32;
+    const int lane_id     = flat_tid % 32;
+    const int local_row   = warp_id / warps_per_row;
+    const int warp_in_row = warp_id % warps_per_row;
+    const int tid         = warp_in_row * 32 + lane_id;
+
+    const int smem_base       = local_row * (nvecs_per_row + 1);
+    const int iters_per_chunk = CHUNK_M / rows_per_block;
+
+    for (int chunk_idx = blockIdx.x;
+         chunk_idx < total_chunks;
+         chunk_idx += grid_stride_chunks)
+    {
+        const int chunk_row_start = chunk_idx * CHUNK_M;  // padded row index
+
+        // thread-0: O(log G) binary search → broadcast owning-group context.
+        if (flat_tid == 0) {
+            int lo = 0, hi = num_groups - 1;
+            while (lo < hi) {
+                int mid = (lo + hi + 1) >> 1;
+                if (padded_row_offsets[mid] <= chunk_row_start) lo = mid;
+                else                                            hi = mid - 1;
+            }
+            const int g = lo;
+            s_padded_base_in_group = chunk_row_start - padded_row_offsets[g];
+            s_unpadded_base_global = unpadded_row_offsets[g];
+            s_m_unpadded           = unpadded_row_offsets[g + 1] - unpadded_row_offsets[g];
+            s_sf_base              = scale_offsets[g];
+        }
+        __syncthreads();
+
+        const int     padded_base = s_padded_base_in_group;
+        const int     m_unpadded  = s_m_unpadded;
+        const int     x_base      = s_unpadded_base_global;
+        const int64_t sf_base     = s_sf_base;
+
+        // Inner loop: iters_per_chunk × rows_per_block = CHUNK_M=128 rows.
+        for (int iter = 0; iter < iters_per_chunk; ++iter) {
+            const int row_in_chunk      = iter * rows_per_block + local_row;   // 0..127
+            const int padded_row_in_grp = padded_base + row_in_chunk;
+            const int padded_row_global = chunk_row_start + row_in_chunk;
+            const bool is_real_row      = padded_row_in_grp < m_unpadded;
+            const bool valid_vec        = (tid < nvecs_per_row);
+            const bool can_load         = is_real_row && valid_vec;
+
+            // ---- Load 8 bf16 values (only from real rows; pad rows keep x=0) ----
+            bf16x8 x{};
+            nv_bfloat16 local_abs_max = __float2bfloat16(0.f);
+            if (can_load) {
+                const int unpadded_row = x_base + padded_row_in_grp;
+                x = bf16x8::load(x_ptr + 8 * (unpadded_row * nvecs_per_row + tid));
+                local_abs_max = vecReduceAbsMax(x);
+            }
+
+            // ---- Step 1: per-row abs-max via shared-memory tree reduce ----
+            bf16_smem[smem_base + tid] = valid_vec ? local_abs_max : __float2bfloat16(0.f);
+            if (tid == nvecs_per_row - 1 || (!valid_vec && tid == nvecs_per_row))
+                bf16_smem[smem_base + nvecs_per_row] = __float2bfloat16(0.f);
+            __syncthreads();
+
+            for (int stride = nvecs_per_row / 2; stride >= 2; stride /= 2) {
+                if (tid < stride) {
+                    nv_bfloat162 a = make_bfloat162(bf16_smem[smem_base + tid],          bf16_smem[smem_base + tid + 1]);
+                    nv_bfloat162 b = make_bfloat162(bf16_smem[smem_base + tid + stride], bf16_smem[smem_base + tid + stride + 1]);
+                    nv_bfloat162 m;
+                    __asm__ volatile(
+                        "max.xorsign.abs.bf16x2 %0, %1, %2;"
+                        : "=r"(reinterpret_cast<int&>(m))
+                        : "r"(reinterpret_cast<int&>(a)), "r"(reinterpret_cast<int&>(b)));
+                    bf16_smem[smem_base + tid]     = m.x;
+                    bf16_smem[smem_base + tid + 1] = m.y;
+                }
+                __syncthreads();
+            }
+
+            // tid==0 of each row: finish reduce, broadcast (s, ges).
+            if (tid == 0) {
+                int last_stride = nvecs_per_row / 2;
+                while (last_stride / 2 >= 2) last_stride /= 2;
+                nv_bfloat16 amax_bf = __habs(bf16_smem[smem_base]);
+                for (int j = 1; j < last_stride; j++)
+                    amax_bf = __hmax(amax_bf, __habs(bf16_smem[smem_base + j]));
+                float row_amax = static_cast<float>(amax_bf);
+
+                constexpr float SCALES_MAX = (NumCandidates > 1) ? 256.0f : 448.0f;
+                constexpr float FP4_MAX    = 6.0f;
+                float ges = (row_amax == 0.f) ? 1.f : (SCALES_MAX * FP4_MAX) / row_amax;
+                float s   = (row_amax == 0.f) ? scale_override : scale_override / ges;
+                global_scale_ptr[padded_row_global] = s;
+                f_smem[local_row * 2 + 0]   = s;
+                f_smem[local_row * 2 + 1]   = ges;
+            }
+            __syncthreads();
+
+            // ---- Step 2: per-group (16-element) abs-max (warp-uniform) ----
+            nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
+            float full_abs_max = static_cast<float>(
+                __hmax(__habs(local_abs_max), __habs(other_abs_max)));
+
+            const float scale               = f_smem[local_row * 2 + 0];
+            const float global_encode_scale = f_smem[local_row * 2 + 1];
+
+            // For pad rows: full_abs_max==0 → quantize_gp returns bits=0,fp8s=0;
+            // the writes below put exact zeros in FP4 data + SF buffers.
+            if (valid_vec) {
+                // ---- Step 3: quantize (RTN or Round-4-or-6) ----
+                QuantResultGP res;
+                if constexpr (NumCandidates == 1) {
+                    res = quantize_gp(full_abs_max, 6.0f, global_encode_scale, scale, x);
+                } else {
+                    float candidates[2] = {6.f, 4.f};
+                    QuantResultGP results[2];
+                    float scores[2];
+                    float best = __builtin_inff();
+                    for (int i = 0; i < 2; ++i) {
+                        results[i] = quantize_gp(full_abs_max, candidates[i], global_encode_scale, scale, x);
+                        const float descale = static_cast<float>(results[i].fp8s) * scale;
+                        float2 sum = {0.f, 0.f};
+                        const float2 dsv = {-descale, -descale};
+                        for (int j = 0; j < 4; ++j) {
+                            float2 dq = __nv_cvt_fp4x2_to_float2(results[i].bits[j]);
+                            float2 xv = {static_cast<float>(x[2*j]), static_cast<float>(x[2*j+1])};
+                            float2 d  = __ffma2_rn(dq, dsv, xv);
+                            sum = __ffma2_rn(d, d, sum);
+                        }
+                        float local_err = sum.x + sum.y;
+                        local_err += __shfl_xor_sync(0xffffffff, local_err, 1);
+                        scores[i] = local_err;
+                        if (scores[i] < best) { best = scores[i]; res = results[i]; }
+                    }
+                }
+
+                // ---- Step 4: store packed FP4 (padded layout) ----
+                const int global_vec_idx = padded_row_global * nvecs_per_row + tid;
+                res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
+
+                // ---- Step 5: store per-group FP8 SF with swizzle ----
+                if (tid % 2 == 0) {
+                    const int     col       = tid / 2;
+                    const int     numKTiles = cols_div16 / 4;
+                    const int64_t tgt = cvt_quant_to_fp4_get_sf_out_offset(padded_row_in_grp, col, numKTiles);
+                    scale_ptr[sf_base + tgt] = res.fp8s;
+                }
+            }
+        } // end iter
+
+        __syncthreads();  // ensure all threads finish before next chunk overwrites s_*
+    } // end chunk loop
+}
+
+// ---- Launch helper (per-CTA-chunk + fused pad) ----
+
+static void launch_fp4_group_pertoken_pad_fuse(
+    int num_candidates,
+    __nv_fp4x4_e2m1*   y_ptr,
+    __nv_fp8_e4m3*     scale_ptr,
+    float*             global_scale_ptr,
+    const nv_bfloat16* x_ptr,
+    const int32_t*     padded_row_offsets,
+    const int32_t*     unpadded_row_offsets,
+    const int64_t*     scale_offsets,
+    float  scale_override,
+    long   padded_total_m,
+    long   cols,
+    int    num_groups,
+    cudaStream_t stream)
+{
+    constexpr int CHUNK_M = 128;
+    TORCH_CHECK(padded_total_m % CHUNK_M == 0,
+                "padded_total_m must be a multiple of 128 for the chunked kernel");
+
+    const int nvecs_per_row  = static_cast<int>(cols / 8);
+    const int warps_per_row  = (nvecs_per_row + 31) / 32;
+    const int raw_rpb        = max(1, 1024 / (warps_per_row * 32));
+    // rows_per_block must be a power-of-2 divisor of CHUNK_M (=128).
+    int rows_per_block = 1;
+    while (rows_per_block * 2 <= raw_rpb && rows_per_block * 2 <= CHUNK_M)
+        rows_per_block *= 2;
+
+    const int block_dim     = rows_per_block * warps_per_row * 32;
+    const int total_chunks  = static_cast<int>(padded_total_m / CHUNK_M);
+    const int grid_dim      = min(total_chunks, MAX_BLOCKS_GP);
+    const int cdiv16        = static_cast<int>(cols / 16);
+
+    // Same smem layout as the per-row kernel: Region A bf16 + Region B float.
+    const size_t bf16_bytes         = static_cast<size_t>(rows_per_block) * (nvecs_per_row + 1) * sizeof(nv_bfloat16);
+    const size_t bf16_bytes_align   = (bf16_bytes + 3) & ~size_t(3);
+    const int    bf16_region_floats = static_cast<int>(bf16_bytes_align / sizeof(float));
+    const size_t smem               = bf16_bytes_align + static_cast<size_t>(rows_per_block) * 2 * sizeof(float);
+
+    if (num_candidates == 2)
+        fp4_group_pertoken_pad_fuse_kernel<2><<<grid_dim, block_dim, smem, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            padded_row_offsets, unpadded_row_offsets, scale_offsets,
+            scale_override, cdiv16, num_groups,
+            nvecs_per_row, warps_per_row, rows_per_block,
+            total_chunks, grid_dim, bf16_region_floats);
+    else
+        fp4_group_pertoken_pad_fuse_kernel<1><<<grid_dim, block_dim, smem, stream>>>(
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
+            padded_row_offsets, unpadded_row_offsets, scale_offsets,
+            scale_override, cdiv16, num_groups,
+            nvecs_per_row, warps_per_row, rows_per_block,
+            total_chunks, grid_dim, bf16_region_floats);
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- PyTorch bindings (pad-fuse) ----
+
+void rtn_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor&       out,                    // [padded_total_m, cols/2]  uint8
+    at::Tensor&       scales,                 // flat FP8 SF buffer (padded layout)
+    at::Tensor&       global_scale,           // [padded_total_m]  float32
+    const at::Tensor& inp,                    // [unpadded_total_m, cols]  bfloat16
+    const at::Tensor& padded_row_offsets,     // [num_groups+1]  int32
+    const at::Tensor& unpadded_row_offsets,   // [num_groups+1]  int32
+    const at::Tensor& scale_offsets,          // [num_groups+1]  int64
+    float             scale_override)
+{
+    TORCH_CHECK(inp.dtype()   == at::kBFloat16,  "inp must be bfloat16");
+    TORCH_CHECK(inp.is_cuda(),                   "inp must be a CUDA tensor");
+    TORCH_CHECK(inp.is_contiguous(),             "inp must be contiguous");
+    TORCH_CHECK(inp.dim() == 2,                  "inp must be 2D [unpadded_total_m, cols]");
+    TORCH_CHECK(inp.size(1) % 128 == 0,          "cols must be divisible by 128");
+    TORCH_CHECK(inp.size(1) / 8 <= 512,          "cols must be <= 4096");
+    TORCH_CHECK(out.dim() == 2,                  "out must be 2D [padded_total_m, cols/2]");
+    TORCH_CHECK(out.size(0) % 128 == 0,          "padded_total_m (out.size(0)) must be 128-aligned");
+    TORCH_CHECK(global_scale.numel() == out.size(0), "global_scale must size padded_total_m");
+    TORCH_CHECK(padded_row_offsets.dtype()   == at::kInt,  "padded_row_offsets must be int32");
+    TORCH_CHECK(unpadded_row_offsets.dtype() == at::kInt,  "unpadded_row_offsets must be int32");
+    TORCH_CHECK(scale_offsets.dtype()        == at::kLong, "scale_offsets must be int64");
+    TORCH_CHECK(padded_row_offsets.numel()   == unpadded_row_offsets.numel(),
+                "padded/unpadded_row_offsets size mismatch");
+
+    const long padded_total_m = out.size(0);
+    const long cols           = inp.size(1);
+    const int  ngroups        = static_cast<int>(padded_row_offsets.numel()) - 1;
+
+    launch_fp4_group_pertoken_pad_fuse(
+        1,
+        reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        reinterpret_cast<const int32_t*>(padded_row_offsets.data_ptr()),
+        reinterpret_cast<const int32_t*>(unpadded_row_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
+        scale_override, padded_total_m, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
+}
+
+void four_six_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor&       out,
+    at::Tensor&       scales,
+    at::Tensor&       global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float             scale_override)
+{
+    TORCH_CHECK(inp.dtype()   == at::kBFloat16,  "inp must be bfloat16");
+    TORCH_CHECK(inp.is_cuda(),                   "inp must be a CUDA tensor");
+    TORCH_CHECK(inp.is_contiguous(),             "inp must be contiguous");
+    TORCH_CHECK(inp.dim() == 2,                  "inp must be 2D [unpadded_total_m, cols]");
+    TORCH_CHECK(inp.size(1) % 128 == 0,          "cols must be divisible by 128");
+    TORCH_CHECK(inp.size(1) / 8 <= 512,          "cols must be <= 4096");
+    TORCH_CHECK(out.dim() == 2,                  "out must be 2D [padded_total_m, cols/2]");
+    TORCH_CHECK(out.size(0) % 128 == 0,          "padded_total_m (out.size(0)) must be 128-aligned");
+    TORCH_CHECK(global_scale.numel() == out.size(0), "global_scale must size padded_total_m");
+    TORCH_CHECK(padded_row_offsets.dtype()   == at::kInt,  "padded_row_offsets must be int32");
+    TORCH_CHECK(unpadded_row_offsets.dtype() == at::kInt,  "unpadded_row_offsets must be int32");
+    TORCH_CHECK(scale_offsets.dtype()        == at::kLong, "scale_offsets must be int64");
+    TORCH_CHECK(padded_row_offsets.numel()   == unpadded_row_offsets.numel(),
+                "padded/unpadded_row_offsets size mismatch");
+
+    const long padded_total_m = out.size(0);
+    const long cols           = inp.size(1);
+    const int  ngroups        = static_cast<int>(padded_row_offsets.numel()) - 1;
+
+    launch_fp4_group_pertoken_pad_fuse(
+        2,
+        reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
+        reinterpret_cast<float*>(global_scale.data_ptr()),
+        reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
+        reinterpret_cast<const int32_t*>(padded_row_offsets.data_ptr()),
+        reinterpret_cast<const int32_t*>(unpadded_row_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(scale_offsets.data_ptr()),
+        scale_override, padded_total_m, cols, ngroups,
+        at::cuda::getCurrentCUDAStream());
+}
+
 // ── Grouped tensor-global FP4 quantization ────────────────────────────────────
 //
 // Grid/block assignment (group-aligned):

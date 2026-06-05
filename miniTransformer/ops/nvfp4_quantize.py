@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 import fp4_gemm
@@ -288,17 +288,29 @@ class GroupQuantizeSwizzledResult:
     """Output of group_quantize_nvfp4_pertoken_swizzled.
 
     data              – [total_m, k//2] uint8, packed FP4x2, row-major.
+                        When ``fuse_pad=True`` was used, ``total_m`` is the
+                        *padded* row count (each group padded up to 128).
     global_scale      – [total_m] float32, per-row global scale.
     scale_flat        – flat FP8 buffer; group g lives at
                         scale_flat[scale_offsets_gpu[g]:scale_offsets_gpu[g+1]].
-    row_offsets_gpu   – int32 CUDA tensor, len = num_groups+1, cumulative row counts.
-    scale_offsets_gpu – int64 CUDA tensor, len = num_groups+1, cumulative FP8 element counts.
+    row_offsets_gpu   – int32 CUDA tensor, len = num_groups+1, cumulative row
+                        counts that index into ``data`` / ``global_scale``.
+                        When ``fuse_pad=True`` these are the *padded* offsets
+                        (what the downstream grouped GEMM expects).
+    scale_offsets_gpu – int64 CUDA tensor, len = num_groups+1, cumulative FP8
+                        element counts.
+    unpadded_row_offsets_gpu – int32 CUDA tensor, only populated when
+                        ``fuse_pad=True``; cumulative *unpadded* token counts
+                        (i.e. the original ``m_splits`` passed in). Use this
+                        to slice the real-row regions out of the padded
+                        ``data`` / ``global_scale`` buffers.
     """
     data:              torch.Tensor
     global_scale:      torch.Tensor
     scale_flat:        torch.Tensor
     row_offsets_gpu:   torch.Tensor
     scale_offsets_gpu: torch.Tensor
+    unpadded_row_offsets_gpu: Optional[torch.Tensor] = None
 
 
 _SCALE_VIEW_PERM = (3, 4, 1, 5, 2, 0)   # matches mma_permute_order in nvfp4_qgemm.py
@@ -388,18 +400,39 @@ def group_quantize_nvfp4_pertoken_swizzled(
     *,
     four_six: bool = False,
     scale_override: float = 1.0,
+    fuse_pad: bool = False,
 ) -> GroupQuantizeSwizzledResult:
     """Grouped per-token NVFP4 quantization with per-group tcgen05 swizzled scales.
 
     Args:
         x:              2-D BF16 tensor [total_m, k], contiguous, on CUDA.
                         k must be divisible by 128 and <= 4096.
-        m_splits:       Row counts per group; sum must equal x.shape[0].
+                        When ``fuse_pad=False`` (default): ``total_m`` is the
+                        actual row count and ``sum(m_splits) == total_m``.
+                        When ``fuse_pad=True``: ``x`` is the *unpadded* tensor
+                        (post-permute, pre-Fp8Padding) and
+                        ``sum(m_splits) == total_m`` still holds — but the
+                        output buffers are sized to the *padded* total
+                        ``sum(ceil(m_i/128)*128)``, with the kernel emitting
+                        bit-zero FP4/SF for the pad rows so the downstream
+                        grouped GEMM produces ``0·W = 0`` on those rows.
+        m_splits:       Per-group token counts. With ``fuse_pad=False`` these
+                        match rows in ``x`` (typical when caller already ran
+                        Fp8Padding). With ``fuse_pad=True`` these are the
+                        *unpadded* per-expert token counts and the wrapper
+                        derives padded offsets internally.
         four_six:       Round-4-or-6 if True; RTN otherwise (default).
         scale_override: Scalar multiplier for the per-row global scale.
+        fuse_pad:       If True, fuse Megatron's ``Fp8Padding`` D2D copy into
+                        the quantize kernel (per-CTA-chunk scheduling + binary
+                        search owning-group lookup). 3-6× faster end-to-end
+                        on Qwen3-30B-A3B shapes. Default False preserves the
+                        legacy per-row kernel.
 
     Returns:
-        GroupQuantizeSwizzledResult with GPU offset tensors ready for the CUTLASS kernel.
+        GroupQuantizeSwizzledResult. When ``fuse_pad=True`` the result also
+        carries ``unpadded_row_offsets_gpu`` for slicing real rows back out
+        of the padded buffers.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16, "x must be a CUDA bfloat16 tensor"
     assert x.dim() == 2 and x.is_contiguous(), "x must be a contiguous 2-D tensor"
@@ -409,35 +442,66 @@ def group_quantize_nvfp4_pertoken_swizzled(
     device = x.device
 
     if total_m == 0:
+        empty_off = torch.zeros(len(m_splits) + 1, dtype=torch.int32, device=device)
         return GroupQuantizeSwizzledResult(
             data=torch.empty((0, k // 2), dtype=nvfp4_output_t, device=device),
             global_scale=torch.empty(0, dtype=torch.float32, device=device),
             scale_flat=torch.empty(0, dtype=nvfp4_scale_t, device=device),
-            row_offsets_gpu=torch.zeros(len(m_splits) + 1, dtype=torch.int32, device=device),
+            row_offsets_gpu=empty_off,
             scale_offsets_gpu=torch.zeros(len(m_splits) + 1, dtype=torch.int64, device=device),
+            unpadded_row_offsets_gpu=empty_off.clone() if fuse_pad else None,
         )
 
-    # Python-only: compute scale_flat total size (pure arithmetic, no GPU op needed).
+    # Padded per-group counts (only differ from m_splits when fuse_pad=True and
+    # some m_i is not 128-aligned).
+    m_splits_t = torch.tensor(m_splits, dtype=torch.int32, device=device)
+    m_padded_t = ((m_splits_t + (_MMA_TILE_ROWS - 1)) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+
     scale_flat_size = sum(
         ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS * (k // 16)
         for m_i in m_splits
     )
-
-    data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
-    global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
-    scale_flat   = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
-
-    # Single GPU copy of m_splits; derive both offset tensors on GPU — 1 copy instead of 2.
-    m_splits_t = torch.tensor(m_splits, dtype=torch.int32, device=device)
-    m_padded_t = ((m_splits_t + (_MMA_TILE_ROWS - 1)) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
-
-    row_offsets_gpu = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.cumsum(m_splits_t, dim=0).to(torch.int32),
-    ])
+    scale_flat = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
     scale_offsets_gpu = torch.cat([
         torch.zeros(1, dtype=torch.int64, device=device),
         torch.cumsum(m_padded_t.to(torch.int64) * (k // 16), dim=0),
+    ])
+
+    if fuse_pad:
+        # Unpadded offsets index into x; padded offsets index into data / gs.
+        unpadded_row_offsets_gpu = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(m_splits_t, dim=0).to(torch.int32),
+        ])
+        padded_row_offsets_gpu = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(m_padded_t, dim=0).to(torch.int32),
+        ])
+        padded_total = int(padded_row_offsets_gpu[-1].item())
+        data         = torch.empty((padded_total, k // 2), dtype=nvfp4_output_t, device=device)
+        global_scale = torch.empty(padded_total, dtype=torch.float32, device=device)
+
+        fn = (fp4_gemm.four_six_fp4_group_pertoken_pad_fuse if four_six
+              else fp4_gemm.rtn_fp4_group_pertoken_pad_fuse)
+        fn(data, scale_flat, global_scale, x,
+           padded_row_offsets_gpu, unpadded_row_offsets_gpu,
+           scale_offsets_gpu, scale_override)
+
+        return GroupQuantizeSwizzledResult(
+            data=data,
+            global_scale=global_scale,
+            scale_flat=scale_flat,
+            row_offsets_gpu=padded_row_offsets_gpu,
+            scale_offsets_gpu=scale_offsets_gpu,
+            unpadded_row_offsets_gpu=unpadded_row_offsets_gpu,
+        )
+
+    # Legacy path: x already matches m_splits row-for-row (no fused padding).
+    data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
+    global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
+    row_offsets_gpu = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.cumsum(m_splits_t, dim=0).to(torch.int32),
     ])
 
     fn = fp4_gemm.four_six_fp4_group_pertoken if four_six else fp4_gemm.rtn_fp4_group_pertoken

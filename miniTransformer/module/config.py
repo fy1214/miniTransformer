@@ -12,7 +12,7 @@ from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2QuantizeOp as Nvfp4Cursor2CutlassQuantizeOp
+from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2CutlassQuantizeOp
 from miniTransformer.quantiztion.nvfp4_w4a16_op import Nvfp4W4A16QuantizeOp
 from miniTransformer.quantiztion.nvfp4_qdq_op import Nvfp4QdqOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType

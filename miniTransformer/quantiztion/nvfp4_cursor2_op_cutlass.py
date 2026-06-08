@@ -22,7 +22,7 @@ def _is_sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
 
 
-class Nvfp4Cursor2QuantizeOp(quantization.QuantizeOpBase):
+class Nvfp4Cursor2CutlassQuantizeOp(quantization.QuantizeOpBase):
     """
   NVFP4 quantize op for GroupLinear (cursor2 path):
 

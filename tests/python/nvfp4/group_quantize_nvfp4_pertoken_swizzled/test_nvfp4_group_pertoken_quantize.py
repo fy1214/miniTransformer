@@ -221,24 +221,25 @@ def _get_swizzled_scale_views(res, m_splits: List[int], k: int) -> list:
 # Typical MoE shapes used in production
 # ---------------------------------------------------------------------------
 
-# (num_groups, m_per_group, k)  — m_per_group can be non-multiple-of-128
+# (num_groups, m_per_group, k)  — chunked kernel requires m_per_group % 128 == 0
 TYPICAL_MOE_SHAPES = [
     (8,  128, 1024),    # small, clean multiple of 128
-    (16, 64,  2048),    # m < 128
-    (64, 192, 4096),    # m > 128, not a clean multiple
+    (16, 128, 2048),    # baseline
+    (64, 256, 4096),    # m > 128, clean multiple
     (62, 128, 768),     # realistic: 62 non-empty experts, m=128 per expert
 ]
 
-# Irregular m_splits like RL training (each expert gets different token count)
+# Irregular m_splits like RL training, all 128-aligned (upstream Fp8Padding
+# rounds each per-expert count up to 128 before quantize).
 _RL_M_SPLITS = [
-    128, 0, 96, 192, 64, 128, 0, 48, 128, 160,
-    128, 80, 0, 128, 96, 64, 128, 0, 128, 112,
-    96, 128, 128, 0, 64, 128, 80, 128, 0, 128,
-    128, 96, 64, 128, 128, 0, 80, 128, 64, 128,
-    0, 128, 112, 96, 128, 0, 128, 64, 128, 96,
-    128, 80, 128, 0, 96, 128, 64, 128, 128, 0,
-    128, 112,
-]  # 62 groups, mixed empty/non-empty
+    128, 0, 128, 256, 128, 128, 0, 128, 128, 256,
+    128, 128, 0, 128, 128, 128, 128, 0, 128, 128,
+    128, 128, 128, 0, 128, 128, 128, 128, 0, 128,
+    128, 128, 128, 128, 128, 0, 128, 128, 128, 128,
+    0, 128, 128, 128, 128, 0, 128, 128, 128, 128,
+    128, 128, 128, 0, 128, 128, 128, 128, 128, 0,
+    128, 128,
+]  # 62 groups, mixed empty/non-empty (all non-empty are 128-aligned)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ def test_fp4_data_matches_reference_rl_splits():
 def test_empty_groups_handled():
     """m_splits with some zeros: empty groups must produce None scale_views."""
     k = 512
-    m_splits = [128, 0, 64, 0, 128]
+    m_splits = [128, 0, 128, 0, 128]
     total_m  = sum(m_splits)
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
@@ -406,7 +407,7 @@ def test_all_zeros_stable():
 def test_scale_view_shape():
     """scale_views must have the shape (32,4,nMT,4,nKT,1) matching _make_cute_sf output."""
     k = 1024
-    m_splits = [128, 256, 192, 64]
+    m_splits = [128, 256, 256, 128]
     total_m  = sum(m_splits)
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
@@ -426,7 +427,7 @@ def test_scale_view_shape():
 def test_scale_offsets_row_offsets_correct():
     """scale_offsets and row_offsets must reflect the actual padded allocation."""
     k = 512
-    m_splits = [100, 200, 50, 128]
+    m_splits = [128, 256, 128, 128]
     total_m  = sum(m_splits)
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 

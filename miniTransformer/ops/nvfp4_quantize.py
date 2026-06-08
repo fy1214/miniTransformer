@@ -497,6 +497,12 @@ def group_quantize_nvfp4_pertoken_swizzled(
         )
 
     # Legacy path: x already matches m_splits row-for-row (no fused padding).
+    # The chunked scheduler requires every group's M to be 128-aligned so each
+    # CHUNK_M=128 tile falls inside one group; upstream callers pad to 128.
+    assert all(m % _MMA_TILE_ROWS == 0 for m in m_splits), (
+        f"group_quantize_nvfp4_pertoken_swizzled (fuse_pad=False): each m in "
+        f"m_splits must be a multiple of {_MMA_TILE_ROWS}; got {m_splits}"
+    )
     data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
     row_offsets_gpu = torch.cat([

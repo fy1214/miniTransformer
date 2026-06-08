@@ -91,6 +91,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
           pybind11::arg("scale_override"),
           "Round-4-or-6 FP4 grouped per-token quantization with per-group swizzled SF layout (CUDA)");
+    m.def("rtn_fp4_group_pertoken_legacy_per_row", &rtn_fp4_group_pertoken_legacy_per_row_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "RTN FP4 grouped per-token (legacy per-row scheduler, bench only)");
+    m.def("four_six_fp4_group_pertoken_legacy_per_row", &four_six_fp4_group_pertoken_legacy_per_row_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "Round-4-or-6 FP4 grouped per-token (legacy per-row scheduler, bench only)");
     m.def("rtn_fp4_group_pertoken_pad_fuse", &rtn_fp4_group_pertoken_pad_fuse_binding,
           pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
           pybind11::arg("inp"),

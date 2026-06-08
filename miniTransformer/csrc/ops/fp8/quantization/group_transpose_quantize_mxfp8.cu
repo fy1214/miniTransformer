@@ -1,6 +1,9 @@
 // Grouped MXFP8 transpose quantization (SM100 / Blackwell) — TMA v2.
 //
-// Quantizes [total_M, K] BF16 → transposed [K, total_M] FP8 E4M3 + E8M0 SF.
+// Quantizes [total_M, K] BF16 → per-group transposed FP8 E4M3 + E8M0 SF.
+// Output layout: each group's [K, M_g] block is stored contiguously (row-major),
+// groups stacked sequentially. data_offsets[g] gives byte offset of group g.
+// When all M_g are equal, output is viewable as [ng*K, M_per_group].
 //
 // Tile: [TILE_M=32, TILE_K=64] BF16.
 //   TILE_K=64 chosen so that boxX * sizeof(BF16) = 64*2 = 128 B, satisfying
@@ -73,16 +76,16 @@ static constexpr int TILE_K = 64;    // boxX*2B = 128B → satisfies SWIZZLE_128
 
 __global__ void __launch_bounds__(TILE_K)
 mxfp8_group_transpose_quantize_kernel(
-    uint8_t*           __restrict__ y_T_ptr,           // [K, total_M] FP8 E4M3
+    uint8_t*           __restrict__ y_T_ptr,           // flat FP8 E4M3 output
     uint8_t*           __restrict__ sf_ptr,             // flat E8M0 SF buffer
     const __grid_constant__ CUtensorMap tensor_map_in,  // [total_M, K] BF16, SWIZZLE_128B
     const int32_t*     __restrict__ group_cta_offsets,  // [num_groups+1]
     const int32_t*     __restrict__ row_offsets,        // [num_groups+1]
     const int64_t*     __restrict__ sf_offsets,         // [num_groups+1]
+    const int64_t*     __restrict__ data_offsets,       // [num_groups+1] per-group output offsets
     int    K,
     int    n_k_tiles,    // ceil(K / TILE_K)
-    int    num_groups,
-    int    total_M
+    int    num_groups
 )
 {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -147,14 +150,16 @@ mxfp8_group_transpose_quantize_kernel(
     if (global_k >= K) goto cleanup;
 
     {
-        // ---- Read column t from shmem (conflict-free due to SWIZZLE_128B) ----
-        // With SWIZZLE_128B the TMA XOR's address bits so that
-        // in_sh[m * TILE_K + t] and in_sh[(m+1) * TILE_K + t] hit different banks.
+        // ---- Read column t from shmem (SWIZZLE_128B inverse) ----
+        // TMA stores with XOR swizzle: physical_byte = logical_byte ^ ((row & 7) << 4).
+        // For bf16 (2B): physical_element = logical_element ^ ((m & 7) << 3).
+        // To read logical column t at row m, index with the inverse transform.
         float vals[TILE_M];
         float local_amax = 0.0f;
         #pragma unroll
         for (int m = 0; m < TILE_M; m++) {
-            float v = __bfloat162float(in_sh[m * TILE_K + t]);
+            const int swizzled_t = t ^ ((m & 7) << 3);
+            float v = __bfloat162float(in_sh[m * TILE_K + swizzled_t]);
             vals[m] = v;
             if ((m_offset + m) < m_g)
                 local_amax = fmaxf(local_amax, fabsf(v));
@@ -165,9 +170,9 @@ mxfp8_group_transpose_quantize_kernel(
         const float   scale_fp  = (e8m0_val == 0u) ? 1.0f : mxfp8t_e8m0_to_scale(e8m0_val);
         const float   inv_scale = (scale_fp == 0.0f) ? 0.0f : 1.0f / scale_fp;
 
-        // ---- Write 32 FP8 bytes to transposed output [K, total_M] ----
+        // ---- Write 32 FP8 bytes to per-group transposed output ----
         constexpr float clamp_v = 448.0f;
-        const int64_t out_base  = (int64_t)global_k * total_M + (group_row0 + m_offset);
+        const int64_t out_base  = data_offsets[group_id] + (int64_t)global_k * m_g + m_offset;
         #pragma unroll
         for (int m = 0; m < TILE_M; m++) {
             if ((m_offset + m) < m_g) {
@@ -210,6 +215,7 @@ static void launch_mxfp8_group_transpose_quantize(
     int                total_M,
     const int32_t*     row_offsets_gpu,
     const int64_t*     sf_offsets_gpu,
+    const int64_t*     data_offsets_gpu,
     const int32_t*     row_offsets_host,
     const at::Tensor&  inp_tensor,       // needed for create_2D_tensor_map
     cudaStream_t       stream)
@@ -259,8 +265,8 @@ static void launch_mxfp8_group_transpose_quantize(
 
     mxfp8_group_transpose_quantize_kernel<<<total_ctas, TILE_K, smem_bytes, stream>>>(
         y_T_ptr, sf_ptr, tensor_map_in,
-        d_cta_offsets, row_offsets_gpu, sf_offsets_gpu,
-        K, n_k_tiles, num_groups, total_M);
+        d_cta_offsets, row_offsets_gpu, sf_offsets_gpu, data_offsets_gpu,
+        K, n_k_tiles, num_groups);
 
     CUDA_CHECK(cudaFreeAsync(d_cta_offsets, stream));
     CUDA_CHECK(cudaGetLastError());
@@ -271,11 +277,12 @@ static void launch_mxfp8_group_transpose_quantize(
 // ---------------------------------------------------------------------------
 
 void mxfp8_grouped_transpose_quantize_binding(
-    at::Tensor&       out_T,        // [K, total_M]  uint8
+    at::Tensor&       out_T,        // flat uint8, size = K * total_M
     at::Tensor&       sf,           // flat E8M0 buffer  uint8
     const at::Tensor& inp,          // [total_M, K]  bfloat16
     const at::Tensor& row_offsets,  // [num_groups+1]  int32  GPU
-    const at::Tensor& sf_offsets)   // [num_groups+1]  int64  GPU
+    const at::Tensor& sf_offsets,   // [num_groups+1]  int64  GPU
+    const at::Tensor& data_offsets) // [num_groups+1]  int64  GPU
 {
     TORCH_CHECK(inp.dtype()  == at::kBFloat16, "inp must be bfloat16");
     TORCH_CHECK(inp.is_cuda(),                 "inp must be CUDA");
@@ -285,6 +292,7 @@ void mxfp8_grouped_transpose_quantize_binding(
     TORCH_CHECK(inp.size(0) % TILE_M == 0,     "total_M must be divisible by TILE_M(32)");
     TORCH_CHECK(row_offsets.dtype() == at::kInt,  "row_offsets must be int32");
     TORCH_CHECK(sf_offsets.dtype()  == at::kLong, "sf_offsets must be int64");
+    TORCH_CHECK(data_offsets.dtype() == at::kLong, "data_offsets must be int64");
 
     const int num_groups = static_cast<int>(row_offsets.numel()) - 1;
     const int total_M    = static_cast<int>(inp.size(0));
@@ -304,6 +312,7 @@ void mxfp8_grouped_transpose_quantize_binding(
         num_groups, K, total_M,
         reinterpret_cast<const int32_t*>(row_offsets.data_ptr()),
         reinterpret_cast<const int64_t*>(sf_offsets.data_ptr()),
+        reinterpret_cast<const int64_t*>(data_offsets.data_ptr()),
         h_row_off,
         inp,
         stream);

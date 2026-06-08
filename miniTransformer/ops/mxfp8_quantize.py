@@ -229,50 +229,55 @@ def mxfp8_grouped_quantize_chunked_hw(
 
 def mxfp8_grouped_transpose_quantize(
     inp: torch.Tensor,
-    m_splits,               # List[int] 或 GPU int tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n: int,
+    num_groups: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Colwise (transpose) grouped MXFP8 quantization.
+    Colwise (transpose) grouped MXFP8 quantization for weight tensors.
 
-    Produces a transposed output [K, total_M] FP8 E4M3 with E8M0 scale
-    factors in SfKMajorAtom layout for the [K, m_g] per-group view.
+    Input: [num_groups * n, K] bf16 (all groups stacked, each group has n rows).
+    Output: per-group [K, n] stacked contiguously → returned as [ng*K, n] uint8.
+
+    Args:
+        inp        : [num_groups * n, K] bf16 contiguous
+        n          : per-group row count (= out_features, uniform across groups)
+        num_groups : number of groups
 
     Returns:
-        out_T       : [K, total_M]  uint8  (FP8 E4M3, transposed)
-        sf          : flat uint8 tensor, swizzled E8M0 scale factors
-        row_offsets : [G+1] int32 GPU, group row boundaries (into total_M axis)
-        sf_offsets  : [G+1] int64 GPU, group SF element offsets
+        out_T      : [ng*K, n] uint8 (FP8 E4M3), per-group [K, n] stacked
+        sf         : flat uint8, swizzled E8M0 scale factors
+        sf_offsets : [ng+1] int64 GPU, group SF element offsets
     """
     assert inp.is_cuda and inp.dtype == torch.bfloat16
     assert inp.is_contiguous()
     total_M, K = inp.shape
+    assert total_M == num_groups * n
     assert K % 64 == 0, "K must be divisible by 64 (TMA TILE_K)"
-    assert total_M % 32 == 0, "total_M must be divisible by 32 (TILE_M)"
+    assert n % 32 == 0, "n must be divisible by 32 (TILE_M)"
 
-    if isinstance(m_splits, (list, tuple)):
-        m_splits_t = torch.tensor(m_splits, dtype=torch.int64, device=inp.device)
-    else:
-        m_splits_t = m_splits.to(dtype=torch.int64, device=inp.device)
+    # row_offsets: uniform [0, n, 2n, ..., ng*n]
+    row_offsets = torch.arange(
+        0, (num_groups + 1) * n, n, dtype=torch.int32, device=inp.device
+    )
 
-    num_groups = int(m_splits_t.numel())
+    # sf_offsets: all groups have same SF size
+    m_k_groups = (n + 31) // 32
+    sf_per_group = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
+    sf_offsets = torch.arange(
+        0, (num_groups + 1) * sf_per_group, sf_per_group, dtype=torch.int64, device=inp.device
+    )
 
-    # row_offsets: prefix sum of m_splits
-    row_offsets = torch.empty(num_groups + 1, dtype=torch.int32, device=inp.device)
-    row_offsets[0] = 0
-    row_offsets[1:] = torch.cumsum(m_splits_t.int(), dim=0)
+    # data_offsets: uniform [0, K*n, 2*K*n, ..., ng*K*n]
+    data_per_group = K * n
+    data_offsets = torch.arange(
+        0, (num_groups + 1) * data_per_group, data_per_group, dtype=torch.int64, device=inp.device
+    )
 
-    # sf_offsets: prefix sum of per-group SF sizes (vectorized, no Python loop)
-    m_k_groups = (m_splits_t + 31) // 32
-    sf_sizes   = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
-    sf_offsets = torch.empty(num_groups + 1, dtype=torch.int64, device=inp.device)
-    sf_offsets[0] = 0
-    sf_offsets[1:] = torch.cumsum(sf_sizes, dim=0)
-
-    total_sf = int(sf_offsets[-1].item())
-    out_T = torch.empty((K, total_M), dtype=torch.uint8, device=inp.device)
+    total_sf = num_groups * sf_per_group
+    out_T = torch.empty(num_groups * K * n, dtype=torch.uint8, device=inp.device)
     sf    = torch.zeros(total_sf, dtype=torch.uint8, device=inp.device)
 
-    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets)
+    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets, data_offsets)
 
-    return out_T, sf, row_offsets, sf_offsets
+    return out_T.view(num_groups * K, n), sf, sf_offsets
 

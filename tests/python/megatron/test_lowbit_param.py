@@ -4,6 +4,7 @@ import contextlib
 import gc
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -175,6 +176,17 @@ class TestFP8Param:
         **kwargs,
     ):
         """Test fp8_param with gpt_model."""
+        # Speed profiling config: controlled by env vars.
+        #   LOWBIT_WARMUP_STEPS  - steps before timing starts (default 5)
+        #   LOWBIT_BENCH_STEPS   - steps to time (default 10)
+        #   LOWBIT_PROFILE_STEPS - steps to capture torch.profiler trace (0 = disabled)
+        #   LOWBIT_PROFILE_DIR   - output dir for profiler traces (default /tmp/lowbit_profile)
+        warmup_steps = int(os.environ.get("LOWBIT_WARMUP_STEPS", 5))
+        bench_steps  = int(os.environ.get("LOWBIT_BENCH_STEPS", 10))
+        profile_steps = int(os.environ.get("LOWBIT_PROFILE_STEPS", 0))
+        profile_dir   = os.environ.get("LOWBIT_PROFILE_DIR", "/tmp/lowbit_profile")
+        total_steps = warmup_steps + bench_steps
+
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -243,60 +255,131 @@ class TestFP8Param:
 
         loss_list = []
 
-        for i in range(100):
-            if not inference:
-                gpt_model[0].zero_grad_buffer()
-                optimizer.zero_grad()
-
-            # Capture CUDA graphs after warmup if helper is provided.
-            # Hard coded cuda_graph_warmup_steps = 0.
-            cuda_graph_warmup_steps = 0
-            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                if should_disable_forward_pre_hook(args):
-                    disable_forward_pre_hook(gpt_model, param_sync=False)
-                cuda_graph_helper.create_cudagraphs()
-                if should_disable_forward_pre_hook(args):
-                    enable_forward_pre_hook(gpt_model)
-                    cuda_graph_helper.cuda_graph_set_manual_hooks()
-
-            # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-            # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-            # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                for optim_instance in optimizer.chained_optimizers:
-                    if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
-                        optim_instance._copy_main_params_to_param_buffer()
-
-            gpt_model[0].set_is_first_microbatch()
-            output = gpt_model[0].forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                loss_mask=loss_mask,
+        # Build profiler context: active only when profile_steps > 0.
+        if profile_steps > 0:
+            prof_ctx = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=warmup_steps,
+                    warmup=0,
+                    active=profile_steps,
+                    repeat=1,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
+                record_shapes=True,
+                with_stack=False,
             )
+        else:
+            prof_ctx = contextlib.nullcontext()
 
-            # Check output shapes
-            assert output.shape[0] == self.micro_batch_size
-            assert output.shape[1] == self.seq_length
+        step_times = []
 
-            if inference:
-                continue
+        with prof_ctx as prof:
+            for i in range(total_steps):
+                if not inference:
+                    gpt_model[0].zero_grad_buffer()
+                    optimizer.zero_grad()
 
-            # Verify gradients
-            loss = output.mean()
-            loss.backward()
+                # Capture CUDA graphs after warmup if helper is provided.
+                # Hard coded cuda_graph_warmup_steps = 0.
+                cuda_graph_warmup_steps = 0
+                if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                    if should_disable_forward_pre_hook(args):
+                        disable_forward_pre_hook(gpt_model, param_sync=False)
+                    cuda_graph_helper.create_cudagraphs()
+                    if should_disable_forward_pre_hook(args):
+                        enable_forward_pre_hook(gpt_model)
+                        cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-            if args.overlap_grad_reduce:
-                gpt_model[0].finish_grad_sync()
+                # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+                # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+                # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+                if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                    for optim_instance in optimizer.chained_optimizers:
+                        if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                            optim_instance._copy_main_params_to_param_buffer()
 
-            for name, param in gpt_model[0].named_parameters():
-                assert param.main_grad is not None
+                gpt_model[0].set_is_first_microbatch()
 
-            update_successful, _, _ = optimizer.step()
-            assert update_successful
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
 
-            loss_list.append(loss.item())
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                )
+
+                # Check output shapes
+                assert output.shape[0] == self.micro_batch_size
+                assert output.shape[1] == self.seq_length
+
+                if inference:
+                    torch.cuda.synchronize()
+                    step_times.append(time.perf_counter() - t0)
+                    if prof is not None:
+                        prof.step()
+                    continue
+
+                # Compute masked cross-entropy loss (same as pretrain_gpt.py loss_func)
+                losses = output.view(-1).float()
+                loss_mask_flat = loss_mask.view(-1).float()
+                loss = torch.sum(losses * loss_mask_flat) / loss_mask_flat.sum()
+
+                # Precision check: loss must be finite
+                assert torch.isfinite(loss), f"loss is not finite at step {i}: {loss.item()}"
+
+                loss.backward()
+
+                if args.overlap_grad_reduce:
+                    gpt_model[0].finish_grad_sync()
+
+                # Precision check: gradients must be finite
+                for name, param in gpt_model[0].named_parameters():
+                    assert param.main_grad is not None
+                    assert torch.isfinite(param.main_grad).all(), \
+                        f"non-finite grad in {name} at step {i}"
+
+                update_successful, _, _ = optimizer.step()
+                assert update_successful
+
+                torch.cuda.synchronize()
+                step_times.append(time.perf_counter() - t0)
+
+                loss_list.append(loss.item())
+
+                if prof is not None:
+                    prof.step()
+
+        # ── Speed report ──────────────────────────────────────────────────────
+        if step_times:
+            bench_times = step_times[warmup_steps:]
+            if bench_times:
+                avg_ms  = sum(bench_times) / len(bench_times) * 1e3
+                min_ms  = min(bench_times) * 1e3
+                max_ms  = max(bench_times) * 1e3
+                print(
+                    f"\n[speed] recipe={recipe} tp={tp_size} "
+                    f"seq={self.seq_length} bs={self.micro_batch_size} "
+                    f"| avg={avg_ms:.1f}ms  min={min_ms:.1f}ms  max={max_ms:.1f}ms "
+                    f"over {len(bench_times)} steps"
+                )
+
+        # ── Precision report ──────────────────────────────────────────────────
+        if loss_list and not inference:
+            first, last = loss_list[0], loss_list[-1]
+            print(
+                f"[precision] loss: first={first:.4f}  last={last:.4f}  "
+                f"delta={last - first:+.4f}"
+            )
+            # Loss should decrease (or at least not diverge) over the run.
+            assert last < first * 2, \
+                f"loss diverged: first={first:.4f} last={last:.4f}"
 
         return torch.tensor(loss_list)
 

@@ -26,6 +26,35 @@ if ROOT_DIR not in sys.path:
 pytest.importorskip("fp4_gemm")
 
 from miniTransformer.ops.mxfp8_quantize import mxfp8_grouped_transpose_quantize
+import fp4_gemm
+
+
+def _mxfp8_grouped_transpose_quantize_raw(inp, m_splits):
+    """Raw wrapper supporting unequal m_splits (for kernel testing)."""
+    total_M, K = inp.shape
+    if isinstance(m_splits, (list, tuple)):
+        m_splits_t = torch.tensor(m_splits, dtype=torch.int64, device=inp.device)
+    else:
+        m_splits_t = m_splits.to(dtype=torch.int64, device=inp.device)
+    num_groups = int(m_splits_t.numel())
+    row_offsets = torch.empty(num_groups + 1, dtype=torch.int32, device=inp.device)
+    row_offsets[0] = 0
+    row_offsets[1:] = torch.cumsum(m_splits_t.int(), dim=0)
+    m_k_groups = (m_splits_t + 31) // 32
+    sf_sizes = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
+    sf_offsets = torch.empty(num_groups + 1, dtype=torch.int64, device=inp.device)
+    sf_offsets[0] = 0
+    sf_offsets[1:] = torch.cumsum(sf_sizes, dim=0)
+    data_sizes = K * m_splits_t
+    data_offsets = torch.empty(num_groups + 1, dtype=torch.int64, device=inp.device)
+    data_offsets[0] = 0
+    data_offsets[1:] = torch.cumsum(data_sizes, dim=0)
+    total_sf = int(sf_offsets[-1].item())
+    total_data = int(data_offsets[-1].item())
+    out_T = torch.empty(total_data, dtype=torch.uint8, device=inp.device)
+    sf = torch.zeros(total_sf, dtype=torch.uint8, device=inp.device)
+    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets, data_offsets)
+    return out_T, sf, row_offsets, sf_offsets
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +178,7 @@ def _run(m_splits: List[int], K: int, seed: int = 42):
     total_M = sum(m_splits)
     inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
-    out_T, out_sf, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
+    out_T, out_sf, _, _ = _mxfp8_grouped_transpose_quantize_raw(inp, m_splits)
     torch.cuda.synchronize()
 
     ref_T, ref_sf, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -215,7 +244,7 @@ class TestMxFP8GroupedTransposeQuantize:
         inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
         m_splits_gpu = torch.tensor(m_splits, dtype=torch.int64, device="cuda")
-        out_T, _, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits_gpu)
+        out_T, _, _, _ = _mxfp8_grouped_transpose_quantize_raw(inp, m_splits_gpu)
         torch.cuda.synchronize()
 
         ref_T, ref_sf, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -229,7 +258,7 @@ class TestMxFP8GroupedTransposeQuantize:
         total_M = 64
         inp = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
 
-        out_T, _, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
+        out_T, _, _, _ = _mxfp8_grouped_transpose_quantize_raw(inp, m_splits)
         torch.cuda.synchronize()
 
         ref_T, _, _, _ = _reference_transpose_quantize(inp, m_splits)
@@ -243,7 +272,7 @@ class TestMxFP8GroupedTransposeQuantize:
         total_M = 64
         inp = torch.zeros(total_M, K, dtype=torch.bfloat16).cuda()
 
-        out_T, out_sf, _, _ = mxfp8_grouped_transpose_quantize(inp, m_splits)
+        out_T, out_sf, _, _ = _mxfp8_grouped_transpose_quantize_raw(inp, m_splits)
         torch.cuda.synchronize()
 
         assert torch.all(out_T.cpu() == 0), "Zero input should produce zero FP8"

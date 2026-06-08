@@ -55,7 +55,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &mxfp8_grouped_transpose_quantize_binding,
           pybind11::arg("out_T"), pybind11::arg("sf"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("sf_offsets"),
-          "MXFP8 grouped colwise (transpose) quantization (BF16→[K,M] FP8 E4M3 + E8M0 SF)");
+          pybind11::arg("data_offsets"),
+          "MXFP8 grouped colwise (transpose) quantization, per-group stacked (BF16→[K,M] FP8 E4M3 + E8M0 SF)");
     m.def("mxfp8_grouped_quantize_chunked",
           &mxfp8_grouped_quantize_chunked_binding,
           pybind11::arg("out"), pybind11::arg("sf"),

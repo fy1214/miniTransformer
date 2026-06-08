@@ -134,7 +134,8 @@ void mxfp8_grouped_transpose_quantize_binding(
     at::Tensor&       sf,
     const at::Tensor& inp,
     const at::Tensor& row_offsets,
-    const at::Tensor& sf_offsets
+    const at::Tensor& sf_offsets,
+    const at::Tensor& data_offsets
 );
 
 // MXFP8 grouped quantization (rowwise) — per-CTA-chunk scheduling.

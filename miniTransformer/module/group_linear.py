@@ -190,6 +190,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 ctx.qw_t  = qw_t
                 ctx.sw_t  = sw_t
                 ctx.tw_t  = tw_t
+                ctx.w_extra_info = qresult_w_list.extra_info
                 ctx.x_bf16_list = None
             ctx.save_for_backward(*weights)
 
@@ -279,7 +280,9 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                     m_splits=ctx.m_splits,
                     grad=True,
                     qparams_x=ctx.qlinear_params.g_params,
-                    qparams_w=ctx.qlinear_params.w_params
+                    qparams_w=ctx.qlinear_params.w_params,
+                    extra_info_A=qresult_dy_list.extra_info,
+                    extra_info_B=ctx.w_extra_info,
                 )
 
         # AllReduce for TP

@@ -267,6 +267,28 @@ void four_six_fp4_group_pertoken_binding(
     float scale_override
 );
 
+// Legacy per-row scheduler (bench only — production path uses the chunked
+// scheduler exposed via the names above).
+void rtn_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override
+);
+
+void four_six_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override
+);
+
 void rtn_fp4_group_pertoken_pad_fuse_binding(
     at::Tensor& out,
     at::Tensor& scales,

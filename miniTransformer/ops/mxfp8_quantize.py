@@ -255,29 +255,19 @@ def mxfp8_grouped_transpose_quantize(
     assert K % 64 == 0, "K must be divisible by 64 (TMA TILE_K)"
     assert n % 32 == 0, "n must be divisible by 32 (TILE_M)"
 
-    # row_offsets: uniform [0, n, 2n, ..., ng*n]
-    row_offsets = torch.arange(
-        0, (num_groups + 1) * n, n, dtype=torch.int32, device=inp.device
-    )
-
-    # sf_offsets: all groups have same SF size
+    # SF offsets computed here for the caller (GEMM needs them), but not
+    # passed to the kernel — V2 kernel derives everything from scalars.
     m_k_groups = (n + 31) // 32
     sf_per_group = ((K + 127) // 128) * ((m_k_groups + 3) // 4) * 512
     sf_offsets = torch.arange(
         0, (num_groups + 1) * sf_per_group, sf_per_group, dtype=torch.int64, device=inp.device
     )
 
-    # data_offsets: uniform [0, K*n, 2*K*n, ..., ng*K*n]
-    data_per_group = K * n
-    data_offsets = torch.arange(
-        0, (num_groups + 1) * data_per_group, data_per_group, dtype=torch.int64, device=inp.device
-    )
-
     total_sf = num_groups * sf_per_group
     out_T = torch.empty(num_groups * K * n, dtype=torch.uint8, device=inp.device)
     sf    = torch.zeros(total_sf, dtype=torch.uint8, device=inp.device)
 
-    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, row_offsets, sf_offsets, data_offsets)
+    fp4_gemm.mxfp8_grouped_transpose_quantize(out_T, sf, inp, n, num_groups)
 
     return out_T.view(num_groups * K, n), sf, sf_offsets
 

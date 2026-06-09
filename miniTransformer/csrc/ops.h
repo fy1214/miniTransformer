@@ -129,13 +129,13 @@ void mxfp8_grouped_quantize_hw_binding(
 );
 
 // MXFP8 grouped transpose quantization (colwise: output is [K, total_M])
+// V2: uniform groups only — no GPU offset arrays, all offsets from scalars.
 void mxfp8_grouped_transpose_quantize_binding(
     at::Tensor&       out_T,
     at::Tensor&       sf,
     const at::Tensor& inp,
-    const at::Tensor& row_offsets,
-    const at::Tensor& sf_offsets,
-    const at::Tensor& data_offsets
+    int               m_per_group,
+    int               num_groups
 );
 
 // MXFP8 grouped quantization (rowwise) — per-CTA-chunk scheduling.

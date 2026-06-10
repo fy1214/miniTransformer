@@ -613,8 +613,8 @@ def grouped_gemm_cutedsl_pertoken(
             if NO_CACHE or _ab_key not in _alpha_b_buf_cache:
                 _alpha_b_buf_cache[_ab_key] = torch.empty(num_active, dtype=torch.float32, device=device)
             alpha_b_vec = _alpha_b_buf_cache[_ab_key]
-            alpha_b_vec.copy_(torch.tensor(alpha_b_per_group, dtype=torch.float32))
-        repeats = torch.tensor([ps[0] for ps in problem_sizes], dtype=torch.int64, device=device)
+            alpha_b_vec.copy_(torch.tensor(alpha_b_per_group, dtype=torch.float32).pin_memory(), non_blocking=True)
+        repeats = torch.tensor([ps[0] for ps in problem_sizes], dtype=torch.int64).pin_memory().to(device, non_blocking=True)
         alphas_packed = global_scales * alpha_b_vec.repeat_interleave(repeats)
 
         if _timing_enabled:

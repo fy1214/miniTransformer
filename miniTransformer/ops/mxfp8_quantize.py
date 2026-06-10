@@ -58,8 +58,11 @@ def _get_offsets(m_splits, K, device):
     """Dispatch to CPU or GPU offset computation based on m_splits type."""
     if isinstance(m_splits, (list, tuple)):
         row_off, sf_off, total_sf = _compute_offsets_cpu(m_splits, K)
-        row_offsets = torch.tensor(row_off, dtype=torch.int32, device=device)
-        sf_offsets  = torch.tensor(sf_off,  dtype=torch.int64, device=device)
+        # pin_memory + non_blocking avoids implicit cudaDeviceSynchronize
+        # that pageable H2D copy triggers (was causing 600-800ms stalls
+        # when GPU pipeline is backed up with NCCL / checkpoint recompute).
+        row_offsets = torch.tensor(row_off, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
+        sf_offsets  = torch.tensor(sf_off,  dtype=torch.int64).pin_memory().to(device, non_blocking=True)
         return row_offsets, sf_offsets, total_sf
     else:
         m_splits_t = m_splits.to(dtype=torch.int64, device=device)

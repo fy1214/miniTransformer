@@ -452,32 +452,31 @@ def group_quantize_nvfp4_pertoken_swizzled(
             unpadded_row_offsets_gpu=empty_off.clone() if fuse_pad else None,
         )
 
-    # Padded per-group counts (only differ from m_splits when fuse_pad=True and
-    # some m_i is not 128-aligned).
-    m_splits_t = torch.tensor(m_splits, dtype=torch.int32, device=device)
-    m_padded_t = ((m_splits_t + (_MMA_TILE_ROWS - 1)) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS
+    # Compute all offsets on CPU to avoid implicit cudaDeviceSynchronize from
+    # pageable H2D copies (torch.tensor(list, device='cuda')) and GPU-side
+    # cumsum/cat of tiny tensors.  Upload once via pin_memory + non_blocking.
+    T = _MMA_TILE_ROWS
+    m_padded = [((m + T - 1) // T) * T for m in m_splits]
 
-    scale_flat_size = sum(
-        ((m_i + _MMA_TILE_ROWS - 1) // _MMA_TILE_ROWS) * _MMA_TILE_ROWS * (k // 16)
-        for m_i in m_splits
-    )
+    scale_flat_size = sum(mp * (k // 16) for mp in m_padded)
     scale_flat = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
-    scale_offsets_gpu = torch.cat([
-        torch.zeros(1, dtype=torch.int64, device=device),
-        torch.cumsum(m_padded_t.to(torch.int64) * (k // 16), dim=0),
-    ])
+
+    # scale_offsets: cumsum of m_padded[i] * (k // 16)
+    so = [0]
+    for mp in m_padded:
+        so.append(so[-1] + mp * (k // 16))
+    scale_offsets_gpu = torch.tensor(so, dtype=torch.int64).pin_memory().to(device, non_blocking=True)
 
     if fuse_pad:
         # Unpadded offsets index into x; padded offsets index into data / gs.
-        unpadded_row_offsets_gpu = torch.cat([
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(m_splits_t, dim=0).to(torch.int32),
-        ])
-        padded_row_offsets_gpu = torch.cat([
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(m_padded_t, dim=0).to(torch.int32),
-        ])
-        padded_total = int(padded_row_offsets_gpu[-1].item())
+        uo = [0]
+        po = [0]
+        for m, mp in zip(m_splits, m_padded):
+            uo.append(uo[-1] + m)
+            po.append(po[-1] + mp)
+        unpadded_row_offsets_gpu = torch.tensor(uo, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
+        padded_row_offsets_gpu  = torch.tensor(po, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
+        padded_total = po[-1]
         data         = torch.empty((padded_total, k // 2), dtype=nvfp4_output_t, device=device)
         global_scale = torch.empty(padded_total, dtype=torch.float32, device=device)
 
@@ -497,18 +496,16 @@ def group_quantize_nvfp4_pertoken_swizzled(
         )
 
     # Legacy path: x already matches m_splits row-for-row (no fused padding).
-    # The chunked scheduler requires every group's M to be 128-aligned so each
-    # CHUNK_M=128 tile falls inside one group; upstream callers pad to 128.
-    assert all(m % _MMA_TILE_ROWS == 0 for m in m_splits), (
+    assert all(m % T == 0 for m in m_splits), (
         f"group_quantize_nvfp4_pertoken_swizzled (fuse_pad=False): each m in "
-        f"m_splits must be a multiple of {_MMA_TILE_ROWS}; got {m_splits}"
+        f"m_splits must be a multiple of {T}; got {m_splits}"
     )
     data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
-    row_offsets_gpu = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.cumsum(m_splits_t, dim=0).to(torch.int32),
-    ])
+    ro = [0]
+    for m in m_splits:
+        ro.append(ro[-1] + m)
+    row_offsets_gpu = torch.tensor(ro, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
 
     fn = fp4_gemm.four_six_fp4_group_pertoken if four_six else fp4_gemm.rtn_fp4_group_pertoken
     fn(data, scale_flat, global_scale, x, row_offsets_gpu, scale_offsets_gpu, scale_override)

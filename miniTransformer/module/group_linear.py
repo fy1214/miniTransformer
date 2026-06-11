@@ -79,6 +79,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
 
         update_fp8_weights = (is_first_microbatch or (is_first_microbatch is None))
+        if (not update_fp8_weights
+            and is_grad_enabled
+            and not disable_backward_quant
+            and not quantize_op.should_update_quantize_weights):
+            cached_dt = weight_qresult_cache.data_t
+            if cached_dt is None or (isinstance(cached_dt, list) and len(cached_dt) == 0):
+                update_fp8_weights = True
 
         if quantize_op.should_update_quantize_weights:
             w = torch.stack(weights, dim=0)  # [num_gemms, n, k]

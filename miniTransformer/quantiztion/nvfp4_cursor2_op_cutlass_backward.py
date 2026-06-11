@@ -207,13 +207,14 @@ class Nvfp4Cursor2CutlassBackwardQuantizeOp(quantization.QuantizeOpBase):
             else:
                 extra_info_t = None
 
+            wt_sentinel = [gw] if return_transpose else []
             return GroupQuantizeResult(
                 data=[gw],
-                data_t=[],
+                data_t=wt_sentinel,
                 scale=[gw],
-                scale_t=[],
+                scale_t=wt_sentinel,
                 tensor_scale=[gw],
-                tensor_scale_t=[],
+                tensor_scale_t=wt_sentinel,
                 extra_info={
                     "data":          gw.data,
                     "scale_flat":    gw.scale_flat,

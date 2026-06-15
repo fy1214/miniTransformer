@@ -346,7 +346,8 @@ void rtn_fp4_group_tensor_global_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     const at::Tensor& amax,
-    float scale_override
+    float scale_override,
+    bool swizzle
 );
 
 void four_six_fp4_group_tensor_global_binding(
@@ -357,7 +358,8 @@ void four_six_fp4_group_tensor_global_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     const at::Tensor& amax,
-    float scale_override
+    float scale_override,
+    bool swizzle
 );
 
 void eden_fp4_binding(

@@ -123,12 +123,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
           pybind11::arg("amax"), pybind11::arg("scale_override"),
-          "RTN FP4 grouped tensor-global quantization with per-group swizzled SF layout (CUDA)");
+          pybind11::arg("swizzle") = true,
+          "RTN FP4 grouped tensor-global quantization. swizzle=True writes tcgen05-swizzled "
+          "SF (default, consumed by CuTeDSL grouped GEMM); swizzle=False writes row-major "
+          "SF [rows_padded, cols/16] (used by slime weight-update path).");
     m.def("four_six_fp4_group_tensor_global", &four_six_fp4_group_tensor_global_binding,
           pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
           pybind11::arg("inp"), pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
           pybind11::arg("amax"), pybind11::arg("scale_override"),
-          "Round-4-or-6 FP4 grouped tensor-global quantization with per-group swizzled SF layout (CUDA)");
+          pybind11::arg("swizzle") = true,
+          "Round-4-or-6 FP4 grouped tensor-global quantization. swizzle=True is tcgen05-swizzled "
+          "(default); swizzle=False is row-major SF [rows_padded, cols/16].");
     m.def("eden_fp4", &eden_fp4_binding, "Eden FP4 quantization (CUDA)");
     m.def("group_transform_128_eden", &group_transform_128_eden_binding, "Group Transform 128 Eden (CUDA)");
     m.def("dequant_tp_had_quant", &dequant_tp_had_quant_binding, "Dequant TP Had Quant (CUDA)");

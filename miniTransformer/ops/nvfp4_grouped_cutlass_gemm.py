@@ -259,3 +259,64 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
         inputs.prob_host, workspace, pts_eff,
     )
     return D
+
+
+# ---------------------------------------------------------------------------
+# v2_evt: EVT-fused per-token scale (Phase 1 of doc/fp4_quant_gemm_fuse_phase2.md)
+#
+# Identical to v2 above, but the post-GEMM per_token_scale multiply is folded
+# into the CUTLASS epilogue via Sm90ColBroadcast (PtrArray flavor).  The math
+# is *not* bit-identical to v2: v2 does `bf16(acc) * bf16(scale)`, v2_evt does
+# `bf16(acc_fp32 * scale_fp32)` — the fused FP32 multiply is strictly higher
+# SNR (acc→bf16 cast happens after the multiply).
+# ---------------------------------------------------------------------------
+
+# Separate buffer cache: EVT needs 7 ptrs/group (extra Scale slot) so buf_ptrs
+# is sized differently — sharing the v2 cache would either over- or under-size.
+_v2_evt_buf_cache: dict = {}
+
+
+def _get_v2_evt_buffers(max_groups: int, device):
+    key = (max_groups, str(device))
+    if key not in _v2_evt_buf_cache:
+        ptrs_b, strides_b, layouts_b = fp4_gemm.grouped_cutlass_gemm_v2_evt_buffer_sizes(max_groups)
+        _v2_evt_buf_cache[key] = (
+            torch.empty(ptrs_b,          dtype=torch.uint8, device=device),
+            torch.empty(strides_b,       dtype=torch.uint8, device=device),
+            torch.empty(layouts_b,       dtype=torch.uint8, device=device),
+            torch.empty(max_groups * 3,  dtype=torch.int32, device=device),
+            torch.empty(4 * 1024 * 1024, dtype=torch.uint8, device=device),
+        )
+    return _v2_evt_buf_cache[key]
+
+
+def grouped_cutlass_gemm_v2_evt(inputs: V2GemmInputs, out_dtype: torch.dtype) -> torch.Tensor:
+    """CUTLASS SM100 grouped FP4 GEMM with EVT-fused per-token output scale."""
+    ng      = inputs.a_rows.shape[0] - 1
+    device  = inputs.act_data.device
+    total_m = inputs.act_data.shape[0]
+    n       = inputs.wgt_data.shape[0] // ng
+
+    group_sizes = inputs.a_rows[1:] - inputs.a_rows[:-1]
+    ts_b    = torch.repeat_interleave(
+        inputs.wgt_ts,
+        group_sizes,
+        output_size=total_m,
+    )
+    pts_eff = (inputs.act_ts * ts_b).contiguous()
+
+    D = torch.empty(total_m, n, dtype=out_dtype, device=device)
+
+    buf_ptrs, buf_strides, buf_layouts, buf_psizes, workspace = _get_v2_evt_buffers(ng, device)
+
+    fp4_gemm.grouped_cutlass_gemm_v2_evt(
+        D,
+        inputs.act_data, inputs.wgt_data,
+        inputs.act_sf,   inputs.wgt_sf,
+        inputs.a_rows,   inputs.b_rows,
+        inputs.a_sf_offsets, inputs.b_sf_offsets,
+        ng,
+        buf_ptrs, buf_strides, buf_layouts, buf_psizes,
+        inputs.prob_host, workspace, pts_eff,
+    )
+    return D

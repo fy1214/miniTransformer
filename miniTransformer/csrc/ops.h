@@ -86,6 +86,32 @@ void grouped_cutlass_gemm_v2(
     const at::Tensor& per_token_scale
 );
 
+// EVT-fused variant of grouped_cutlass_gemm_v2: per-token scale multiply
+// folded into the CUTLASS epilogue via Sm90ColBroadcast.  When per_token_scale
+// is undefined/empty, the ColBroadcast EnableNullptr path falls back to a unit
+// scale (so this entry point also serves the no-scale case).
+std::vector<int64_t> grouped_cutlass_gemm_v2_evt_buffer_sizes(int max_groups);
+
+void grouped_cutlass_gemm_v2_evt(
+    at::Tensor&       D,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& A_sf,
+    const at::Tensor& B_sf,
+    const at::Tensor& a_row_offsets,
+    const at::Tensor& b_row_offsets,
+    const at::Tensor& a_sf_offsets,
+    const at::Tensor& b_sf_offsets,
+    int               num_groups,
+    at::Tensor&       buf_ptrs,
+    at::Tensor&       buf_strides,
+    at::Tensor&       buf_layouts,
+    at::Tensor&       buf_problem_sizes_dev,
+    const at::Tensor& problem_sizes_host,
+    at::Tensor&       workspace,
+    const at::Tensor& per_token_scale
+);
+
 std::vector<int64_t> mxfp8_grouped_gemm_buffer_sizes(int max_groups);
 
 void mxfp8_grouped_gemm(

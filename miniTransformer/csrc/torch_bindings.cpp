@@ -35,6 +35,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_cutlass_gemm_v2",
           &grouped_cutlass_gemm_v2,
           "FP4 grouped GEMM v2: zero-overhead, pre-allocated buffers (CUDA)");
+    m.def("grouped_cutlass_gemm_v2_evt_buffer_sizes",
+          &grouped_cutlass_gemm_v2_evt_buffer_sizes,
+          "Return (ptrs_bytes, strides_bytes, layouts_bytes) for EVT-fused v2 pre-allocation (7 ptrs/group)");
+    m.def("grouped_cutlass_gemm_v2_evt",
+          &grouped_cutlass_gemm_v2_evt,
+          "FP4 grouped GEMM v2 with EVT-fused per-token scale (CUDA)");
     m.def("mxfp8_grouped_gemm_buffer_sizes",
           &mxfp8_grouped_gemm_buffer_sizes,
           "Return (ptrs_bytes, strides_bytes, layouts_bytes) for MXFP8 grouped GEMM pre-allocation");

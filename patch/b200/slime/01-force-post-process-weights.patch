@@ -1,0 +1,20 @@
+diff --git a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+--- a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -173,9 +173,13 @@
+
+         # int4/fp4 post_process
+         if rank == 0:
+-            if (self.quantization_config and
+-                    (self.quantization_config["quant_method"] in ["compressed-tensors"]
+-                     or self.quantization_config.get("quant_algo") == "NVFP4")):
++            # miniTE-b200: force post_process_quantization=True so
++            # process_weights_after_loading is invoked unconditionally after every
++            # weight refresh (needed for nvfp4-expert-only checkpoints).
++            if True:
++            #if (self.quantization_config and
++            #        (self.quantization_config["quant_method"] in ["compressed-tensors"]
++            #         or self.quantization_config.get("quant_algo") == "NVFP4")):
+                 post_process_weights(
+                     restore_weights_before_load=False,
+                     post_process_quantization=True,

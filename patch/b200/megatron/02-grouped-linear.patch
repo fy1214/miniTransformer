@@ -1,0 +1,13 @@
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -1218,7 +1218,9 @@
+             
+         return x_out
+ 
+-    class TEGroupedLinear(te.pytorch.GroupedLinear):
++    from miniTransformer.module.group_linear import GroupedLinear
++
++    class TEGroupedLinear(GroupedLinear):
+         """
+         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
+ 

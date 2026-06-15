@@ -305,7 +305,7 @@ index a400747..507873c 100644
 +            torch.empty(strides_b, dtype=torch.uint8, device=device),
 +            torch.empty(layouts_b, dtype=torch.uint8, device=device),
 +            torch.empty(num_groups * 3, dtype=torch.int32, device=device),
-+            torch.empty(4 * 1024 * 1024, dtype=torch.uint8, device=device),
++            torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device),
 +        )
 +    return _v2_buf_cache[key]
 +

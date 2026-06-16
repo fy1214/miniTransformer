@@ -223,7 +223,7 @@ void cutlass_gemm(at::Tensor& D,
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void cutlass_gemm(
   at::Tensor& D,
@@ -233,7 +233,7 @@ void cutlass_gemm(
   const at::Tensor& B_sf,
   const at::Tensor& alpha
 ) {
-  NVTE_ERROR("cutlass_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("cutlass_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

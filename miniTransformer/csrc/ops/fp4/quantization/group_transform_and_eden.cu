@@ -381,7 +381,7 @@ void group_transform_128_eden_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void group_transform_128_eden_binding(
     at::Tensor& y,
@@ -393,7 +393,7 @@ void group_transform_128_eden_binding(
     at::Tensor& x,
     at::Tensor& seed,
     float fp4_max, float fp8_max, bool transpose) {
-  NVTE_ERROR("group_transform_128_eden_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("group_transform_128_eden_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

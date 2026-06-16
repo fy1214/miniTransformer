@@ -221,7 +221,7 @@ void cublas_gemm_impl(
   NVTE_CHECK(status != CUBLAS_STATUS_NOT_SUPPORTED,
              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
-  if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
+  if (returnedResults == 0) throw std::runtime_error("Unable to find any suitable algorithms");
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
@@ -476,7 +476,7 @@ void block_scaled_matmul_nvfp4(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void cublas_gemm(
   const at::Tensor A,
@@ -494,7 +494,7 @@ void cublas_gemm(
   const at::Tensor workspace_tensor,
   size_t workspace_size
 ) {
-  NVTE_ERROR("cublas_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("cublas_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void block_scaled_matmul_nvfp4(
@@ -509,7 +509,7 @@ void block_scaled_matmul_nvfp4(
     bool accumulate,
     const at::Tensor& workspace_tensor,
     size_t workspace_size) {
-  NVTE_ERROR("block_scaled_matmul_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("block_scaled_matmul_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

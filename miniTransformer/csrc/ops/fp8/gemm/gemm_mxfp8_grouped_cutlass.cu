@@ -411,10 +411,10 @@ void mxfp8_grouped_gemm(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 std::vector<int64_t> mxfp8_grouped_gemm_buffer_sizes(int max_groups) {
-    NVTE_ERROR("mxfp8_grouped_gemm_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+    throw std::runtime_error("mxfp8_grouped_gemm_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
     return {};
 }
 
@@ -436,7 +436,7 @@ void mxfp8_grouped_gemm(
     const at::Tensor&  problem_sizes_host,
     at::Tensor&        workspace,
     bool               use_2sm) {
-    NVTE_ERROR("mxfp8_grouped_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+    throw std::runtime_error("mxfp8_grouped_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

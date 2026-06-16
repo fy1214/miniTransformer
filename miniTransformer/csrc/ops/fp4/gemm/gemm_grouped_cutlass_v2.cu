@@ -465,10 +465,10 @@ void grouped_cutlass_gemm_v2(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 std::vector<int64_t> grouped_cutlass_gemm_v2_buffer_sizes(int max_groups) {
-  NVTE_ERROR("grouped_cutlass_gemm_v2_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("grouped_cutlass_gemm_v2_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
   return {};
 }
 
@@ -491,7 +491,7 @@ void grouped_cutlass_gemm_v2(
     at::Tensor&       workspace,
     const at::Tensor& per_token_scale
 ) {
-  NVTE_ERROR("grouped_cutlass_gemm_v2 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("grouped_cutlass_gemm_v2 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

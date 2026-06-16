@@ -295,7 +295,7 @@ void dequant_tp_had_quant_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void dequant_tp_had_quant_binding(
     at::Tensor& y,
@@ -309,7 +309,7 @@ void dequant_tp_had_quant_binding(
     at::Tensor& x_global_scale,
     at::Tensor& seed,
     float fp4_max, float fp8_max) {
-  NVTE_ERROR("dequant_tp_had_quant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("dequant_tp_had_quant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

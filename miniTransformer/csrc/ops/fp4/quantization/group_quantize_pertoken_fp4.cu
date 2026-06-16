@@ -1342,7 +1342,7 @@ void four_six_fp4_group_tensor_global_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void rtn_fp4_group_pertoken_binding(
     at::Tensor& out,
@@ -1352,7 +1352,7 @@ void rtn_fp4_group_pertoken_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("rtn_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rtn_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void four_six_fp4_group_pertoken_binding(
@@ -1363,7 +1363,7 @@ void four_six_fp4_group_pertoken_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("four_six_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("four_six_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void rtn_fp4_group_pertoken_legacy_per_row_binding(
@@ -1374,7 +1374,7 @@ void rtn_fp4_group_pertoken_legacy_per_row_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("rtn_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rtn_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void four_six_fp4_group_pertoken_legacy_per_row_binding(
@@ -1385,7 +1385,7 @@ void four_six_fp4_group_pertoken_legacy_per_row_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("four_six_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("four_six_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void rtn_fp4_group_pertoken_pad_fuse_binding(
@@ -1397,7 +1397,7 @@ void rtn_fp4_group_pertoken_pad_fuse_binding(
     const at::Tensor& unpadded_row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("rtn_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rtn_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void four_six_fp4_group_pertoken_pad_fuse_binding(
@@ -1409,7 +1409,7 @@ void four_six_fp4_group_pertoken_pad_fuse_binding(
     const at::Tensor& unpadded_row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  NVTE_ERROR("four_six_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("four_six_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void rtn_fp4_group_tensor_global_binding(
@@ -1422,7 +1422,7 @@ void rtn_fp4_group_tensor_global_binding(
     const at::Tensor& amax,
     float scale_override,
     bool swizzle) {
-  NVTE_ERROR("rtn_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rtn_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void four_six_fp4_group_tensor_global_binding(
@@ -1435,7 +1435,7 @@ void four_six_fp4_group_tensor_global_binding(
     const at::Tensor& amax,
     float scale_override,
     bool swizzle) {
-  NVTE_ERROR("four_six_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("four_six_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

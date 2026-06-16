@@ -352,7 +352,7 @@ void rht128_requant_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void rht128_requant_binding(
     at::Tensor& y,
@@ -366,7 +366,7 @@ void rht128_requant_binding(
     at::Tensor& x_global_scale,
     at::Tensor& seed,
     float fp4_max, float fp8_max) {
-  NVTE_ERROR("rht128_requant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rht128_requant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

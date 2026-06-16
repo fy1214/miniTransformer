@@ -175,7 +175,7 @@ void rtn_fp4_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void four_six_fp4_binding(
     at::Tensor& out,
@@ -185,7 +185,7 @@ void four_six_fp4_binding(
     const at::Tensor& amax_ptr,
     float scale_override
 ) {
-  NVTE_ERROR("four_six_fp4_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("four_six_fp4_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 void rtn_fp4_binding(
@@ -196,7 +196,7 @@ void rtn_fp4_binding(
     const at::Tensor& amax_ptr,
     float scale_override
 ) {
-  NVTE_ERROR("rtn_fp4_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("rtn_fp4_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

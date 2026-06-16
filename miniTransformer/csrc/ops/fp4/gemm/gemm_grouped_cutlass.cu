@@ -287,7 +287,7 @@ void grouped_cutlass_gemm_with_per_token_scale(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void grouped_cutlass_gemm_with_per_token_scale(
     std::vector<at::Tensor>& D_list,
@@ -297,7 +297,7 @@ void grouped_cutlass_gemm_with_per_token_scale(
     const std::vector<at::Tensor>& B_sf_list,
     const std::vector<at::Tensor>& per_token_scale_list
 ) {
-  NVTE_ERROR("grouped_cutlass_gemm_with_per_token_scale requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  throw std::runtime_error("grouped_cutlass_gemm_with_per_token_scale requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

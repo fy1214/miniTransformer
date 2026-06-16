@@ -270,7 +270,7 @@ void mxfp8_grouped_transpose_quantize_binding(
 #else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
 
 #include "../../../ops.h"
-#include "../../../util/transformer_engine/logging.h"
+#include <stdexcept>
 
 void mxfp8_grouped_transpose_quantize_binding(
     at::Tensor&       out_T,
@@ -278,7 +278,7 @@ void mxfp8_grouped_transpose_quantize_binding(
     const at::Tensor& inp,
     int               m_per_group,
     int               num_groups) {
-    NVTE_ERROR("mxfp8_grouped_transpose_quantize_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+    throw std::runtime_error("mxfp8_grouped_transpose_quantize_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
 }
 
 #endif  // MINI_TE_NO_BLACKWELL_OPS

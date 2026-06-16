@@ -24,6 +24,8 @@
 //   mIdx = global_k,  kIdx = m_tile_within_group
 //   numKTiles = ceil(ceil(m_per_group/32) / 4)
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -264,3 +266,19 @@ void mxfp8_grouped_transpose_quantize_binding(
         num_groups, K, total_M, m_per_group,
         inp, stream);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+void mxfp8_grouped_transpose_quantize_binding(
+    at::Tensor&       out_T,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    int               m_per_group,
+    int               num_groups) {
+    NVTE_ERROR("mxfp8_grouped_transpose_quantize_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

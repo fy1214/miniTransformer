@@ -14,6 +14,8 @@
 //   Swizzle=true  : tcgen05 MMA swizzled layout via cvt_quant_to_fp4_get_sf_out_offset
 //   Swizzle=false : plain row-major layout  scale_ptr[row * (cols/16) + group_col]
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -259,3 +261,54 @@ void rtn_fp4_pertoken_linear_binding(
 {
     binding_impl(1, false, out, scales, global_scale, inp, amax_per_row, scale_override);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+void four_six_fp4_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
+    float scale_override)
+{
+    NVTE_ERROR("four_six_fp4_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
+    float scale_override)
+{
+    NVTE_ERROR("rtn_fp4_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_pertoken_linear_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
+    float scale_override)
+{
+    NVTE_ERROR("four_six_fp4_pertoken_linear_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_pertoken_linear_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_per_row,
+    float scale_override)
+{
+    NVTE_ERROR("rtn_fp4_pertoken_linear_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

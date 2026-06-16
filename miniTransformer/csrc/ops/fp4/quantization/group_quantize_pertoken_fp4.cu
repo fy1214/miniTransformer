@@ -27,6 +27,8 @@
 //   Each group g occupies  ceil(m_g/128)*128 * (cols/16)  elements (zero-padded to
 //   the nearest 128-row tile boundary so swizzle addresses never escape the buffer).
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -1336,3 +1338,104 @@ void four_six_fp4_group_tensor_global_binding(
         swizzle,
         at::cuda::getCurrentCUDAStream());
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+void rtn_fp4_group_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("rtn_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("four_six_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("rtn_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("four_six_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("rtn_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  NVTE_ERROR("four_six_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float scale_override,
+    bool swizzle) {
+  NVTE_ERROR("rtn_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float scale_override,
+    bool swizzle) {
+  NVTE_ERROR("four_six_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

@@ -4,6 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -470,4 +472,45 @@ void block_scaled_matmul_nvfp4(
       &A, &B, &output, &scale_A, &scale_B,
       workspace_tensor.data_ptr(), workspace_size, static_cast<float*>(alpha.data_ptr()), accumulate, stream);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+void cublas_gemm(
+  const at::Tensor A,
+  const at::Tensor A_scale,
+  float amax_A,
+  bool transa,
+  const at::Tensor B,
+  const at::Tensor B_scale,
+  float amax_B,
+  bool transb,
+  float alpha,
+  std::optional<float> beta,
+  at::Tensor D,
+  bool accumulate,
+  const at::Tensor workspace_tensor,
+  size_t workspace_size
+) {
+  NVTE_ERROR("cublas_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void block_scaled_matmul_nvfp4(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& output,
+    const at::Tensor& scale_A,
+    const at::Tensor& scale_B,
+    float amax_A,
+    float amax_B,
+    at::Tensor& alpha,
+    bool accumulate,
+    const at::Tensor& workspace_tensor,
+    size_t workspace_size) {
+  NVTE_ERROR("block_scaled_matmul_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS
 

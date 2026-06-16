@@ -38,6 +38,8 @@
  * expected — SNR should improve slightly.
  */
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -410,3 +412,37 @@ void grouped_cutlass_gemm_v2_evt(
     }
     CUTLASS_CHECK(entry.gemm.run(arguments, workspace.data_ptr(), stream));
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+std::vector<int64_t> grouped_cutlass_gemm_v2_evt_buffer_sizes(int max_groups) {
+  NVTE_ERROR("grouped_cutlass_gemm_v2_evt_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+  return {};
+}
+
+void grouped_cutlass_gemm_v2_evt(
+    at::Tensor&       D,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& A_sf,
+    const at::Tensor& B_sf,
+    const at::Tensor& a_row_offsets,
+    const at::Tensor& b_row_offsets,
+    const at::Tensor& a_sf_offsets,
+    const at::Tensor& b_sf_offsets,
+    int               num_groups,
+    at::Tensor&       buf_ptrs,
+    at::Tensor&       buf_strides,
+    at::Tensor&       buf_layouts,
+    at::Tensor&       buf_problem_sizes_dev,
+    const at::Tensor& problem_sizes_host,
+    at::Tensor&       workspace,
+    const at::Tensor& per_token_scale
+) {
+  NVTE_ERROR("grouped_cutlass_gemm_v2_evt requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

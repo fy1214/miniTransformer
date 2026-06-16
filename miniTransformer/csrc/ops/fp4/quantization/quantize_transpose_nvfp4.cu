@@ -8,6 +8,8 @@
  *  \brief CUDA kernels to cast to NVFP4 and transpose.
  */
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #ifndef TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
 #define TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
 
@@ -1387,3 +1389,24 @@ void quantize_transpose_nvfp4(
 
 
 #endif  // TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include "../../../util/transformer_engine/logging.h"
+
+void quantize_transpose_nvfp4(
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
+    at::Tensor &output,
+    at::Tensor &output_scale,
+    at::Tensor &output_transpose,
+    at::Tensor &output_scale_transpose,
+    bool use_2d_quantization,
+    bool return_transpose
+) {
+  NVTE_ERROR("quantize_transpose_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

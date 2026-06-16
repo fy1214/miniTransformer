@@ -32,6 +32,24 @@ def cuda_version() -> tuple[int, ...]:
     return tuple(map(int, match.group(1).split(".")))
 
 
+def _detect_blackwell() -> tuple[bool, str]:
+    """Return (enable_blackwell_ops, reason)."""
+    if os.getenv("MINI_TE_FORCE_BLACKWELL_OPS") == "1":
+        return True, "forced by MINI_TE_FORCE_BLACKWELL_OPS"
+    if os.getenv("MINI_TE_DISABLE_BLACKWELL_OPS") == "1":
+        return False, "disabled by MINI_TE_DISABLE_BLACKWELL_OPS"
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True, "no CUDA device visible, default-include"
+        major, minor = torch.cuda.get_device_capability(0)
+        if major >= 10:
+            return True, f"Blackwell+ (cc {major}.{minor})"
+        return False, f"non-Blackwell GPU (cc {major}.{minor})"
+    except Exception as e:
+        return True, f"detection failed ({e}), default-include"
+
+
 def build_extensions() -> list[setuptools.Extension]:
     try:
         from torch.utils.cpp_extension import CUDAExtension
@@ -79,6 +97,13 @@ def build_extensions() -> list[setuptools.Extension]:
         cuda_archs = os.getenv("HYBRID_CUDA_ARCHS", "100a;103a")
         for arch in cuda_archs.split(";"):
             nvcc_flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+
+    build_blackwell, reason = _detect_blackwell()
+    print(f"[mini-TE] Blackwell ops (FP4+FP8): "
+          f"{'enabled' if build_blackwell else 'disabled'} ({reason})")
+    if not build_blackwell:
+        nvcc_flags.append("-DMINI_TE_NO_BLACKWELL_OPS")
+        cxx_flags.append("-DMINI_TE_NO_BLACKWELL_OPS")
 
     csrc_dir = ROOT_DIR / "miniTransformer" / "csrc"
     cutlass_dir = ROOT_DIR / "third-party" / "cutlass"

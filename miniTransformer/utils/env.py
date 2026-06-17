@@ -35,6 +35,22 @@ def should_disable_2d_quantization():
     disable_2d_quantization= os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
     return disable_2d_quantization
 
+    
+def get_int4_real_group_size():
+    return int(os.getenv("INT4_REAL_GROUP_SIZE", "128"))
+
+
+def get_int4_fake_group_size():
+    return int(
+        os.getenv(
+            "INT4_FAKE_GROUP_SIZE",
+            os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "16"),
+        )
+    )
+
+
+def should_use_int4_real_symmetric():
+    return os.getenv("INT4_REAL_SYMMETRIC", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # Tensor statistics hook settings

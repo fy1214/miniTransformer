@@ -600,6 +600,7 @@ def run_all_tests(
 QPARAM_MAP = {
     "non":      QuantizeRecipe.NON_QUANTIZE,
     "int4":     QuantizeRecipe.INT4_SUB_CHANNEL,
+    "int4_marlin": QuantizeRecipe.INT4_MARLIN_FORWARD,
     "fp4_ref":  QuantizeRecipe.FP4_SUB_CHANNEL_REF,
     "fp4":      QuantizeRecipe.FP4_SUB_CHANNEL,
     "fp4_q":    QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET,

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <cuda/barrier>
@@ -346,3 +348,25 @@ void rht128_requant_binding(
         *reinterpret_cast<float *>(seed.data_ptr()),  fp4_max, fp8_max,
         x.size(0), x.size(1) * 2);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void rht128_requant_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& x_micro_scales,
+    at::Tensor& x_global_scale,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max) {
+  throw std::runtime_error("rht128_requant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

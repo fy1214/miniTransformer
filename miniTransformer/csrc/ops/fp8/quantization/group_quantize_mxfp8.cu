@@ -31,6 +31,8 @@
 //   blockDim       = rows_per_block * warps_per_row * 32
 //   gridDim        = min(ceil(total_rows / rows_per_block), MAX_BLOCKS)
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -423,3 +425,28 @@ void mxfp8_grouped_quantize_hw_binding(
         reinterpret_cast<const int64_t*>(sf_offsets.data_ptr()),
         stream);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void mxfp8_grouped_quantize_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets) {
+    throw std::runtime_error("mxfp8_grouped_quantize_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void mxfp8_grouped_quantize_hw_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets) {
+    throw std::runtime_error("mxfp8_grouped_quantize_hw_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

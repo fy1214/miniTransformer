@@ -39,6 +39,8 @@
  *   gemm.initialize() to configure TMA descriptors.
  */
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -405,3 +407,36 @@ void mxfp8_grouped_gemm(
         CUTLASS_CHECK(entry.gemm1sm.run(arguments, workspace.data_ptr(), stream));
     }
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+std::vector<int64_t> mxfp8_grouped_gemm_buffer_sizes(int max_groups) {
+    throw std::runtime_error("mxfp8_grouped_gemm_buffer_sizes requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+    return {};
+}
+
+void mxfp8_grouped_gemm(
+    at::Tensor&        D,
+    const at::Tensor&  A,
+    const at::Tensor&  B,
+    const at::Tensor&  A_sf,
+    const at::Tensor&  B_sf,
+    const at::Tensor&  a_row_offsets,
+    const at::Tensor&  b_row_offsets,
+    const at::Tensor&  a_sf_offsets,
+    const at::Tensor&  b_sf_offsets,
+    int                num_groups,
+    at::Tensor&        buf_ptrs,
+    at::Tensor&        buf_strides,
+    at::Tensor&        buf_layouts,
+    at::Tensor&        buf_problem_sizes_dev,
+    const at::Tensor&  problem_sizes_host,
+    at::Tensor&        workspace,
+    bool               use_2sm) {
+    throw std::runtime_error("mxfp8_grouped_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

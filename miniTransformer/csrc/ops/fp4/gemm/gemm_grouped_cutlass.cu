@@ -4,6 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <ATen/ATen.h>
 #include <torch/types.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -281,3 +283,21 @@ void grouped_cutlass_gemm_with_per_token_scale(
     CUTLASS_CHECK(gemm.initialize(arguments, workspace.get(), stream));
     CUTLASS_CHECK(gemm.run(arguments, workspace.get(), stream));
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void grouped_cutlass_gemm_with_per_token_scale(
+    std::vector<at::Tensor>& D_list,
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& A_sf_list,
+    const std::vector<at::Tensor>& B_sf_list,
+    const std::vector<at::Tensor>& per_token_scale_list
+) {
+  throw std::runtime_error("grouped_cutlass_gemm_with_per_token_scale requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

@@ -632,7 +632,7 @@ def group_quantize_nvfp4_tensor_global_packed(
 
     fn = fp4_gemm.four_six_fp4_group_tensor_global if four_six else fp4_gemm.rtn_fp4_group_tensor_global
     amax = x_2d.abs().amax(dim=1).reshape(num_experts, n_per_expert).amax(dim=1).to(torch.float32).contiguous()
-    fn(data, scale_flat, global_scale, x_2d, row_offsets_gpu, scale_offsets_gpu, amax, scale_override)
+    fn(data, scale_flat, global_scale, x_2d, row_offsets_gpu, scale_offsets_gpu, amax, scale_override, swizzle=True)
 
     if skip_cute_data:
         cute_data = None

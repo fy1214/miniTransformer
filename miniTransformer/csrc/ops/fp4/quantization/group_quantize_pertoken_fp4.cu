@@ -27,6 +27,8 @@
 //   Each group g occupies  ceil(m_g/128)*128 * (cols/16)  elements (zero-padded to
 //   the nearest 128-row tile boundary so swizzle addresses never escape the buffer).
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -1079,7 +1081,7 @@ __device__ __forceinline__ int tg_find_group(const int32_t* cta_offsets, int num
 }
 
 // ---- Kernel: quantize using caller-supplied per-group amax -------------------
-template<int NumCandidates>
+template<int NumCandidates, bool Swizzle>
 __global__ void fp4_group_tensor_global_kernel(
     __nv_fp4x4_e2m1*    __restrict__ y_ptr,
     __nv_fp8_e4m3*      __restrict__ scale_ptr,
@@ -1173,11 +1175,17 @@ __global__ void fp4_group_tensor_global_kernel(
     const int global_vec_idx = row * nvecs_per_row + tid;
     res.bits.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * global_vec_idx);
 
-    // Store FP8 scale with per-group swizzle.
+    // Store FP8 scale: per-group swizzled OR plain row-major (compile-time switch).
     if (tid % 2 == 0) {
-        const int     col       = tid / 2;
-        const int     numKTiles = cols_div16 / 4;
-        const int64_t tgt = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, numKTiles);
+        const int col = tid / 2;
+        int64_t tgt;
+        if constexpr (Swizzle) {
+            const int numKTiles = cols_div16 / 4;
+            tgt = cvt_quant_to_fp4_get_sf_out_offset(local_row_in_group, col, numKTiles);
+        } else {
+            // Row-major layout: [rows_padded, cols_div16].
+            tgt = static_cast<int64_t>(local_row_in_group) * cols_div16 + col;
+        }
         scale_ptr[sf_base + tgt] = res.fp8s;
     }
 }
@@ -1196,6 +1204,7 @@ static void launch_fp4_group_tensor_global(
     float  scale_override,
     long   cols,
     int    num_groups,
+    bool   swizzle,
     cudaStream_t stream)
 {
     const int nvecs_per_row  = static_cast<int>(cols / 8);
@@ -1224,18 +1233,21 @@ static void launch_fp4_group_tensor_global(
         cudaMemcpyHostToDevice, stream));
     const int32_t* cta_offsets_ptr = cta_offsets_t.data_ptr<int32_t>();
 
-    if (num_candidates == 2)
-        fp4_group_tensor_global_kernel<2><<<total_ctas, block_dim, 0, stream>>>(
-            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
-            cta_offsets_ptr, row_offsets_gpu, scale_offsets_gpu,
-            amax_ptr, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block);
-    else
-        fp4_group_tensor_global_kernel<1><<<total_ctas, block_dim, 0, stream>>>(
-            y_ptr, scale_ptr, global_scale_ptr, x_ptr,
-            cta_offsets_ptr, row_offsets_gpu, scale_offsets_gpu,
-            amax_ptr, scale_override, cdiv16, num_groups,
-            nvecs_per_row, warps_per_row, rows_per_block);
+    #define LAUNCH_TG(NC, SW)                                                          \
+        fp4_group_tensor_global_kernel<NC, SW><<<total_ctas, block_dim, 0, stream>>>(  \
+            y_ptr, scale_ptr, global_scale_ptr, x_ptr,                                 \
+            cta_offsets_ptr, row_offsets_gpu, scale_offsets_gpu,                       \
+            amax_ptr, scale_override, cdiv16, num_groups,                              \
+            nvecs_per_row, warps_per_row, rows_per_block)
+
+    if (num_candidates == 2) {
+        if (swizzle) { LAUNCH_TG(2, true);  }
+        else         { LAUNCH_TG(2, false); }
+    } else {
+        if (swizzle) { LAUNCH_TG(1, true);  }
+        else         { LAUNCH_TG(1, false); }
+    }
+    #undef LAUNCH_TG
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1247,14 +1259,15 @@ void rtn_fp4_group_tensor_global_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     const at::Tensor& amax,
-    float             scale_override)
+    float             scale_override,
+    bool              swizzle)
 {
     TORCH_CHECK(inp.dtype()      == at::kBFloat16, "inp must be bfloat16");
     TORCH_CHECK(inp.is_cuda(),                     "inp must be a CUDA tensor");
     TORCH_CHECK(inp.is_contiguous(),               "inp must be contiguous");
     TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
     TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
-    TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
+    TORCH_CHECK(inp.size(1) / 8 <= 1024,           "cols must be <= 8192");
     TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
     TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
     TORCH_CHECK(amax.dtype()          == at::kFloat, "amax must be float32");
@@ -1278,6 +1291,7 @@ void rtn_fp4_group_tensor_global_binding(
         reinterpret_cast<const float*>(amax.data_ptr()),
         row_offsets_host,
         scale_override, cols, ngroups,
+        swizzle,
         at::cuda::getCurrentCUDAStream());
 }
 
@@ -1289,14 +1303,15 @@ void four_six_fp4_group_tensor_global_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     const at::Tensor& amax,
-    float             scale_override)
+    float             scale_override,
+    bool              swizzle)
 {
     TORCH_CHECK(inp.dtype()      == at::kBFloat16, "inp must be bfloat16");
     TORCH_CHECK(inp.is_cuda(),                     "inp must be a CUDA tensor");
     TORCH_CHECK(inp.is_contiguous(),               "inp must be contiguous");
     TORCH_CHECK(inp.dim() == 2,                    "inp must be 2D [total_n, cols]");
     TORCH_CHECK(inp.size(1) % 128 == 0,            "cols must be divisible by 128");
-    TORCH_CHECK(inp.size(1) / 8 <= 512,            "cols must be <= 4096");
+    TORCH_CHECK(inp.size(1) / 8 <= 1024,           "cols must be <= 8192");
     TORCH_CHECK(row_offsets.dtype()   == at::kInt, "row_offsets must be int32");
     TORCH_CHECK(scale_offsets.dtype() == at::kLong,"scale_offsets must be int64");
     TORCH_CHECK(amax.dtype()          == at::kFloat, "amax must be float32");
@@ -1320,5 +1335,107 @@ void four_six_fp4_group_tensor_global_binding(
         reinterpret_cast<const float*>(amax.data_ptr()),
         row_offsets_host,
         scale_override, cols, ngroups,
+        swizzle,
         at::cuda::getCurrentCUDAStream());
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void rtn_fp4_group_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("rtn_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("four_six_fp4_group_pertoken_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("rtn_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_legacy_per_row_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("four_six_fp4_group_pertoken_legacy_per_row_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("rtn_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_pertoken_pad_fuse_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& padded_row_offsets,
+    const at::Tensor& unpadded_row_offsets,
+    const at::Tensor& scale_offsets,
+    float scale_override) {
+  throw std::runtime_error("four_six_fp4_group_pertoken_pad_fuse_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float scale_override,
+    bool swizzle) {
+  throw std::runtime_error("rtn_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_group_tensor_global_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& scale_offsets,
+    const at::Tensor& amax,
+    float scale_override,
+    bool swizzle) {
+  throw std::runtime_error("four_six_fp4_group_tensor_global_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

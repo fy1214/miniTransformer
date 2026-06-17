@@ -17,6 +17,8 @@
 //   - Same memory layout / SF layout as the original so it's a drop-in for
 //     the CUTLASS SM100 collective, and Python-side wrappers can A/B both.
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -426,3 +428,28 @@ void mxfp8_grouped_quantize_chunked_hw_binding(
         reinterpret_cast<const int64_t*>(sf_offsets.data_ptr()),
         stream);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void mxfp8_grouped_quantize_chunked_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets) {
+    throw std::runtime_error("mxfp8_grouped_quantize_chunked_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void mxfp8_grouped_quantize_chunked_hw_binding(
+    at::Tensor&       out,
+    at::Tensor&       sf,
+    const at::Tensor& inp,
+    const at::Tensor& row_offsets,
+    const at::Tensor& sf_offsets) {
+    throw std::runtime_error("mxfp8_grouped_quantize_chunked_hw_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

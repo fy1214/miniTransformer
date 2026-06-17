@@ -37,6 +37,8 @@
 // Limitation: cols > 8192 (warps_per_row > 32) is unsupported — falls back
 // to the two-pass launcher in quantize_pertoken_fp4.cu.
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -372,3 +374,50 @@ void rtn_fp4_pertoken_linear_fused_binding(
 {
     binding_impl_fused(1, false, out, scales, global_scale, inp, scale_override);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void four_six_fp4_pertoken_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override)
+{
+    throw std::runtime_error("four_six_fp4_pertoken_fused_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_pertoken_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override)
+{
+    throw std::runtime_error("rtn_fp4_pertoken_fused_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void four_six_fp4_pertoken_linear_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override)
+{
+    throw std::runtime_error("four_six_fp4_pertoken_linear_fused_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void rtn_fp4_pertoken_linear_fused_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    float scale_override)
+{
+    throw std::runtime_error("rtn_fp4_pertoken_linear_fused_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

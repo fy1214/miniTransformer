@@ -43,6 +43,42 @@ except ImportError:
     reason_for_no_cuda_graph = "Need newer TransformerEngine"
 
 
+def _add_lowbit_speed_args(parser):
+    group = parser.add_argument_group(title='lowbit speed profiling')
+    group.add_argument('--lowbit-warmup-steps', type=int, default=5,
+                       help='Steps before speed timing starts.')
+    group.add_argument('--lowbit-bench-steps', type=int, default=10,
+                       help='Steps included in speed timing.')
+    group.add_argument('--lowbit-profile-steps', type=int, default=0,
+                       help='Steps captured by torch.profiler (0 disables).')
+    group.add_argument('--lowbit-profile-dir', type=str, default='/tmp/lowbit_profile',
+                       help='Output directory for torch.profiler traces.')
+    return parser
+
+
+def _capture_lowbit_argv():
+    """Pick --lowbit-* flags out of sys.argv at import time so they survive create_test_args's argv reset."""
+    known = {'--lowbit-warmup-steps', '--lowbit-bench-steps',
+             '--lowbit-profile-steps', '--lowbit-profile-dir'}
+    out, argv, i = [], sys.argv[1:], 0
+    while i < len(argv):
+        tok = argv[i]
+        key = tok.split('=', 1)[0]
+        if key in known:
+            out.append(tok)
+            if '=' not in tok and i + 1 < len(argv):
+                out.append(argv[i + 1])
+                i += 2
+            else:
+                i += 1
+        else:
+            i += 1
+    return out
+
+
+_LOWBIT_ARGV = _capture_lowbit_argv()
+
+
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
@@ -114,8 +150,8 @@ class TestFP8Param:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-        sys.argv = ['test_fp8_param.py']
-        args = parse_args()
+        sys.argv = ['test_fp8_param.py', *_LOWBIT_ARGV]
+        args = parse_args(extra_args_provider=_add_lowbit_speed_args)
         args.num_layers = 4
         args.vocal_size = 128800
         args.hidden_size = 128
@@ -176,17 +212,6 @@ class TestFP8Param:
         **kwargs,
     ):
         """Test fp8_param with gpt_model."""
-        # Speed profiling config: controlled by env vars.
-        #   LOWBIT_WARMUP_STEPS  - steps before timing starts (default 5)
-        #   LOWBIT_BENCH_STEPS   - steps to time (default 10)
-        #   LOWBIT_PROFILE_STEPS - steps to capture torch.profiler trace (0 = disabled)
-        #   LOWBIT_PROFILE_DIR   - output dir for profiler traces (default /tmp/lowbit_profile)
-        warmup_steps = int(os.environ.get("LOWBIT_WARMUP_STEPS", 5))
-        bench_steps  = int(os.environ.get("LOWBIT_BENCH_STEPS", 10))
-        profile_steps = int(os.environ.get("LOWBIT_PROFILE_STEPS", 0))
-        profile_dir   = os.environ.get("LOWBIT_PROFILE_DIR", "/tmp/lowbit_profile")
-        total_steps = warmup_steps + bench_steps
-
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -197,6 +222,17 @@ class TestFP8Param:
             use_cuda_graph,
             **kwargs,
         )
+
+        # Speed profiling config: controlled by CLI args.
+        #   --lowbit-warmup-steps   steps before timing starts (default 5)
+        #   --lowbit-bench-steps    steps to time (default 10)
+        #   --lowbit-profile-steps  steps to capture torch.profiler trace (0 = disabled)
+        #   --lowbit-profile-dir    output dir for profiler traces (default /tmp/lowbit_profile)
+        warmup_steps = args.lowbit_warmup_steps
+        bench_steps  = args.lowbit_bench_steps
+        profile_steps = args.lowbit_profile_steps
+        profile_dir   = args.lowbit_profile_dir
+        total_steps = warmup_steps + bench_steps
 
         if recipe == "blockwise" and args.sequence_parallel:
             assert (

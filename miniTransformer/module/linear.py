@@ -14,6 +14,7 @@ from miniTransformer.distributed.distributed import (
     set_tensor_model_parallel_attributes, get_distributed_world_size,
 )
 from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp
 from miniTransformer.utils.env import should_keep_backward_in_bf16, get_linear_profiler_config, get_linear_tensor_stats_config
 from miniTransformer.utils.utils import (
     is_rank_0,
@@ -749,6 +750,11 @@ class Linear(LayerLinearBaseModule):
             layer_number=self.layer_number,
             layer_name=self.layer_name,
         )
+        if isinstance(self.qlinear_params.quantize_op, Int4MarlinForwardQuantizeOp):
+            logger.info(
+                "INT4 Marlin real-forward is GroupedLinear-only; keeping regular Linear in BF16."
+            )
+            self.qlinear_params = config.QLinearParams(quantize=False)
 
         if is_rank_0():
             logger.info(

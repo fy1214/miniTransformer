@@ -6,6 +6,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
 from .base import LayerLinearBaseModule, get_dummy_wgrad
+from ..quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp
 from ..distributed.distributed import get_distributed_rank, allreduce, set_tensor_model_parallel_attributes
 from ..quantiztion import quantization
 from ..quantiztion.quantization import GroupQuantizeResultCache
@@ -566,6 +567,14 @@ class GroupedLinear(LayerLinearBaseModule):
 
         # 当 DISABLE_BACKWARD_QUANT=1 时，backward 不量化 dy/x，直接用 BF16 GEMM
         self.disable_backward_quant = should_keep_backward_in_bf16()
+        if (
+            isinstance(self.qlinear_params.quantize_op, Int4MarlinForwardQuantizeOp)
+            and not self.disable_backward_quant
+        ):
+            raise ValueError(
+                "INT4 Marlin real-forward GroupedLinear requires DISABLE_BACKWARD_QUANT=1 "
+                "so backward keeps the BF16 weight copy for parameter updates."
+            )
 
         # Megatron's _split_extra_state (sharded_state_dict path) accesses these
         # attributes that are normally provided by TE's TransformerEngineBaseModule.

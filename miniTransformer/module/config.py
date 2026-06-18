@@ -6,7 +6,7 @@ import torch
 from typing import Dict, Optional, Mapping, Sequence, Type
 
 from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
-from miniTransformer.quantiztion.int4_quantize_op import Int4TiledQuantizeOp
+from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp, Int4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op_ref import Nvfp4Cursor2QuantizeOpRef
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
@@ -101,6 +101,7 @@ class QuantizeRecipe(enum.Enum):
     NON_QUANTIZE = "non_quantize"
     BF16_REF = "bf16_ref"
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
+    INT4_MARLIN_FORWARD = "int4_marlin_forward"
     FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
     FP4_SUB_CHANNEL_QUARTET = "fp4_subchannel_scaling_quartet"
     FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
@@ -120,25 +121,51 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     elif recipe == QuantizeRecipe.BF16_REF:
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
     elif recipe == QuantizeRecipe.INT4_SUB_CHANNEL:
+        group_size = env.get_int4_fake_group_size()
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.INT4,
             x_params=QParams(
                 output_dtype=torch.bfloat16,
-                quant_tile_shape=(1, 16),
+                quant_tile_shape=(1, group_size),
                 param_type=ParamType.X
             ),
             w_params=QParams(
                 output_dtype=torch.bfloat16,
-                quant_tile_shape=(1, 16),
+                quant_tile_shape=(1, group_size),
                 param_type=ParamType.WEIGHT
             ),
             g_params=QParams(
                 output_dtype=torch.bfloat16,
-                quant_tile_shape=(1, 16),
+                quant_tile_shape=(1, group_size),
                 param_type=ParamType.Y
             ),
             quantize_op=Int4TiledQuantizeOp())
+    elif recipe == QuantizeRecipe.INT4_MARLIN_FORWARD:
+        group_size = env.get_int4_real_group_size()
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.INT4,
+            x_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, group_size),
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.int32,
+                quant_tile_shape=(1, group_size),
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                quant_tile_shape=(1, group_size),
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Int4MarlinForwardQuantizeOp(
+                group_size=group_size,
+                symmetric=env.should_use_int4_real_symmetric(),
+            ),
+        )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
         return QLinearParams(
             quantize=True,
@@ -527,5 +554,9 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
         return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_QDQ_PERTOKEN)
     if qat_params_idx == 12:
         return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_BWD)
+    if qat_params_idx == 13:
+        return get_qlinear_params_from_predefined(
+            QuantizeRecipe.INT4_MARLIN_FORWARD
+        )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

@@ -734,6 +734,8 @@ class Int4MarlinForwardQuantizeOp(Int4TiledQuantizeOp):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         if grad or layout != "TN":
             return super().grouped_gemm(

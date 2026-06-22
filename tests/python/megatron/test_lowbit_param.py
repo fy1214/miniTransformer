@@ -5,6 +5,8 @@ import gc
 import os
 import sys
 import time
+import argparse
+import inspect
 
 import pytest
 import torch
@@ -100,6 +102,10 @@ def should_disable_forward_pre_hook(args):
 
 class TestFP8Param:
 
+    # Populated by main() (standalone runner). pytest path leaves this empty
+    # and falls back to per-method defaults.
+    _extra_args: dict = {}
+
     def setup_method(self, method):
         self.seq_length = 512
         self.micro_batch_size = 2
@@ -121,7 +127,14 @@ class TestFP8Param:
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn()
+        num_experts = getattr(args, "num_experts", None)
+        if num_experts and num_experts > 0:
+            transformer_layer_spec = layer_spec_fn(
+                num_experts=num_experts,
+                moe_grouped_gemm=getattr(args, "moe_grouped_gemm", False),
+            )
+        else:
+            transformer_layer_spec = layer_spec_fn()
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -170,9 +183,35 @@ class TestFP8Param:
         args.add_bias_linear = False
         args.swiglu = True
         args.use_distributed_optimizer = not inference
-        args.fp8 = "e4m3"
-        args.fp8_recipe = recipe
-        args.fp8_param_gather = fp8_param_gather
+        # NVFP4 goes through megatron's --fp4-format/--fp4-recipe path; fp4 and fp8
+        # are mutually exclusive in validate_args, so clear fp8 when recipe="nvfp4".
+        if recipe == "nvfp4":
+            args.fp8 = None
+            args.fp8_recipe = None
+            args.fp8_param_gather = False
+            args.fp4 = "e2m1"
+            args.fp4_recipe = "nvfp4"
+            # TE's replace_raw_data() does not support NVFP4Tensor yet, so megatron's
+            # DDP _ParamAndGradBuffer.modify_underlying_storage() will crash if we
+            # enable fp4_param. Keep main params in bf16 and quantize to NVFP4 on the
+            # fly during forward — re-enable once TE adds NVFP4Tensor support.
+            args.fp4_param = False
+            # When QAT_PARAMS is set, miniTransformer.GroupedLinear owns fp4 via its
+            # own kernels. We still want config.fp4=True so megatron applies the
+            # hidden/seq padding required for fp4 alignment, but we DON'T want the
+            # per-layer NVFP4 autocast (which would force TE Linear/LayerNormLinear
+            # to quantize and trigger A/B scaling_mode mismatch in wgrad backward).
+            # Trick: flag every layer as a "first-last bf16" layer, so get_fp4_context
+            # returns nullcontext for the whole stack. Validation in transformer_config
+            # only kicks in when config.fp8 is set, so this is safe for fp4-only.
+            if os.environ.get("QAT_PARAMS"):
+                args.first_last_layers_bf16 = True
+                args.num_layers_at_start_in_bf16 = args.num_layers
+                args.num_layers_at_end_in_bf16 = 0
+        else:
+            args.fp8 = "e4m3"
+            args.fp8_recipe = recipe
+            args.fp8_param_gather = fp8_param_gather
         args.ddp_bucket_size = 1024  # Create more buckets to test the rs/ag overlap.
         args.attention_backend = AttnBackend.flash
         # MXFP8 test settings
@@ -182,6 +221,12 @@ class TestFP8Param:
         if use_cuda_graph:
             args.cuda_graph_impl = "transformer_engine"
             args.cuda_graph_warmup_steps = 0
+
+        # Merge class-level extras first (from CLI main()), then per-call kwargs
+        # so kwargs win on conflict.
+        for key, value in type(self)._extra_args.items():
+            assert hasattr(args, key), f"unknown megatron arg: {key}"
+            setattr(args, key, value)
 
         for key, value in kwargs.items():
             assert hasattr(args, key)
@@ -241,7 +286,11 @@ class TestFP8Param:
 
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        ep_size = getattr(args, "expert_model_parallel_size", 1) or 1
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+        )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
@@ -286,7 +335,11 @@ class TestFP8Param:
             fp8_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp8_layers -= kwargs["num_layers_at_end_in_bf16"]
         # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
-        if fp8_param_gather:
+        # Skip the strict count when MoE is on (different expert weight layout) or
+        # when recipe is fp4 (is_float8tensor doesn't match fp4 param tensors).
+        moe_enabled = bool(getattr(args, "num_experts", 0))
+        fp4_recipe = bool(getattr(args, "fp4", None))
+        if fp8_param_gather and not moe_enabled and not fp4_recipe:
             assert num_fp8_params == 4 * fp8_layers
 
         loss_list = []
@@ -399,8 +452,9 @@ class TestFP8Param:
                 avg_ms  = sum(bench_times) / len(bench_times) * 1e3
                 min_ms  = min(bench_times) * 1e3
                 max_ms  = max(bench_times) * 1e3
+                _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                 print(
-                    f"\n[speed] recipe={recipe} tp={tp_size} "
+                    f"\n[rank={_rank}][speed] recipe={recipe} tp={tp_size} "
                     f"seq={self.seq_length} bs={self.micro_batch_size} "
                     f"| avg={avg_ms:.1f}ms  min={min_ms:.1f}ms  max={max_ms:.1f}ms "
                     f"over {len(bench_times)} steps"
@@ -409,8 +463,9 @@ class TestFP8Param:
         # ── Precision report ──────────────────────────────────────────────────
         if loss_list and not inference:
             first, last = loss_list[0], loss_list[-1]
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(
-                f"[precision] loss: first={first:.4f}  last={last:.4f}  "
+                f"[rank={_rank}][precision] loss: first={first:.4f}  last={last:.4f}  "
                 f"delta={last - first:+.4f}"
             )
             # Loss should decrease (or at least not diverge) over the run.
@@ -558,3 +613,150 @@ class TestFP8Param:
             "num_layers_at_end_in_bf16": 1,
         }
         self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    def test_nvfp4(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, recipe="nvfp4", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    @pytest.mark.skipif(not cuda_graph_supported, reason=reason_for_no_cuda_graph)
+    def test_nvfp4_with_cuda_graph(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test_with_cuda_graph(tp_size=tp_size, recipe="nvfp4", **kwargs)
+
+
+def _build_cli_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone runner for TestFP8Param. Launch via torchrun:\n"
+            "  torchrun --nproc_per_node=N tests/python/megatron/test_lowbit_param.py "
+            "<method> [--tp-size N] [--overlap-param-gather 0|1] [--overlap-grad-reduce 0|1] "
+            "[--lowbit-warmup-steps INT] [--lowbit-bench-steps INT] "
+            "[--lowbit-profile-steps INT] [--lowbit-profile-dir DIR]"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("method", help="Test method on TestFP8Param, e.g. test_mxfp8")
+    parser.add_argument("--tp-size", type=int, default=2,
+                        help="Tensor-parallel size (when ep=1 must match --nproc_per_node).")
+    parser.add_argument("--ep-size", type=int, default=1,
+                        help="Expert-parallel size. world_size = tp_size * ep_size (pp=cp=1 here).")
+    parser.add_argument("--moe", action="store_true",
+                        help="Replace dense MLP with MoE layer.")
+    parser.add_argument("--num-experts", type=int, default=8,
+                        help="Number of MoE experts (used when --moe).")
+    parser.add_argument("--moe-router-topk", type=int, default=2,
+                        help="MoE router top-k (used when --moe).")
+    parser.add_argument("--moe-grouped-gemm", action="store_true",
+                        help="Enable grouped GEMM for MoE experts (used when --moe).")
+    parser.add_argument("--moe-token-dispatcher-type", type=str, default="alltoall",
+                        choices=["alltoall", "allgather", "alltoall_seq"],
+                        help="MoE token dispatcher type (used when --moe).")
+    parser.add_argument("--ffn-hidden-size", type=int, default=None,
+                        help="Override args.ffn_hidden_size. Default lets megatron derive it.")
+    parser.add_argument("--moe-ffn-hidden-size", type=int, default=None,
+                        help=(
+                            "Override args.moe_ffn_hidden_size (used when --moe). "
+                            "Auto-default = max(512, 64*tp_size) so GroupedLinear's "
+                            "out_features %% 128 == 0 holds for swiglu gate+up packed."
+                        ))
+    parser.add_argument("--qat-params", type=int, default=None,
+                        help=(
+                            "Select miniTransformer hybrid-linear recipe by index "
+                            "(see miniTransformer/module/config.py:get_qlinear_params_from_env_qat_params). "
+                            "Forwarded to QAT_PARAMS env var before model build. "
+                            "Default None = leave env untouched."
+                        ))
+    parser.add_argument("--overlap-param-gather", type=int, default=1, choices=[0, 1],
+                        help="dp_overlap[0]; ignored if method has no dp_overlap.")
+    parser.add_argument("--overlap-grad-reduce", type=int, default=1, choices=[0, 1],
+                        help="dp_overlap[1]; ignored if method has no dp_overlap.")
+    parser.add_argument("--lowbit-warmup-steps", type=int, default=5)
+    parser.add_argument("--lowbit-bench-steps", type=int, default=10)
+    parser.add_argument("--lowbit-profile-steps", type=int, default=0)
+    parser.add_argument("--lowbit-profile-dir", type=str, default="/tmp/lowbit_profile")
+    return parser
+
+
+def main():
+    cli = _build_cli_parser().parse_args()
+
+    # Forward --qat-params into QAT_PARAMS env var BEFORE megatron builds the model,
+    # so miniTransformer.utils.env.should_switch_to_hybrid_linear() and
+    # config.get_qlinear_params_from_env_qat_params() observe the chosen recipe.
+    if cli.qat_params is not None:
+        os.environ["QAT_PARAMS"] = str(cli.qat_params)
+
+    # Forward lowbit values into megatron's parse_args path used by create_test_args.
+    global _LOWBIT_ARGV
+    _LOWBIT_ARGV = [
+        f"--lowbit-warmup-steps={cli.lowbit_warmup_steps}",
+        f"--lowbit-bench-steps={cli.lowbit_bench_steps}",
+        f"--lowbit-profile-steps={cli.lowbit_profile_steps}",
+        f"--lowbit-profile-dir={cli.lowbit_profile_dir}",
+    ]
+
+    extra = {"expert_model_parallel_size": cli.ep_size}
+    if cli.ffn_hidden_size is not None:
+        extra["ffn_hidden_size"] = cli.ffn_hidden_size
+    if cli.moe:
+        # GroupedLinear asserts out_features % 128 == 0 on the column-parallel
+        # linear_fc1 (gate+up packed when swiglu). Post-TP that means
+        #   2 * moe_ffn_hidden_size / tp_size  must be a multiple of 128
+        # i.e. moe_ffn_hidden_size must be a multiple of 64 * tp_size.
+        moe_ffn = cli.moe_ffn_hidden_size
+        if moe_ffn is None:
+            moe_ffn = max(512, 64 * cli.tp_size)
+        assert moe_ffn % (64 * cli.tp_size) == 0, (
+            f"--moe-ffn-hidden-size={moe_ffn} must be a multiple of "
+            f"64*tp_size={64 * cli.tp_size} (GroupedLinear divisibility)."
+        )
+        extra.update({
+            "num_experts": cli.num_experts,
+            "moe_router_topk": cli.moe_router_topk,
+            "moe_grouped_gemm": cli.moe_grouped_gemm,
+            "moe_token_dispatcher_type": cli.moe_token_dispatcher_type,
+            "moe_ffn_hidden_size": moe_ffn,
+        })
+    TestFP8Param._extra_args = extra
+
+    obj = TestFP8Param()
+    if not hasattr(obj, cli.method) or not cli.method.startswith("test_"):
+        raise SystemExit(f"unknown test method: {cli.method!r}")
+    method = getattr(obj, cli.method)
+    sig = inspect.signature(method)
+    call_kwargs = {}
+    if "tp_size" in sig.parameters:
+        call_kwargs["tp_size"] = cli.tp_size
+    if "dp_overlap" in sig.parameters:
+        call_kwargs["dp_overlap"] = (bool(cli.overlap_param_gather),
+                                     bool(cli.overlap_grad_reduce))
+
+    obj.setup_method(None)
+    try:
+        method(**call_kwargs)
+    finally:
+        obj.teardown_method(None)
+
+
+if __name__ == "__main__":
+    main()

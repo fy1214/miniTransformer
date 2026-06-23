@@ -734,7 +734,6 @@ def group_quantize_nvfp4_pertoken_split_amax(
 
     total_m, k = x.shape
     device = x.device
-    T = _MMA_TILE_ROWS
 
     if total_m == 0:
         n = len(m_splits) + 1
@@ -747,15 +746,14 @@ def group_quantize_nvfp4_pertoken_split_amax(
             scale_offsets_gpu=torch.zeros(n, dtype=torch.int64, device=device),
         )
 
-    m_padded = [((m + T - 1) // T) * T for m in m_splits]
     sf_k = k // 16
 
-    scale_flat_size = sum(mp * sf_k for mp in m_padded)
+    scale_flat_size = sum(m * sf_k for m in m_splits)
     scale_flat = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
 
     so = [0]
-    for mp in m_padded:
-        so.append(so[-1] + mp * sf_k)
+    for m in m_splits:
+        so.append(so[-1] + m * sf_k)
     scale_offsets_gpu = (
         torch.tensor(so, dtype=torch.int64).pin_memory().to(device, non_blocking=True)
     )

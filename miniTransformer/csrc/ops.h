@@ -423,12 +423,12 @@ void rht128_requant_binding(
     at::Tensor& seed,
     float fp4_max, float fp8_max);
 // v2 grouped pertoken (zero-sync streaming, accepts pre-computed amax)
-void rtn_fp4_group_pertoken_v2_binding(
+void rtn_fp4_group_pertoken_split_amax_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
     const at::Tensor& inp, const at::Tensor& amax_per_row,
     const at::Tensor& row_offsets, const at::Tensor& scale_offsets,
     float scale_override);
-void four_six_fp4_group_pertoken_v2_binding(
+void four_six_fp4_group_pertoken_split_amax_binding(
     at::Tensor& out, at::Tensor& scales, at::Tensor& global_scale,
     const at::Tensor& inp, const at::Tensor& amax_per_row,
     const at::Tensor& row_offsets, const at::Tensor& scale_offsets,

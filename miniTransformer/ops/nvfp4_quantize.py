@@ -411,7 +411,7 @@ def group_quantize_nvfp4_pertoken_swizzled(
         Splits quantization into two independent kernels:
         1. ``fp4_perrow_amax_te`` — per-row absolute-max reduction
            (grid=num_rows, block=256, one row per CTA).
-        2. ``rtn_fp4_group_pertoken_v2`` — pure streaming quantize
+        2. ``rtn_fp4_group_pertoken_split_amax`` — pure streaming quantize
            (flat 1-D grid, zero __syncthreads, zero shared memory).
         Total: 2 kernel launches regardless of number of groups.
         Advantages: no K limit, no M-alignment requirement, 2-67x faster
@@ -514,8 +514,8 @@ def group_quantize_nvfp4_pertoken_swizzled(
         amax_per_row = torch.empty(total_m, dtype=torch.float32, device=device)
 
         fp4_gemm.fp4_perrow_amax_te(amax_per_row, x)
-        fn = (fp4_gemm.four_six_fp4_group_pertoken_v2 if four_six
-              else fp4_gemm.rtn_fp4_group_pertoken_v2)
+        fn = (fp4_gemm.four_six_fp4_group_pertoken_split_amax if four_six
+              else fp4_gemm.rtn_fp4_group_pertoken_split_amax)
         fn(data, scale_flat, global_scale, x, amax_per_row,
            row_offsets_gpu, scale_offsets_gpu, scale_override)
 

@@ -3,11 +3,12 @@
 // Two kernels:
 //   1. fp4_perrow_amax_te_kernel — TE-style per-row absolute-max reduction.
 //      (grid=num_rows, block=256, universal — no Blackwell dependency)
-//   2. fp4_group_pertoken_v2_kernel — pure streaming quantize with pre-computed amax.
-//      (flat 1-D grid, zero __syncthreads, zero shared memory, no K/M limits)
+//   2. fp4_group_pertoken_split_amax_kernel — pure streaming quantize with
+//      pre-computed amax. (flat 1-D grid, zero __syncthreads, zero shared
+//      memory, no K/M limits)
 //
-// Together they replace the fused amax+quantize kernel in group_quantize_pertoken_fp4.cu
-// for the split_amax=True path in group_quantize_nvfp4_pertoken_swizzled().
+// Together they implement the split_amax=True path in
+// group_quantize_nvfp4_pertoken_swizzled().
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -124,7 +125,7 @@ void fp4_perrow_amax_te_binding(
 }
 
 
-// ── v2 streaming quantize kernel (Blackwell-only) ────────────────────────────
+// ── split_amax streaming quantize kernel (Blackwell-only) ────────────────────────────
 
 #ifndef MINI_TE_NO_BLACKWELL_OPS
 
@@ -137,19 +138,19 @@ void fp4_perrow_amax_te_binding(
 using bf16x8 = GenericVector<nv_bfloat16, 8>;
 using fp4x8  = GenericVector<unsigned char, 4>;
 
-struct QuantResultGP_v2 {
+struct QuantResultGP_SA {
     fp4x8 bits;
     __nv_fp8_e4m3 fp8s;
 };
 
-__device__ __forceinline__ nv_bfloat16 vecReduceAbsMax_v2(bf16x8 v) {
+__device__ __forceinline__ nv_bfloat16 vecReduceAbsMax_SA(bf16x8 v) {
     nv_bfloat16 m = __habs(v[0]);
     #pragma unroll
     for (int i = 1; i < 8; ++i) m = __hmax(m, __habs(v[i]));
     return m;
 }
 
-__device__ __forceinline__ QuantResultGP_v2 quantize_gp_v2(
+__device__ __forceinline__ QuantResultGP_SA quantize_gp_SA(
     float group_abs_max, float fp4_max, float global_encode_scale,
     float token_decode_scale, bf16x8 x)
 {
@@ -158,7 +159,7 @@ __device__ __forceinline__ QuantResultGP_v2 quantize_gp_v2(
     __nv_fp8_e4m3 fp8s = __nv_fp8_e4m3(enc_sf);
     float descale = static_cast<float>(fp8s) * token_decode_scale;
     float inv = (descale == 0.f) ? 0.f : 1.0f / descale;
-    QuantResultGP_v2 res;
+    QuantResultGP_SA res;
     res.fp8s = fp8s;
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -173,7 +174,7 @@ __device__ __forceinline__ QuantResultGP_v2 quantize_gp_v2(
 //
 
 template<int NumCandidates>
-__global__ void fp4_group_pertoken_v2_kernel(
+__global__ void fp4_group_pertoken_split_amax_kernel(
     __nv_fp4x4_e2m1*    __restrict__ y_ptr,
     __nv_fp8_e4m3*      __restrict__ scale_ptr,
     float*              __restrict__ global_scale_ptr,
@@ -225,21 +226,21 @@ __global__ void fp4_group_pertoken_v2_kernel(
         global_scale_ptr[row] = scale;
 
     // Per-group abs-max: 16 elements = 2 consecutive threads.
-    nv_bfloat16 local_abs_max = vecReduceAbsMax_v2(x);
+    nv_bfloat16 local_abs_max = vecReduceAbsMax_SA(x);
     nv_bfloat16 other_abs_max = __shfl_xor_sync(0xffffffff, local_abs_max, 1);
     float full_abs_max = static_cast<float>(
         __hmax(__habs(local_abs_max), __habs(other_abs_max)));
 
     // Quantize.
-    QuantResultGP_v2 res;
+    QuantResultGP_SA res;
     if constexpr (NumCandidates == 1) {
-        res = quantize_gp_v2(full_abs_max, 6.0f, global_encode_scale, scale, x);
+        res = quantize_gp_SA(full_abs_max, 6.0f, global_encode_scale, scale, x);
     } else {
         float candidates[2] = {6.f, 4.f};
-        QuantResultGP_v2 results[2];
+        QuantResultGP_SA results[2];
         float best = __builtin_inff();
         for (int i = 0; i < 2; ++i) {
-            results[i] = quantize_gp_v2(full_abs_max, candidates[i],
+            results[i] = quantize_gp_SA(full_abs_max, candidates[i],
                                      global_encode_scale, scale, x);
             const float descale = static_cast<float>(results[i].fp8s) * scale;
             float2 sum = {0.f, 0.f};
@@ -272,7 +273,7 @@ __global__ void fp4_group_pertoken_v2_kernel(
 
 // ---- Launch helper (v2: flat grid, no smem) ----
 
-static void launch_fp4_group_pertoken_v2(
+static void launch_fp4_group_pertoken_split_amax(
     int num_candidates,
     __nv_fp4x4_e2m1*   y_ptr,
     __nv_fp8_e4m3*     scale_ptr,
@@ -288,7 +289,7 @@ static void launch_fp4_group_pertoken_v2(
     cudaStream_t stream)
 {
     TORCH_CHECK(cols % 128 == 0,
-                "fp4_group_pertoken_v2: cols must be divisible by 128, got ", cols);
+                "split_amax streaming quantize: cols must be divisible by 128, got ", cols);
 
     const int nvecs_per_row = static_cast<int>(cols / 8);
     const int total_vecs    = static_cast<int>(total_rows) * nvecs_per_row;
@@ -297,12 +298,12 @@ static void launch_fp4_group_pertoken_v2(
     const int n_blocks = (total_vecs + BLOCK - 1) / BLOCK;
 
     if (num_candidates == 2)
-        fp4_group_pertoken_v2_kernel<2><<<n_blocks, BLOCK, 0, stream>>>(
+        fp4_group_pertoken_split_amax_kernel<2><<<n_blocks, BLOCK, 0, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row,
             row_offsets, scale_offsets, scale_override,
             nvecs_per_row, cdiv16, num_groups, total_vecs);
     else
-        fp4_group_pertoken_v2_kernel<1><<<n_blocks, BLOCK, 0, stream>>>(
+        fp4_group_pertoken_split_amax_kernel<1><<<n_blocks, BLOCK, 0, stream>>>(
             y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_per_row,
             row_offsets, scale_offsets, scale_override,
             nvecs_per_row, cdiv16, num_groups, total_vecs);
@@ -312,7 +313,7 @@ static void launch_fp4_group_pertoken_v2(
 
 // ---- PyTorch bindings (v2) ----
 
-void rtn_fp4_group_pertoken_v2_binding(
+void rtn_fp4_group_pertoken_split_amax_binding(
     at::Tensor&       out,
     at::Tensor&       scales,
     at::Tensor&       global_scale,
@@ -337,7 +338,7 @@ void rtn_fp4_group_pertoken_v2_binding(
     const long cols    = inp.size(1);
     const int  ngroups = static_cast<int>(row_offsets.numel()) - 1;
 
-    launch_fp4_group_pertoken_v2(
+    launch_fp4_group_pertoken_split_amax(
         1,
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
@@ -350,7 +351,7 @@ void rtn_fp4_group_pertoken_v2_binding(
         at::cuda::getCurrentCUDAStream());
 }
 
-void four_six_fp4_group_pertoken_v2_binding(
+void four_six_fp4_group_pertoken_split_amax_binding(
     at::Tensor&       out,
     at::Tensor&       scales,
     at::Tensor&       global_scale,
@@ -375,7 +376,7 @@ void four_six_fp4_group_pertoken_v2_binding(
     const long cols    = inp.size(1);
     const int  ngroups = static_cast<int>(row_offsets.numel()) - 1;
 
-    launch_fp4_group_pertoken_v2(
+    launch_fp4_group_pertoken_split_amax(
         2,
         reinterpret_cast<__nv_fp4x4_e2m1*>(out.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(scales.data_ptr()),
@@ -396,7 +397,7 @@ void four_six_fp4_group_pertoken_v2_binding(
 #include <stdexcept>
 
 
-void rtn_fp4_group_pertoken_v2_binding(
+void rtn_fp4_group_pertoken_split_amax_binding(
     at::Tensor& out,
     at::Tensor& scales,
     at::Tensor& global_scale,
@@ -405,10 +406,10 @@ void rtn_fp4_group_pertoken_v2_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  throw std::runtime_error("rtn_fp4_group_pertoken_v2_binding requires Blackwell+ (SM100).");
+  throw std::runtime_error("rtn_fp4_group_pertoken_split_amax_binding requires Blackwell+ (SM100).");
 }
 
-void four_six_fp4_group_pertoken_v2_binding(
+void four_six_fp4_group_pertoken_split_amax_binding(
     at::Tensor& out,
     at::Tensor& scales,
     at::Tensor& global_scale,
@@ -417,7 +418,7 @@ void four_six_fp4_group_pertoken_v2_binding(
     const at::Tensor& row_offsets,
     const at::Tensor& scale_offsets,
     float scale_override) {
-  throw std::runtime_error("four_six_fp4_group_pertoken_v2_binding requires Blackwell+ (SM100).");
+  throw std::runtime_error("four_six_fp4_group_pertoken_split_amax_binding requires Blackwell+ (SM100).");
 }
 
 

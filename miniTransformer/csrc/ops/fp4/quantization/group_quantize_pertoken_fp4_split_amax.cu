@@ -165,7 +165,7 @@ __device__ __forceinline__ QuantResultGP_SA quantize_gp_SA(
     for (int j = 0; j < 4; ++j) {
         float2 pair = {static_cast<float>(x[2*j]) * inv,
                        static_cast<float>(x[2*j+1]) * inv};
-        res.bits[j] = __nv_cvt_float2_to_fp4x2(pair, __NV_SATFINITE, __NV_E2M1);
+        res.bits[j] = __nv_cvt_float2_to_fp4x2(pair, __nv_fp4_interpretation_t::__NV_E2M1, cudaRoundMode::cudaRoundNearest);
     }
     return res;
 }

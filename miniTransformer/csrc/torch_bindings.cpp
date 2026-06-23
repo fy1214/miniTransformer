@@ -21,6 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("output_scale_transpose"),
         pybind11::arg("use_2d_quantization"),
         pybind11::arg("return_transpose"),
+        pybind11::arg("swizzle_scales") = false,
         "quantize and transpose (CUDA)");
     m.def("swizzle_scaling_factors", &swizzle_scaling_factors, "Swizzle scaling factors (CUDA)");
     m.def("cublas_gemm", &cublas_gemm, "FP4 GEMM with cuBLASLt (CUDA)");

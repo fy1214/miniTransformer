@@ -13,7 +13,8 @@ void quantize_transpose_nvfp4(
     at::Tensor &output_transpose,
     at::Tensor &output_scale_transpose,
     bool use_2d_quantization,
-    bool return_transpose
+    bool return_transpose,
+    bool swizzle_scales = false
 );
 
 void cublas_gemm( 

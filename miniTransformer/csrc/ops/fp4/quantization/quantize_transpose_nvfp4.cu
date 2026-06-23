@@ -26,9 +26,7 @@
 #include "../../../util/transformer_engine/common.h"
 #include "../../../util/transformer_engine/ptx.cuh"
 #include "../../../util/transformer_engine/vector.cuh"
-#if FP4_TYPE_SUPPORTED
-#include "quantize_transpose_nvfp4_tuned_1d.cuh"
-#endif
+#include "../../../util/quarter/utils.cuh"
 
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};
@@ -157,11 +155,13 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     const __grid_constant__ CUtensorMap tensor_map_output_t,
                                     nvfp4_scale_t *const scales_ptr,
                                     nvfp4_scale_t *const scales_t_ptr,
-                                    const size_t rows, const size_t cols, 
+                                    const size_t rows, const size_t cols,
                                     const size_t scale_stride,
                                     const size_t scale_stride_t,
                                     const float *const amax_rowwise_ptr,
-                                    const float *const amax_colwise_ptr) {
+                                    const float *const amax_colwise_ptr,
+                                    const bool swizzle_scales,
+                                    const int32_t numKTiles) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -547,7 +547,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
         const size_t scales_offset_Y =
             scales_offset_Y_rowwise + stage * BUFF_DIM_Y + it * THREADS_Y_ROWWISE;
         const size_t scales_offset_X = scales_offset_X_rowwise;
-        const size_t scale_idx_global = scales_offset_Y * scale_stride + scales_offset_X;
+        const size_t scale_idx_global = swizzle_scales
+            ? (size_t)cvt_quant_to_fp4_get_sf_out_offset(
+                  (int)scales_offset_Y, (int)scales_offset_X, numKTiles)
+            : scales_offset_Y * scale_stride + scales_offset_X;
 
         // const bool rowwise_scale_is_within_bounds_Y = scales_offset_Y < rows;
         const bool rowwise_scale_is_within_bounds_Y =
@@ -661,11 +664,13 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        nvfp4_scale_t *const scales_ptr,
                                        nvfp4_scale_t *const scales_t_ptr,
                                        const size_t rows,
-                                       const size_t cols, 
+                                       const size_t cols,
                                        const size_t scale_stride,
                                        const size_t scale_stride_t,
                                        const float *const amax_rowwise_ptr,
-                                       const float *const amax_colwise_ptr) {
+                                       const float *const amax_colwise_ptr,
+                                       const bool swizzle_scales,
+                                       const int32_t numKTiles) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -1286,7 +1291,8 @@ void quantize_transpose_nvfp4(
     at::Tensor &output_transpose,
     at::Tensor &output_scale_transpose,
     bool use_2d_quantization,
-    bool return_transpose
+    bool return_transpose,
+    bool swizzle_scales
 ) {
   constexpr bool use_stochastic_rounding = false;
 
@@ -1302,6 +1308,13 @@ void quantize_transpose_nvfp4(
              "Number of tensor rows must be a multiple of 32");  // 16B alignment for TMA
   TORCH_CHECK(cols % 32 == 0,
              "Number of tensor cols must be a multiple of 32");  // 16B alignment for TMA
+  TORCH_CHECK(!(swizzle_scales && use_2d_quantization),
+             "swizzle_scales is not supported with 2D quantization");
+  TORCH_CHECK(!(swizzle_scales && return_transpose),
+             "swizzle_scales is not supported with return_transpose");
+
+  const size_t SFs_per_row = cols / SCALE_DIM;
+  const int32_t numKTiles = (SFs_per_row + 3) >> 2;
 
 #if FP4_TYPE_SUPPORTED
   // NOTE: tuned_1D kernel wiring is currently disabled due runtime stability issues.
@@ -1382,7 +1395,8 @@ void quantize_transpose_nvfp4(
         kernel<<<grid, block_size, dshmem_size, stream>>>(
             tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
             scales_transpose_ptr, rows, cols,
-            scale_stride, scale_stride_transpose, amax_rowwise_ptr, amax_colwise_ptr);
+            scale_stride, scale_stride_transpose, amax_rowwise_ptr, amax_colwise_ptr,
+            swizzle_scales, numKTiles);
       });
     );
 }

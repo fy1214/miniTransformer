@@ -401,47 +401,38 @@ def group_quantize_nvfp4_pertoken_swizzled(
     four_six: bool = False,
     scale_override: float = 1.0,
     fuse_pad: bool = False,
-    split_amax: bool = True,
 ) -> GroupQuantizeSwizzledResult:
     """Grouped per-token NVFP4 quantization with per-group tcgen05 swizzled scales.
 
-    Two implementation modes controlled by ``split_amax``:
-
-    **split_amax=True** (default, recommended):
-        Splits quantization into two independent kernels:
-        1. ``fp4_perrow_amax_te`` — per-row absolute-max reduction
-           (grid=num_rows, block=256, one row per CTA).
-        2. ``rtn_fp4_group_pertoken_split_amax`` — pure streaming quantize
-           (flat 1-D grid, zero __syncthreads, zero shared memory).
-        Total: 2 kernel launches regardless of number of groups.
-        Advantages: no K limit, no M-alignment requirement, 2-67x faster
-        than TE split_quantize on MoE shapes (8-32 experts).
-
-    **split_amax=False** (legacy fused):
-        Single kernel ``rtn_fp4_group_pertoken`` that fuses amax reduction
-        + quantization using shared-memory tree-reduce.
-        Constraints: K <= 4096, m_splits must be multiples of 128.
-
     Args:
         x:              2-D BF16 tensor [total_m, k], contiguous, on CUDA.
+                        k must be divisible by 128 and <= 4096.
                         When ``fuse_pad=False`` (default): ``total_m`` is the
                         actual row count and ``sum(m_splits) == total_m``.
                         When ``fuse_pad=True``: ``x`` is the *unpadded* tensor
-                        and ``sum(m_splits) == total_m`` still holds — but the
-                        output buffers are sized to the *padded* total.
+                        (post-permute, pre-Fp8Padding) and
+                        ``sum(m_splits) == total_m`` still holds — but the
+                        output buffers are sized to the *padded* total
+                        ``sum(ceil(m_i/128)*128)``, with the kernel emitting
+                        bit-zero FP4/SF for the pad rows so the downstream
+                        grouped GEMM produces ``0·W = 0`` on those rows.
         m_splits:       Per-group token counts. With ``fuse_pad=False`` these
-                        match rows in ``x``. With ``fuse_pad=True`` these are
-                        the *unpadded* per-expert token counts.
+                        match rows in ``x`` (typical when caller already ran
+                        Fp8Padding). With ``fuse_pad=True`` these are the
+                        *unpadded* per-expert token counts and the wrapper
+                        derives padded offsets internally.
         four_six:       Round-4-or-6 if True; RTN otherwise (default).
         scale_override: Scalar multiplier for the per-row global scale.
         fuse_pad:       If True, fuse Megatron's ``Fp8Padding`` D2D copy into
-                        the quantize kernel. Only supported with split_amax=False.
-        split_amax:     If True (default), use the 2-kernel split approach
-                        (separate amax + streaming quantize). If False, use
-                        the legacy single fused kernel.
+                        the quantize kernel (per-CTA-chunk scheduling + binary
+                        search owning-group lookup). 3-6× faster end-to-end
+                        on Qwen3-30B-A3B shapes. Default False preserves the
+                        legacy per-row kernel.
 
     Returns:
-        GroupQuantizeSwizzledResult.
+        GroupQuantizeSwizzledResult. When ``fuse_pad=True`` the result also
+        carries ``unpadded_row_offsets_gpu`` for slicing real rows back out
+        of the padded buffers.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16, "x must be a CUDA bfloat16 tensor"
     assert x.dim() == 2 and x.is_contiguous(), "x must be a contiguous 2-D tensor"
@@ -449,7 +440,6 @@ def group_quantize_nvfp4_pertoken_swizzled(
 
     total_m, k = x.shape
     device = x.device
-    T = _MMA_TILE_ROWS
 
     if total_m == 0:
         empty_off = torch.zeros(len(m_splits) + 1, dtype=torch.int32, device=device)
@@ -462,20 +452,23 @@ def group_quantize_nvfp4_pertoken_swizzled(
             unpadded_row_offsets_gpu=empty_off.clone() if fuse_pad else None,
         )
 
+    # Compute all offsets on CPU to avoid implicit cudaDeviceSynchronize from
+    # pageable H2D copies (torch.tensor(list, device='cuda')) and GPU-side
+    # cumsum/cat of tiny tensors.  Upload once via pin_memory + non_blocking.
+    T = _MMA_TILE_ROWS
     m_padded = [((m + T - 1) // T) * T for m in m_splits]
 
     scale_flat_size = sum(mp * (k // 16) for mp in m_padded)
     scale_flat = torch.zeros(scale_flat_size, dtype=nvfp4_scale_t, device=device)
 
+    # scale_offsets: cumsum of m_padded[i] * (k // 16)
     so = [0]
     for mp in m_padded:
         so.append(so[-1] + mp * (k // 16))
     scale_offsets_gpu = torch.tensor(so, dtype=torch.int64).pin_memory().to(device, non_blocking=True)
 
-    # --- fuse_pad path (only supported with legacy fused kernel) ---
     if fuse_pad:
-        assert not split_amax, (
-            "fuse_pad=True is only supported with split_amax=False (legacy fused kernel)")
+        # Unpadded offsets index into x; padded offsets index into data / gs.
         uo = [0]
         po = [0]
         for m, mp in zip(m_splits, m_padded):
@@ -502,35 +495,10 @@ def group_quantize_nvfp4_pertoken_swizzled(
             unpadded_row_offsets_gpu=unpadded_row_offsets_gpu,
         )
 
-    # --- split_amax=True: 2-kernel approach (amax + streaming quantize) ---
-    if split_amax:
-        ro = [0]
-        for m in m_splits:
-            ro.append(ro[-1] + m)
-        row_offsets_gpu = torch.tensor(ro, dtype=torch.int32).pin_memory().to(device, non_blocking=True)
-
-        data = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
-        global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
-        amax_per_row = torch.empty(total_m, dtype=torch.float32, device=device)
-
-        fp4_gemm.fp4_perrow_amax_te(amax_per_row, x)
-        fn = (fp4_gemm.four_six_fp4_group_pertoken_split_amax if four_six
-              else fp4_gemm.rtn_fp4_group_pertoken_split_amax)
-        fn(data, scale_flat, global_scale, x, amax_per_row,
-           row_offsets_gpu, scale_offsets_gpu, scale_override)
-
-        return GroupQuantizeSwizzledResult(
-            data=data,
-            global_scale=global_scale,
-            scale_flat=scale_flat,
-            row_offsets_gpu=row_offsets_gpu,
-            scale_offsets_gpu=scale_offsets_gpu,
-        )
-
-    # --- split_amax=False: legacy fused kernel ---
+    # Legacy path: x already matches m_splits row-for-row (no fused padding).
     assert all(m % T == 0 for m in m_splits), (
-        f"split_amax=False requires each m in m_splits to be a multiple of {T}; "
-        f"got {m_splits}"
+        f"group_quantize_nvfp4_pertoken_swizzled (fuse_pad=False): each m in "
+        f"m_splits must be a multiple of {T}; got {m_splits}"
     )
     data         = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(total_m, dtype=torch.float32, device=device)

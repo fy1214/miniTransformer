@@ -21,6 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("output_scale_transpose"),
         pybind11::arg("use_2d_quantization"),
         pybind11::arg("return_transpose"),
+        pybind11::arg("swizzle_scales") = false,
         "quantize and transpose (CUDA)");
     m.def("swizzle_scaling_factors", &swizzle_scaling_factors, "Swizzle scaling factors (CUDA)");
     m.def("cublas_gemm", &cublas_gemm, "FP4 GEMM with cuBLASLt (CUDA)");
@@ -139,4 +140,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequant_tp_had_quant", &dequant_tp_had_quant_binding, "Dequant TP Had Quant (CUDA)");
     m.def("rht_128_eden", &rht_128_eden_binding, "rht 128 eden (CUDA)");
     m.def("rht128_requant", &rht128_requant_binding, "rht 128 requant (CUDA)");
+
+    // v2 grouped pertoken (zero-sync streaming, accepts pre-computed amax)
+    m.def("rtn_fp4_group_pertoken_split_amax", &rtn_fp4_group_pertoken_split_amax_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("amax_per_row"),
+          pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "RTN FP4 grouped per-token v2: zero-sync streaming, pre-computed amax (CUDA)");
+    m.def("four_six_fp4_group_pertoken_split_amax", &four_six_fp4_group_pertoken_split_amax_binding,
+          pybind11::arg("out"), pybind11::arg("scales"), pybind11::arg("global_scale"),
+          pybind11::arg("inp"), pybind11::arg("amax_per_row"),
+          pybind11::arg("row_offsets"), pybind11::arg("scale_offsets"),
+          pybind11::arg("scale_override"),
+          "Round-4-or-6 FP4 grouped per-token v2: zero-sync streaming, pre-computed amax (CUDA)");
+    m.def("fp4_perrow_amax_te", &fp4_perrow_amax_te_binding,
+          pybind11::arg("amax_out"), pybind11::arg("inp"),
+          "Per-row absolute max (TE-style, grid=num_rows, block=256) (CUDA)");
 }

@@ -27,6 +27,7 @@
 #include "../../../util/transformer_engine/ptx.cuh"
 #include "../../../util/transformer_engine/vector.cuh"
 #include "../../../util/quarter/utils.cuh"
+#include "quantize_transpose_nvfp4_tuned_1d.cuh"
 
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};

@@ -48,7 +48,14 @@ void create_2D_tensor_map(CUtensorMap &tensorMap, const at::Tensor &tensor,
   // The distance between elements in units of sizeof(element)
   uint32_t elemStride[rank] = {1, 1};
 
-  const CUtensorMapDataType tensorDataType = get_CUtensorMapDataType(tensor.scalar_type());
+  CUtensorMapDataType tensorDataType = get_CUtensorMapDataType(tensor.scalar_type());
+#if FP4_TYPE_SUPPORTED
+  // FP4 outputs/scales are stored in uint8 buffers but represent packed 4-bit data.
+  // TMA descriptor must use U4 packed mode to match TE behavior.
+  if (type_num_bits == 4) {
+    tensorDataType = CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
+  }
+#endif
   void *dataPtr = reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(tensor.data_ptr()) +
                                            (offset_elems * type_num_bits) / 8);
 

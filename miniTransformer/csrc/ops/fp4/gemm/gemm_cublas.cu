@@ -4,6 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -18,6 +20,38 @@
 
 inline void CreateCublasHandle(cublasLtHandle_t *handle) {
   NVTE_CHECK_CUBLAS(cublasLtCreate(handle));
+}
+
+
+/* Use CUDA const memory to store scalar 1 and 0 for cublas usage
+*/
+__device__ __constant__ float one_device;
+__device__ __constant__ float zero_device;
+
+
+inline float *GetScalarOne() {
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    float one = 1.0f;
+    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(one_device, &one, sizeof(float)));
+  });
+  // return address by cudaGetSymbolAddress
+  float *dev_ptr;
+  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), one_device));
+  return dev_ptr;
+}
+
+
+inline float *GetScalarZero() {
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    float zero = 0.0f;
+    NVTE_CHECK_CUDA(cudaMemcpyToSymbol(zero_device, &zero, sizeof(float)));
+  });
+  // return address by cudaGetSymbolAddress
+  float *dev_ptr;
+  NVTE_CHECK_CUDA(cudaGetSymbolAddress(reinterpret_cast<void **>(&dev_ptr), zero_device));
+  return dev_ptr;
 }
 
 void cublas_gemm_impl(
@@ -72,9 +106,9 @@ void cublas_gemm_impl(
   const cudaDataType_t A_type = CUDA_R_4F_E2M1;
   const cudaDataType_t B_type = CUDA_R_4F_E2M1;
   cudaDataType_t D_type = CUDA_R_16BF;
-  if (inputB->dtype() == at::ScalarType::Half) {
+  if (outputD->dtype() == at::ScalarType::Half) {
     D_type = CUDA_R_16F;
-  } else if (inputB->dtype() == at::ScalarType::Float) {
+  } else if (outputD->dtype() == at::ScalarType::Float) {
     D_type = CUDA_R_32F;
   }
 
@@ -187,7 +221,7 @@ void cublas_gemm_impl(
   NVTE_CHECK(status != CUBLAS_STATUS_NOT_SUPPORTED,
              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
-  if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
+  if (returnedResults == 0) throw std::runtime_error("Unable to find any suitable algorithms");
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
@@ -291,6 +325,8 @@ void block_scaled_matmul_nvfp4_impl(
     const at::Tensor *scale_B,
     void *workspace,
     size_t workspaceSize,
+    float *alpha,
+    bool accumulate,
     cudaStream_t stream) {
   const int M = A->size(0);
   const int K_bytes = A->size(1);  // K in bytes
@@ -298,11 +334,8 @@ void block_scaled_matmul_nvfp4_impl(
   const int N = B->size(0);
   
   TORCH_CHECK(B->size(1) == K_bytes, "B K dimension mismatch: expected ", K_bytes, " bytes, got ", B->size(1));
-  TORCH_CHECK(output->size(0) == M && output->size(1) == N, 
-              "Output shape mismatch: expected (", M, ", ", N, "), got (", output->size(0), ", ", output->size(1), ")");
   TORCH_CHECK(A->dtype() == at::ScalarType::Byte, "A must be uint8, got ", A->dtype());
   TORCH_CHECK(B->dtype() == at::ScalarType::Byte, "B must be uint8, got ", B->dtype());
-  TORCH_CHECK(output->dtype() == at::ScalarType::Half, "Output must be float16, got ", output->dtype());
 
   using cublasHandleManager = HandleManager<cublasLtHandle_t, CreateCublasHandle>;
   cublasLtHandle_t handle = cublasHandleManager::Instance().GetHandle();
@@ -334,33 +367,43 @@ void block_scaled_matmul_nvfp4_impl(
       sizeof(ab_scale_type)));
 
   // Set scale pointers
-  // NOTE: A and B matrices are swapped in cublasLtMatmul call to handle
-  // row-major vs column-major conversion, so scales are also swapped
   void *scale_A_ptr = const_cast<void*>(scale_A->data_ptr());
   void *scale_B_ptr = const_cast<void*>(scale_B->data_ptr());
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
-      matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_B_ptr,
-      sizeof(scale_B_ptr))); // Swapped
+      matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_A_ptr,
+      sizeof(scale_A_ptr)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
-      matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_A_ptr,
-      sizeof(scale_A_ptr))); // Swapped
+      matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_B_ptr,
+      sizeof(scale_B_ptr)));
   // Create matrix layouts
   // NVFP4: CUDA_R_4F_E2M1
   // With transa=T: A layout is (k, m), lda=k
   // With transb=N: B layout is (k, n), ldb=k
   cudaDataType_t dataType = CUDA_R_4F_E2M1;
+  cudaDataType_t D_type = CUDA_R_16BF;
+  if (output->dtype() == at::ScalarType::Half) {
+    D_type = CUDA_R_16F;
+  } else if (output->dtype() == at::ScalarType::Float) {
+    D_type = CUDA_R_32F;
+  }
+
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, dataType, K, M, K));
   NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, dataType, K, N, K));
-  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, M, N, M));
+  NVTE_CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, D_type, M, N, M));
 
-  float alpha = 1.0f;
-  float beta = 0.0f; // No bias
+  float* beta = (accumulate) ? GetScalarOne() : GetScalarZero();
 
   // Create preference
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
   NVTE_CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
       sizeof(workspaceSize)));
+
+  // Set pointer mode: alpha and beta are both device pointers
+  // https://docs.nvidia.com/cuda/cublas/#cublasltpointermode-t
+  cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+  NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+      matmulDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
   // Query cuBLAS heuristics for the best algorithm
   cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
@@ -374,10 +417,10 @@ void block_scaled_matmul_nvfp4_impl(
 
   // Execute matmul with the selected algorithm
   // B and A are swapped for row-major to col-major conversion
-  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, &alpha, 
+  NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, alpha,
+                                   const_cast<void*>(A->data_ptr()), Adesc,
                                    const_cast<void*>(B->data_ptr()), Bdesc,
-                                   const_cast<void*>(A->data_ptr()), Adesc, 
-                                   &beta, 
+                                   beta,
                                    output->data_ptr(), Cdesc,
                                    output->data_ptr(), Cdesc, 
                                    &heuristicResult.algo,
@@ -396,12 +439,16 @@ void block_scaled_matmul_nvfp4_impl(
 }
 
 void block_scaled_matmul_nvfp4(
-    const at::Tensor A,
-    const at::Tensor B,
-    at::Tensor output,
-    const at::Tensor scale_A,
-    const at::Tensor scale_B,
-    const at::Tensor workspace_tensor,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& output,
+    const at::Tensor& scale_A,
+    const at::Tensor& scale_B,
+    float amax_A,
+    float amax_B,
+    at::Tensor& alpha,
+    bool accumulate,
+    const at::Tensor& workspace_tensor,
     size_t workspace_size) {
   auto stream = at::cuda::getCurrentCUDAStream();
   
@@ -410,8 +457,6 @@ void block_scaled_matmul_nvfp4(
               "block_scaled_matmul_nvfp4 only supports uint8 packed FP4 inputs (NVFP4), got A dtype: ", A.dtype());
   TORCH_CHECK(B.dtype() == at::ScalarType::Byte,
               "block_scaled_matmul_nvfp4 only supports uint8 packed FP4 inputs (NVFP4), got B dtype: ", B.dtype());
-  TORCH_CHECK(output.dtype() == at::ScalarType::Half,
-              "block_scaled_matmul_nvfp4 output must be float16, got ", output.dtype());
   
   // For packed FP4, shape[1] is in bytes, but K dimension should be in elements
   // So K = A_shape[1] * 2 (2 elements per byte)
@@ -419,8 +464,53 @@ void block_scaled_matmul_nvfp4(
   TORCH_CHECK(B.size(1) * 2 == K, 
               "K dimensions must match. A has ", K, " elements, B has ", B.size(1) * 2, " elements");
 
+  // Compute alpha
+  // float new_alpha = 1.0f;
+  // new_alpha = compute_nvfp4_per_tensor_scale_kernel(alpha, amax_A, amax_B);
+
   block_scaled_matmul_nvfp4_impl(
       &A, &B, &output, &scale_A, &scale_B,
-      workspace_tensor.data_ptr(), workspace_size, stream);
+      workspace_tensor.data_ptr(), workspace_size, static_cast<float*>(alpha.data_ptr()), accumulate, stream);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void cublas_gemm(
+  const at::Tensor A,
+  const at::Tensor A_scale,
+  float amax_A,
+  bool transa,
+  const at::Tensor B,
+  const at::Tensor B_scale,
+  float amax_B,
+  bool transb,
+  float alpha,
+  std::optional<float> beta,
+  at::Tensor D,
+  bool accumulate,
+  const at::Tensor workspace_tensor,
+  size_t workspace_size
+) {
+  throw std::runtime_error("cublas_gemm requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+void block_scaled_matmul_nvfp4(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& output,
+    const at::Tensor& scale_A,
+    const at::Tensor& scale_B,
+    float amax_A,
+    float amax_B,
+    at::Tensor& alpha,
+    bool accumulate,
+    const at::Tensor& workspace_tensor,
+    size_t workspace_size) {
+  throw std::runtime_error("block_scaled_matmul_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS
 

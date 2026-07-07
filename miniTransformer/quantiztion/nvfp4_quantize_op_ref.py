@@ -1,12 +1,27 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
 from miniTransformer.quantiztion import quantization
+from miniTransformer.utils.utils import _empty_tensor
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
+
+
+def unpack_quantize_results(qresult_list):
+    """Unpack a list of QuantizeResult objects into per-field lists."""
+    return (
+        [r.data for r in qresult_list],
+        [r.scale for r in qresult_list],
+        [r.tensor_scale for r in qresult_list],
+        [r.data_t for r in qresult_list],
+        [r.scale_t for r in qresult_list],
+        [r.tensor_scale_t for r in qresult_list],
+    )
 
 
 def cast_to_e8(decode_scale):
@@ -14,11 +29,11 @@ def cast_to_e8(decode_scale):
 
     The result is in FP32, not FP8 E8M0.
     """
-    max_exponent = torch.tensor(127, device=decode_scale.device, dtype=torch.float32)
+    max_exponent = 127
     exponent = torch.ceil(torch.log2(decode_scale))
     exponent = torch.clamp(exponent, min=-max_exponent, max=max_exponent)
 
-    return torch.tensor(2.0, device=decode_scale.device, dtype=torch.float32) ** exponent
+    return torch.exp2(exponent)
 
 
 def cast_to_e4m3(decode_scale, global_amax):
@@ -160,6 +175,7 @@ def get_wgrad_sign_vector() -> torch.Tensor:
 class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
+        self.should_update_quantize_weights = True
 
     @property
     def supports_allgather(self) -> bool:
@@ -216,7 +232,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         transform = H * scale
         out = x_mat @ transform
         return out.view(original_shape)
-    
+
+
     @staticmethod
     def _pad_tensor(
         tensor: torch.Tensor, row_divisor: Optional[int], col_divisor: Optional[int]
@@ -302,56 +319,159 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
                 torch.float32
             )  # (128, 8, 1)
         x = x.view(m, n // tile_len_x, tile_len_x)
-        FLOAT4_E2M1_MAX = torch.tensor(6.0, device=x.device, dtype=torch.float32)
-        FLOAT8_E4M3_MAX = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+        FLOAT4_E2M1_MAX = 6.0
+        FLOAT8_E4M3_MAX = 448.0
         decode_scale = torch.div(vec_max, FLOAT4_E2M1_MAX)
 
         if pow_2_scales:
             decode_scale = cast_to_e8(decode_scale)
-            encode_scale = torch.div(
-                torch.tensor(1.0, device=x.device, dtype=torch.float32),
-                decode_scale.to(torch.float32),
-            )
+            encode_scale = torch.reciprocal(decode_scale.to(torch.float32))
         else:
-            global_encode_scale = torch.div(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, global_amax)
-            global_encode_scale = torch.min(
+            # global_amax is [1] (per-tensor) or [M, 1] (per-token).
+            # decode_scale is 3D [M, num_tiles, 1]; broadcast global_amax to [M, 1, 1].
+            if global_amax.dim() == 2:
+                global_amax_bc = global_amax.unsqueeze(1)  # [M, 1] -> [M, 1, 1]
+            else:
+                global_amax_bc = global_amax               # [1], broadcasts directly
+            global_encode_scale = torch.div(FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, global_amax_bc)
+            global_encode_scale = torch.clamp(
                 global_encode_scale,
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=global_encode_scale.device,
-                    dtype=torch.float32,
-                ),
+                max=torch.finfo(torch.float32).max,
             )
-            if global_encode_scale == torch.tensor(0.0, device=x.device, dtype=torch.float32):
-                global_encode_scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)
-            global_decode_scale = torch.div(1.0, global_encode_scale)
+            global_encode_scale = torch.where(
+                global_encode_scale == 0.0,
+                torch.ones_like(global_encode_scale),
+                global_encode_scale,
+            )
+            global_decode_scale = torch.div(1.0, global_encode_scale)   # global_encode_scale = 1/(global_amax/448*6)
 
-            decode_scale = decode_scale * global_encode_scale
-            decode_scale = torch.min(
+            decode_scale = decode_scale * global_encode_scale   # decode_scale= (vec_max/6) * (global_amax/448*6)
+            decode_scale = torch.clamp(
                 decode_scale,
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=decode_scale.device,
-                    dtype=torch.float32,
-                ),
+                max=torch.finfo(torch.float32).max,
             )
             decode_scale = torch.clamp(decode_scale, min=-FLOAT8_E4M3_MAX, max=FLOAT8_E4M3_MAX)
             decode_scale = decode_scale.to(torch.float8_e4m3fn)
 
-            encode_scale = torch.min(
+            encode_scale = torch.clamp(
                 torch.div(1.0, decode_scale.to(torch.float32) * global_decode_scale),
-                torch.tensor(
-                    torch.finfo(torch.float32).max,
-                    device=decode_scale.device,
-                    dtype=torch.float32,
-                ),
-            )
+                max=torch.finfo(torch.float32).max,
+            )   # encode_scale = vec_max/6
 
         scaled_x = x.to(torch.float32) * encode_scale
 
         clipped_x = torch.clamp(scaled_x, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).reshape(m, n)
 
         return cast_to_fp4x2(clipped_x), decode_scale.squeeze(-1)
+
+    @classmethod
+    def _dequantize_blockwise_reference(
+        cls,
+        qx: torch.Tensor,
+        decode_scale: torch.Tensor,
+        original_shape: Tuple[int, int],
+        tile_len_x: int,
+        tile_len_y: int,
+        *,
+        out_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        Blockwise NVFP4 dequantize; inverse of _quantize_blockwise_reference.
+
+        Args:
+            qx          : packed uint8 tensor, shape [M, N//2]
+                          (each byte stores 2 FP4 values: low 4 bits = even column, high 4 bits = odd column)
+            decode_scale: fp8_e4m3fn tensor, shape [M, N//tile_len_x]
+                          (one scale per tile)
+            original_shape: (M, N) original unpadded size
+            tile_len_x  : number of columns per tile (typically 16)
+            tile_len_y  : number of rows per tile (1 for 1D quant, 16 for 2D quant)
+            out_dtype   : output dtype
+
+        Returns:
+            dequantized tensor, shape [M, N], dtype=out_dtype
+        """
+        M_orig, N_orig = original_shape
+
+        # 1. Unpack packed uint8 -> float, shape [M, N]
+        x_fp4 = cast_from_fp4x2(qx, torch.float32)   # [M, N], each element is an FP4 float value
+
+        M, N = x_fp4.shape
+
+        # 2. Reshape into tile view and multiply by decode_scale
+        #    decode_scale shape: [M, N//tile_len_x], one scale per row per tile
+        #    x_fp4 reshape: [M, N//tile_len_x, tile_len_x]
+        x_tiles = x_fp4.view(M, N // tile_len_x, tile_len_x)          # [M, num_tiles, tile_len_x]
+
+        scale = decode_scale.to(torch.float32)                          # [M, num_tiles]
+
+        # For 2D quantization (tile_len_y > 1), scale rows are already expanded via repeat_interleave,
+        # so shape remains [M, N//tile_len_x] — no extra handling needed.
+        x_dequant = x_tiles * scale.unsqueeze(-1)                       # [M, num_tiles, tile_len_x]
+        x_dequant = x_dequant.view(M, N)                                # [M, N]
+
+        # 3. Crop to original size (remove padding)
+        x_dequant = x_dequant[:M_orig, :N_orig].contiguous()
+
+        return x_dequant.to(out_dtype)
+
+    def dequantize(
+        self,
+        qx: torch.Tensor,
+        sx: torch.Tensor,
+        global_amax: torch.Tensor,
+        out_dtype: torch.dtype = torch.bfloat16,
+        qparams: Optional["quantization.QParams"] = None,
+    ) -> torch.Tensor:
+        """
+        Inverse of quantize().
+
+        Args:
+            qx         : packed uint8, shape [M, N//2]
+            sx         : decode_scale, fp8_e4m3fn, shape [M, N//tile_len_x]
+            global_amax: global amax (used to recover global_decode_scale when pow_2_scales=False)
+            out_dtype  : output dtype (default bfloat16)
+            qparams    : quantization params; uses defaults when None
+
+        Returns:
+            dequantized tensor, shape [M, N], dtype=out_dtype
+        """
+        if qparams is None:
+            # Default: 1x16 tile, no pow_2_scales, no 2D quantization
+            tile_len_x = 16
+            tile_len_y = 1
+            pow_2_scales = False
+            with_2d_quantization = False
+        else:
+            tile_len_x = qparams.quant_tile_shape[1]
+            tile_len_y = qparams.quant_tile_shape[0]
+            pow_2_scales = qparams.pow_2_scales
+            with_2d_quantization = qparams.with_2d_quantization
+
+        # qx shape: [M, N//2]; original N = qx.shape[1] * 2
+        M = qx.shape[0]
+        N = qx.shape[1] * 2
+
+        if pow_2_scales:
+            # pow_2_scales path: decode_scale is already the final scale, no global factor needed
+            actual_scale = sx
+        else:
+            # Non-pow_2_scales path:
+            # During quantization: decode_scale = (vec_max / E2M1_MAX) * global_encode_scale
+            # To dequantize, multiply by global_decode_scale = 1 / global_encode_scale = global_amax / (E4M3_MAX * E2M1_MAX)
+            FLOAT8_E4M3_MAX = 448.0
+            FLOAT4_E2M1_MAX = 6.0
+            global_decode_scale = global_amax.to(torch.float32) / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+            actual_scale = sx.to(torch.float32) * global_decode_scale
+
+        return self._dequantize_blockwise_reference(
+            qx,
+            actual_scale,
+            original_shape=(M, N),
+            tile_len_x=tile_len_x,
+            tile_len_y=tile_len_y,
+            out_dtype=out_dtype,
+        )
 
     def _quantize(
         self,
@@ -372,13 +492,24 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             if qparams.with_rht
             else x.t().contiguous()
         )
-        # Compute amax for rowwise and columnwise paths separately
-        global_amax_row = torch.max(torch.abs(row_input)).to(torch.float32).view(1)
-        global_amax_col = (
-            torch.max(torch.abs(col_input)).to(torch.float32).view(1)
-            if return_transpose
-            else global_amax_row
-        )
+        
+        # Compatibility shim: support per_token_amax if set on qparams
+        per_token_amax = getattr(qparams, 'per_token_amax', False)
+
+        if per_token_amax:
+            global_amax_row = torch.amax(torch.abs(row_input), dim=-1, keepdim=True).to(torch.float32)
+            global_amax_col = (
+                torch.amax(torch.abs(col_input), dim=-1, keepdim=True).to(torch.float32)
+                if return_transpose
+                else global_amax_row
+            )
+        else:
+            global_amax_row = torch.max(torch.abs(row_input)).to(torch.float32).view(1)
+            global_amax_col = (
+                torch.max(torch.abs(col_input)).to(torch.float32).view(1)
+                if return_transpose
+                else global_amax_row
+            )
 
         transpose_scales = False
 
@@ -458,6 +589,42 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         )
         return quantization.QuantizeResult(qx, sx, qx_t, sx_t, global_amax_row, global_amax_col)
 
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+    ) -> GroupQuantizeResult:
+        """
+        If param type is weight, the shape is [num_gemms, n, k].
+        If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
+        If param type is Y, the shape is [m_sum, n].
+        """
+        if qparams.param_type != qparams.param_type.WEIGHT:
+            x = torch.split(x, m_splits)
+
+        results = [
+            self.quantize(xi, qparams, return_transpose, reduce_amax, tp_group, input_meta)
+            for xi in x
+        ]
+
+        qx, sx, tx, qx_t, sx_t, tx_t = unpack_quantize_results(results)
+
+        return GroupQuantizeResult(
+            data=qx,
+            data_t=qx_t,
+            scale=sx,
+            scale_t=sx_t,
+            tensor_scale=tx,
+            tensor_scale_t=tx_t
+        )
+
+
     def _ref_qgemm(
         self,
         qx: torch.Tensor,
@@ -474,6 +641,8 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """Python implementation of microblock FP4 GEMM."""
         assert bias is None, "Bias is implemented for FP4 GEMM."
@@ -571,6 +740,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             y = y.to(out_dtype)
             return y
 
+
     def qgemm(
         self,
         qx: torch.Tensor,
@@ -588,6 +758,7 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        custom_gemm_backend: str = "cublas",
     ) -> torch.Tensor:
         if out is not None:
             assert out_dtype == out.dtype, "Output dtype mismatch."
@@ -608,3 +779,57 @@ class Nvfp4TiledQuantizeRefOp(quantization.QuantizeOpBase):
             qparams_x=qparams_x,
             qparams_w=qparams_w,
         )
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad=False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+
+        num_gemms = len(m_splits)
+
+        empty_tensor = _empty_tensor()
+        empty_tensors = [empty_tensor] * num_gemms
+
+        bias = bias if use_bias else None
+        res = []
+
+        for i in range(num_gemms):
+            out = self.qgemm(
+                A[i],
+                B[i],
+                None,
+                out_dtype,
+                sA[i],
+                sB[i],
+                None if bias is None else bias[i],
+                None if out is None else out[i],
+                grad,
+                accumulate,
+                layout,
+                global_amax_A[i],
+                global_amax_B[i],
+                qparams_x,
+                qparams_w,
+                "cublas"
+            )
+            res.append(out)
+
+        return torch.cat(res, dim=0)

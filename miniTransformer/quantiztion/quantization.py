@@ -3,16 +3,15 @@ import dataclasses
 import enum
 import math
 import torch
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, NamedTuple, List
 
 from ..utils import utils
 
 
 @enum.unique
 class ParamType(enum.Enum):
-    """quantization type for linear layers."""
+    """Parameter role for quantization dispatch (activation, weight, or gradient)."""
 
-    # Non-quantize
     X = "x"
     WEIGHT = "weight"
     Y = "y"
@@ -74,6 +73,27 @@ class QuantizeResult:
 
 
 @dataclasses.dataclass
+class GroupQuantizeResult:
+    """A container to hold quantization result, including quantized tensor, optional
+    transposed quantized tensor, and corresponding decoding scales.
+
+    data: the quantized tensor.
+    scale: the decoding scale for the quantized tensor. Shape depends on the scaling granularity.
+        - if scaling type is PER_TENSOR, it should be a 1D scalar tensor.
+    data_t: the transposed quantized tensor.
+    scale_t: the decoding scale for the transposed quantized tensor.
+    """
+
+    data: List[torch.Tensor]
+    scale: List[torch.Tensor]
+    data_t: List[torch.Tensor] | None = None
+    scale_t: List[torch.Tensor] | None = None
+    tensor_scale: List[torch.Tensor] | None = None
+    tensor_scale_t: List[torch.Tensor] | None = None
+    extra_info: dict | None = None
+
+
+@dataclasses.dataclass
 class QuantizeResultCache:
     """
     Cache of quantized tensors
@@ -100,6 +120,20 @@ class QuantizeResultCache:
 
 
 @dataclasses.dataclass
+class GroupQuantizeResultCache:
+    """
+    Cache of group quantized tensors
+    """
+    data: Optional[List[torch.Tensor]] = None
+    scale: Optional[List[torch.Tensor]] = None
+    data_t: Optional[List[torch.Tensor]] = None
+    scale_t: Optional[List[torch.Tensor]] = None
+    global_amax_row: Optional[List[torch.Tensor]] = None
+    global_amax_col: Optional[List[torch.Tensor]] = None
+    extra_info: dict | None = None
+
+
+@dataclasses.dataclass
 class QuantizeInputMetaBase:
     """Metadata for quantization input, such as holding amax from the previous normalization layer.
     This should be subclassed for specific quantize operations.
@@ -107,7 +141,15 @@ class QuantizeInputMetaBase:
 
 
 
-class QuantizeOpBase():
+class QuantizeOpBase:
+
+    """
+    Base class for quantization operators.
+
+    Subclasses implement quantize() and qgemm() to define quantized training behavior.
+    Set should_update_quantize_weights=True to cache and reuse weight quantization across microbatches.
+    """
+    should_update_quantize_weights: bool = False
 
     @staticmethod
     def compute_global_amax(x: torch.Tensor):
@@ -151,6 +193,7 @@ class QuantizeOpBase():
         global_amax_qw: torch.Tensor,
         qparams_x: Optional[QParams],
         qparams_w: Optional[QParams],
+        custom_gemm_backend: str = "cublas"
     ) -> torch.Tensor:
         """Quantized GEMM interface.
 
@@ -219,10 +262,9 @@ def _scale_from_amax_tensor(
     """
     assert amax.dtype == torch.float, "amax must be a float tensor."
     fp8_max = torch.finfo(quant_dtype).max
-    # Clamping amax to avoid division by small numbers
+    # Clamp to avoid division by near-zero amax
     amax = torch.max(amax, torch.tensor(eps))
 
-    # Compute scale factor
     scale = torch.div(fp8_max, amax)
     # Note frexp doesn't give back inf for exponent with an inf input
     # We take care of inf before pow_2_scales
@@ -249,10 +291,9 @@ def _scale_from_amax_tensor(
         # calculation.
         scale = torch.where(amax == float("inf"), 0.0, scale)
 
-    # Handle overflow cases for amax zero causing NaN
+    # Handle amax==0 edge case (would cause NaN in division)
     scale = torch.where(amax == 0, 1.0, scale)
 
-    # Compute scale_inv
     scale_inv = torch.reciprocal(scale)
 
     return scale, scale_inv, amax
@@ -289,10 +330,8 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         ), f"Unsupported input dtype, {x.dtype}"
         assert not reduce_amax
         if qparams.quant_dtype is None:
-            # If qparams is None, use the input tensor as is
             qx = x
         else:
-            # Otherwise, cast the input tensor to quant_dtype
             assert (
                 qparams.scaling_type in self.supported_scaling_types
             ), f"Unsupported scaling type"
@@ -328,6 +367,7 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[QParams] = None,
         qparams_w: Optional[QParams] = None,
+        custom_gemm_backend: str = "cublas"
     ) -> torch.Tensor:
 
         assert (
@@ -338,7 +378,6 @@ class QuantizeOpNonQuantize(QuantizeOpBase):
         ), f"Unsupported weight dtype, {qw.dtype}"
 
         if bias is not None and bias.numel():
-            # fused matmul + bias
             y = torch.nn.functional.linear(qx, qw, bias=bias)
         else:
             y = torch.matmul(qx, qw.t())

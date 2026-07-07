@@ -8,6 +8,8 @@
  *  \brief CUDA kernels to cast to NVFP4 and transpose.
  */
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #ifndef TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
 #define TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
 
@@ -21,8 +23,11 @@
 #include <torch/extension.h>
 #include <torch/torch.h>    
 
+#include "../../../util/transformer_engine/common.h"
 #include "../../../util/transformer_engine/ptx.cuh"
 #include "../../../util/transformer_engine/vector.cuh"
+#include "../../../util/quarter/utils.cuh"
+#include "quantize_transpose_nvfp4_tuned_1d.cuh"
 
 using nvfp4_scale_t = fp8e4m3;
 struct Empty {};
@@ -151,11 +156,13 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     const __grid_constant__ CUtensorMap tensor_map_output_t,
                                     nvfp4_scale_t *const scales_ptr,
                                     nvfp4_scale_t *const scales_t_ptr,
-                                    const size_t rows, const size_t cols, 
+                                    const size_t rows, const size_t cols,
                                     const size_t scale_stride,
                                     const size_t scale_stride_t,
                                     const float *const amax_rowwise_ptr,
-                                    const float *const amax_colwise_ptr) {
+                                    const float *const amax_colwise_ptr,
+                                    const bool swizzle_scales,
+                                    const int32_t numKTiles) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -220,7 +227,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
   constexpr size_t in_mem = buff_size_aligned_in;
 
   constexpr size_t out_mem_rowwise_data = buff_size_aligned_out;
-  constexpr size_t out_mem_colwise_data = buff_size_aligned_out;
+  // Keep SHMEM layout consistent with host-side dshmem sizing:
+  // when RETURN_TRANSPOSE=false, no transpose data buffer is reserved.
+  constexpr size_t out_mem_colwise_data = RETURN_TRANSPOSE ? buff_size_aligned_out : 0;
   constexpr size_t out_mem_rowwise_scales = 0;
 
   extern __shared__ char dynamic_shmem[];
@@ -245,13 +254,16 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   const bool is_master_thread = (threadIdx.x == 0);
 
-  // Compute a global encoding/decoding scaling factors for all S_dec_b
-  const float S_enc_rowwise = 1.0f;
-  // NOTE: This is to match with how emulation code was written.
-  const float S_dec_rowwise = 1.0 / S_enc_rowwise;
+  // Global encode/decode scaling (match TE quantize_transpose_nvfp4.cuh and 2D kernel below).
+  const float S_enc_rowwise = (amax_rowwise_ptr == nullptr)
+                                  ? 1.0f
+                                  : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
+  const float S_dec_rowwise = 1.0f / S_enc_rowwise;
 
-  const float S_enc_colwise = S_enc_rowwise;
-  const float S_dec_colwise = 1.0 / S_enc_colwise;
+  const float S_enc_colwise = (amax_colwise_ptr == nullptr)
+                                  ? S_enc_rowwise
+                                  : compute_global_encode_scaling_factor_FP4(*amax_colwise_ptr);
+  const float S_dec_colwise = 1.0f / S_enc_colwise;
 
   float thread_amax = 0.0f;
 
@@ -536,7 +548,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
         const size_t scales_offset_Y =
             scales_offset_Y_rowwise + stage * BUFF_DIM_Y + it * THREADS_Y_ROWWISE;
         const size_t scales_offset_X = scales_offset_X_rowwise;
-        const size_t scale_idx_global = scales_offset_Y * scale_stride + scales_offset_X;
+        const size_t scale_idx_global = swizzle_scales
+            ? (size_t)cvt_quant_to_fp4_get_sf_out_offset(
+                  (int)scales_offset_Y, (int)scales_offset_X, numKTiles)
+            : scales_offset_Y * scale_stride + scales_offset_X;
 
         // const bool rowwise_scale_is_within_bounds_Y = scales_offset_Y < rows;
         const bool rowwise_scale_is_within_bounds_Y =
@@ -650,11 +665,13 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                        nvfp4_scale_t *const scales_ptr,
                                        nvfp4_scale_t *const scales_t_ptr,
                                        const size_t rows,
-                                       const size_t cols, 
+                                       const size_t cols,
                                        const size_t scale_stride,
                                        const size_t scale_stride_t,
                                        const float *const amax_rowwise_ptr,
-                                       const float *const amax_colwise_ptr) {
+                                       const float *const amax_colwise_ptr,
+                                       const bool swizzle_scales,
+                                       const int32_t numKTiles) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
@@ -720,7 +737,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
   constexpr size_t in_mem = buff_size_aligned_in;
 
   constexpr size_t out_mem_rowwise_data = buff_size_aligned_out;
-  constexpr size_t out_mem_colwise_data = buff_size_aligned_out;
+  // Keep SHMEM layout consistent with host-side dshmem sizing:
+  // when RETURN_TRANSPOSE=false, no transpose data buffer is reserved.
+  constexpr size_t out_mem_colwise_data = RETURN_TRANSPOSE ? buff_size_aligned_out : 0;
   constexpr size_t out_mem_rowwise_scales = 0;
 
   extern __shared__ char dynamic_shmem[];
@@ -1164,6 +1183,105 @@ __global__ void __launch_bounds__(THREADS_NUM)
 #endif  // #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
+#if FP4_TYPE_SUPPORTED
+namespace {
+
+void launch_quantize_transpose_nvfp4_tuned_1d(
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
+    at::Tensor &output,
+    at::Tensor &output_scale,
+    at::Tensor &output_transpose,
+    at::Tensor &output_scale_transpose,
+    bool return_transpose) {
+  namespace tk = transformer_engine::dispatch::nvfp4::quantize_transpose_tuned_kernel;
+
+  constexpr bool use_stochastic_rounding = false;
+  constexpr bool use_fast_math = false;
+
+  const size_t total_elements = input.numel();
+  const size_t cols = input.size(-1);
+  const size_t rows = total_elements / cols;
+
+  const int blocks_Y =
+      static_cast<int>(DIVUP(rows, static_cast<size_t>(tk::TunableConfig::CHUNK_DIM_Y)));
+  const int blocks_X =
+      static_cast<int>(DIVUP(cols, static_cast<size_t>(tk::TunableConfig::CHUNK_DIM_X)));
+  const dim3 grid(blocks_X, blocks_Y);
+  const int block_size = tk::THREADS_NUM;
+
+  const size_t scale_stride = output_scale.stride(0);
+  const size_t scale_stride_transpose =
+      return_transpose ? output_scale_transpose.stride(0) : 0;
+
+  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output_scale.data_ptr());
+  nvfp4_scale_t *const scales_transpose_ptr =
+      reinterpret_cast<nvfp4_scale_t *>(output_scale_transpose.data_ptr());
+
+  float *const amax_rowwise_ptr = reinterpret_cast<float *>(amax_rowwise.data_ptr());
+  float *const amax_colwise_ptr = reinterpret_cast<float *>(amax_colwise.data_ptr());
+
+  alignas(64) CUtensorMap tensor_map_input{};
+  alignas(64) CUtensorMap tensor_map_output{};
+  alignas(64) CUtensorMap tensor_map_transpose{};
+
+  create_2D_tensor_map(tensor_map_input, input, rows, cols, tk::BUFF_DIM_Y, tk::BUFF_DIM_X, cols, 0,
+                       sizeof(bf16) * 8, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+  create_2D_tensor_map(tensor_map_output, output, rows, cols, tk::BUFF_DIM_Y, tk::BUFF_DIM_X, cols, 0,
+                       4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+  if (return_transpose) {
+    create_2D_tensor_map(tensor_map_transpose, output_transpose, cols, rows, tk::BUFF_DIM_X,
+                         tk::BUFF_DIM_Y, rows, 0, 4, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+  }
+
+  constexpr int buff_elems = tk::BUFF_DIM_Y * tk::BUFF_IN_DIM_X;
+  constexpr int buff_elems_total_in = tk::BUFFS_NUM_IN * buff_elems;
+  constexpr int buff_size_aligned_in =
+      static_cast<int>(DIVUP_TO_MULTIPLE(buff_elems_total_in * sizeof(bf16), TMA_SHMEM_ALIGNMENT));
+  constexpr int buff_size_aligned_out =
+      static_cast<int>(DIVUP_TO_MULTIPLE(tk::BUFFS_NUM_OUT * tk::BUFF_OUT_SIZE, TMA_SHMEM_ALIGNMENT));
+  constexpr int buff_size_aligned_out_t = static_cast<int>(
+      DIVUP_TO_MULTIPLE(tk::BUFFS_NUM_OUT_TR * tk::BUFF_OUT_TR_SIZE, TMA_SHMEM_ALIGNMENT));
+
+  constexpr int buff_size_scales = static_cast<int>(DIVUP_TO_MULTIPLE(
+      tk::TunableConfig::CHUNK_DIM_Y * tk::SCALES_PER_CHUNK_X * sizeof(nvfp4_scale_t),
+      TMA_SHMEM_ALIGNMENT));
+  constexpr int buff_size_scales_transpose = static_cast<int>(DIVUP_TO_MULTIPLE(
+      tk::TunableConfig::CHUNK_DIM_X * tk::SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t),
+      TMA_SHMEM_ALIGNMENT));
+
+  const int in_mem = buff_size_aligned_in;
+  const int out_data_mem = buff_size_aligned_out;
+  const int out_data_transpose_mem = return_transpose ? buff_size_aligned_out_t : 0;
+  const int out_scales_mem = buff_size_scales;
+  const int out_scales_transpose_mem = return_transpose ? buff_size_scales_transpose : 0;
+  const int out_mem = out_data_mem + out_data_transpose_mem;
+  const int dshmem_size =
+      in_mem + out_mem + out_scales_transpose_mem + out_scales_mem + static_cast<int>(TMA_SHMEM_ALIGNMENT);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const float *noop_ptr = nullptr;
+  const size_t *rng_state = nullptr;
+
+  TRANSFORMER_ENGINE_SWITCH_CONDITION(
+      use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
+      TRANSFORMER_ENGINE_SWITCH_CONDITION(
+          use_fast_math, USE_FAST_MATH,
+          TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
+            auto kernel = tk::quantize_transpose_nvfp4_tuned_1D_kernel<USE_STOCHASTIC_ROUNDING,
+                                                                       USE_FAST_MATH, RETURN_TRANSPOSE>;
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
+            kernel<<<grid, block_size, dshmem_size, stream>>>(
+                tensor_map_input, tensor_map_output, tensor_map_transpose, scales_ptr,
+                scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
+                scale_stride, scale_stride_transpose, rng_state);
+          });););
+}
+
+}  // namespace
+#endif  // FP4_TYPE_SUPPORTED
 
 void quantize_transpose_nvfp4(
     const at::Tensor &input,
@@ -1174,7 +1292,8 @@ void quantize_transpose_nvfp4(
     at::Tensor &output_transpose,
     at::Tensor &output_scale_transpose,
     bool use_2d_quantization,
-    bool return_transpose
+    bool return_transpose,
+    bool swizzle_scales
 ) {
   constexpr bool use_stochastic_rounding = false;
 
@@ -1190,6 +1309,24 @@ void quantize_transpose_nvfp4(
              "Number of tensor rows must be a multiple of 32");  // 16B alignment for TMA
   TORCH_CHECK(cols % 32 == 0,
              "Number of tensor cols must be a multiple of 32");  // 16B alignment for TMA
+  TORCH_CHECK(!(swizzle_scales && use_2d_quantization),
+             "swizzle_scales is not supported with 2D quantization");
+  TORCH_CHECK(!(swizzle_scales && return_transpose),
+             "swizzle_scales is not supported with return_transpose");
+
+  const size_t SFs_per_row = cols / SCALE_DIM;
+  const int32_t numKTiles = (SFs_per_row + 3) >> 2;
+
+#if FP4_TYPE_SUPPORTED
+  // NOTE: tuned_1D kernel wiring is currently disabled due runtime stability issues.
+  // Re-enable after tuned path is validated across return_transpose modes.
+  if (false && !use_2d_quantization && input.scalar_type() == at::kBFloat16) {
+    launch_quantize_transpose_nvfp4_tuned_1d(input, amax_rowwise, amax_colwise, output,
+                                             output_scale, output_transpose, output_scale_transpose,
+                                             return_transpose);
+    return;
+  }
+#endif
 
   const size_t blocks_Y = DIVUP(rows, CHUNK_DIM_Y);
   const size_t blocks_X = DIVUP(cols, CHUNK_DIM_X);
@@ -1259,10 +1396,32 @@ void quantize_transpose_nvfp4(
         kernel<<<grid, block_size, dshmem_size, stream>>>(
             tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
             scales_transpose_ptr, rows, cols,
-            scale_stride, scale_stride_transpose, amax_rowwise_ptr, amax_colwise_ptr);
+            scale_stride, scale_stride_transpose, amax_rowwise_ptr, amax_colwise_ptr,
+            swizzle_scales, numKTiles);
       });
     );
 }
 
 
 #endif  // TRANSFORMER_ENGINE_QUANTIZE_TRANSPOSE_NVFP4_CUH_
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void quantize_transpose_nvfp4(
+    const at::Tensor &input,
+    const at::Tensor &amax_rowwise,
+    const at::Tensor &amax_colwise,
+    at::Tensor &output,
+    at::Tensor &output_scale,
+    at::Tensor &output_transpose,
+    at::Tensor &output_scale_transpose,
+    bool use_2d_quantization,
+    bool return_transpose
+) {
+  throw std::runtime_error("quantize_transpose_nvfp4 requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

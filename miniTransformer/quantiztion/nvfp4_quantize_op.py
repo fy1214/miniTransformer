@@ -1,30 +1,49 @@
 import math
 import torch
 import fp4_gemm
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from miniTransformer.quantiztion import quantization
+from miniTransformer.quantiztion.quantization import GroupQuantizeResult
 from miniTransformer.utils import utils
-from miniTransformer.ops.nvfp4_qgemm import (
-    qgemm_tl,
-    swizzle_scale,
-)
 
-from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
+import transformer_engine.pytorch.cpp_extensions as tex
+from transformer_engine.pytorch import NVFP4Quantizer, MXFP8Quantizer
+from transformer_engine.pytorch.cpp_extensions import split_quantize
+from miniTransformer.ops._te_compat import general_gemm, general_grouped_gemm
+from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
+
 
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
 
 use_cpp_allocator = False
 
+def _is_sm100() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+
+
+def _grouped_gemm_cutedsl(
+    A: list,
+    B: list,
+    m_splits: list,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    # Kept for backward compatibility with existing imports/tests.
+    # Actual implementation is hosted in nvfp4_quartet_op and gated there.
+    from miniTransformer.quantiztion.nvfp4_quartet_op import grouped_gemm_cutedsl
+
+    return grouped_gemm_cutedsl(A, B, m_splits, out_dtype)
+
+
 class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
+        self.should_update_quantize_weights = True
 
     @property
     def supports_allgather(self) -> bool:
-        return False   
+        return False
 
     def _quantize(
         self,
@@ -37,7 +56,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         device = x.device
         x_dtype = x.dtype
 
-        nvfp4_quantizer = NVFP4Quantizer(
+        nvfp4_quantizer = NVFP4Quantizer(  # NVFP4Quantizer
             rowwise=True,
             columnwise=return_transpose,
             with_amax_reduction=False,
@@ -81,6 +100,7 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         )
         return quantization.QuantizeResult(data=nvfp4_tensor, scale=nvfp4_tensor, data_t=nvfp4_tensor, scale_t=nvfp4_tensor)
 
+
     def qgemm(
         self,
         qx: torch.Tensor,
@@ -98,108 +118,188 @@ class Nvfp4TiledQuantizeOp(quantization.QuantizeOpBase):
         global_amax_qw: torch.Tensor | None = None,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
-        custom_gemm: bool = False,
         custom_gemm_backend: str = "cutlass",  # cutlass, triton, cuteDSL
     ) -> torch.Tensor:
 
-        if custom_gemm:
-            assert custom_gemm_backend in [
-                "cutlass",
-                "triton",
-                "cuteDSL",
-            ], "Unsupported custom gemm backend."
-
-            device = qx.device
-            M, K_bytes_a = qx.shape
-            N, K_bytes_b = qw.shape
-            assert (
-                K_bytes_a == K_bytes_b
-            ), f"K dimension mismatch between qx ({K_bytes_a}) and qw ({K_bytes_b})"
-            K = 2 * K_bytes_a  # 2 FP4 values per byte
-
-            if custom_gemm_backend == "cutlass":
-
-                sx_4d = swizzle_scale(sx, M, K).to(torch.float8_e4m3fn)
-                sw_4d = swizzle_scale(sw, N, K).to(torch.float8_e4m3fn)
-
-                if (
-                    not (qparams_x and qparams_x.pow_2_scales)
-                    and K > 0
-                    and global_amax_qx is not None
-                    and global_amax_qw is not None
-                ):
-                    factor = 6.0 * 6.0 * 448.0 * 448.0
-                    partial_alpha = (global_amax_qx * global_amax_qw).to(torch.float32)
-                    alpha = partial_alpha.squeeze(-1) / factor
-                    alpha = alpha.item()
-                else:
-                    alpha = 1.0
-
-                out_tensor = torch.empty((M, N), device=device, dtype=out_dtype)
-                fp4_gemm.cutlass_gemm(
-                    out_tensor,  # output
-                    qx,  # A: packed NVFP4
-                    qw,  # B: packed NVFP4
-                    sx_4d,  # A scales
-                    sw_4d,  # B scales
-                    torch.tensor(alpha, device=device, dtype=torch.float32),
-                )
-                gemm_out = out_tensor
-
-            elif custom_gemm_backend == "triton":
-                gemm_out = qgemm_tl(
-                    qx=qx,
-                    qw=qw,
-                    m_params=m_params,
-                    out_dtype=out_dtype,
-                    sx=sx,
-                    sw=sw,
-                    bias=bias,
-                    out=out,
-                    accumulate=accumulate,
-                    pow_2_scales=qparams_x.pow_2_scales and qparams_w.pow_2_scales
-                    if (qparams_x is not None and qparams_w is not None)
-                    else False,
-                    global_amax_qx=global_amax_qx,
-                    global_amax_qw=global_amax_qw,
-                    qparams_x=qparams_x,
-                    qparams_w=qparams_w,
-                )
-            elif custom_gemm_backend == "cuteDSL":
-                sx_4d = swizzle_scale(sx, M, K).to(torch.float8_e4m3fn)
-                sw_4d = swizzle_scale(sw, N, K).to(torch.float8_e4m3fn)
-                alpha = 1.0
-                out_tensor = torch.empty((M, N), device=device, dtype=out_dtype)
-                fp4_gemm.cuteDSL_gemm(
-                    out_tensor,
-                    qx,
-                    qw,
-                    sx_4d,
-                    sw_4d,
-                    torch.tensor(alpha, device=device, dtype=torch.float32),
-                )
-                gemm_out = out_tensor
-            else:
-                raise ValueError(f"Unsupported custom gemm backend: {custom_gemm_backend}")
-        else:
-            gemm_out = general_gemm(
-                A=qw,
-                B=qx,
-                out_dtype=out_dtype,
-                quantization_params=None,
-                gelu=False,
-                gelu_in=None,
-                alpha=1.0,
-                beta=None,
-                accumulate=accumulate,
-                layout=layout,
-                out=out,
-                bias=bias,
-                use_split_accumulator=False,
-                grad=grad,
-                ub=None,
-                ub_type=None,
-                extra_output=None,
-                bulk_overlap=False
-            )[0]
+        gemm_out = general_gemm(
+            A=qw,
+            B=qx,
+            out_dtype=out_dtype,
+            quantization_params=None,
+            gelu=False,
+            gelu_in=None,
+            alpha=1.0,
+            beta=None,
+            accumulate=accumulate,
+            layout=layout,
+            out=out,
+            bias=bias,
+            use_split_accumulator=False,
+            grad=grad,
+            ub=None,
+            ub_type=None,
+            extra_output=None,
+            bulk_overlap=False
+        )[0]
         return gemm_out
+
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: quantization.QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+    ) -> GroupQuantizeResult:
+        """
+        If param type is weight, the shape is [num_gemms, n, k].
+        If param type is X, the shape is [m_sum, k], m_sum should split into m_splits.
+        If param type is Y, the shape is [m_sum, n].
+        """
+        num_gemms = len(m_splits)
+
+        if qparams.param_type == qparams.param_type.WEIGHT:
+            # Weight always needs columnwise data for backward dgrad GEMM,
+            # regardless of the return_transpose flag.
+            # If columnwise=False, _columnwise_data is None, and general_grouped_gemm
+            # cannot find the transposed weight needed for dgrad, triggering a swizzle
+            # assertion (NVTE_NVFP4_1D_SCALING not supported in that path).
+            quantize_tensor_list = []
+            for i in range(num_gemms):
+                w_quantizer = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=True,   # always True: backward dgrad needs weight transpose
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding
+                )
+                quantize_tensor_list.append(w_quantizer.quantize(x[i]))
+        else:
+            # ACT / GRAD path: columnwise controlled by return_transpose
+            quantizers = []
+            for i in range(num_gemms):
+                x_quantizer = NVFP4Quantizer(
+                    rowwise=True,
+                    columnwise=return_transpose,
+                    with_amax_reduction=False,
+                    amax_reduction_group=None,
+                    with_rht=qparams.with_rht,
+                    with_post_rht_amax=qparams.with_rht,
+                    with_2d_quantization=qparams.with_2d_quantization,
+                    stochastic_rounding=qparams.stochastic_rounding
+                )
+                quantizers.append(x_quantizer)
+            quantize_tensor_list = tex.split_quantize(
+                x,
+                m_splits,
+                quantizers,
+            )
+
+        return GroupQuantizeResult(
+            data=quantize_tensor_list,
+            data_t=quantize_tensor_list,
+            scale=quantize_tensor_list,
+            scale_t=quantize_tensor_list,
+            tensor_scale=quantize_tensor_list,
+            tensor_scale_t=quantize_tensor_list,
+        )
+
+
+    def grouped_gemm(
+        self,
+        A: List[torch.Tensor],
+        B: List[torch.Tensor],
+        sA: List[torch.Tensor],
+        sB: List[torch.Tensor],
+        global_amax_A: List[torch.Tensor],
+        global_amax_B: List[torch.Tensor],
+        out: List[torch.Tensor],
+        out_dtype: torch.dtype,
+        layout: str = "TN",
+        m_splits: List[int] = None,
+        gelu: bool = False,
+        grad=False,
+        accumulate: bool = False,
+        bias: Optional[List[torch.Tensor]] = None,
+        use_bias: bool = False,
+        qparams_x: Optional[quantization.QParams] = None,
+        qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
+    ) -> Tuple[List[torch.Tensor], ...]:
+        activation_dtype = out_dtype
+
+        # Determine whether input is a quantized tensor or BF16 plain tensor
+        a0 = A[0]
+        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+
+        # Optional env-gated bridge for grouped cuteDSL path.
+        # Default remains TE grouped_gemm for compatibility on environments
+        # without newer cuteDSL.
+        from miniTransformer.quantiztion.nvfp4_quartet_op import is_grouped_gemm_cutedsl_enabled
+
+        if (
+            is_grouped_gemm_cutedsl_enabled()
+            and is_quantized
+            and not grad
+            and not gelu
+            and not accumulate
+            and layout == "TN"
+            and _is_sm100()
+        ):
+            try:
+                return _grouped_gemm_cutedsl(A, B, m_splits, activation_dtype)
+            except (TypeError, NotImplementedError):
+                pass
+
+        if grad:
+            if layout == "NN":
+                if is_quantized:
+                    n_cols = B[0]._rowwise_data.size(1) * 2
+                else:
+                    # BF16: B[i] shape [n, k], dgrad shape [m_sum, k]
+                    n_cols = B[0].size(1)
+                out = torch.empty(
+                    [sum(m_splits), n_cols],
+                    dtype=activation_dtype,
+                    device=B[0].device,
+                )
+                out = [out]
+        else:
+            if is_quantized:
+                n_cols = B[0]._rowwise_data.size(0)
+            else:
+                # BF16 fprop: B[i] shape [n, k], output shape [m_sum, n]
+                n_cols = B[0].size(0)
+            out = torch.empty(
+                [sum(m_splits), n_cols],
+                dtype=activation_dtype,
+                device=B[0].device,
+            )
+            out = [out]
+
+        general_grouped_gemm(
+            A=B,
+            B=A,
+            out=out,
+            out_dtype=activation_dtype,
+            layout=layout,
+            m_splits=m_splits,
+            single_output=False if (grad and layout == "NT") else True,
+            grad=grad,
+            bias=bias,
+            use_bias=use_bias,
+            use_split_accumulator=False,
+            accumulate=accumulate
+        )
+
+        if grad and layout == "NT":
+            return out
+        else:
+            return out[0]

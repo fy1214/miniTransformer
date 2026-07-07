@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 from typing import Any, Optional, Tuple
 
@@ -9,22 +11,24 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "partition_stride": 1,
 }
 
+dist_group_type = torch.distributed.ProcessGroup
 
-def get_distributed_world_size(
-    group: Optional[torch.distributed.ProcessGroup] = None,
-) -> int:
+@lru_cache
+def get_distributed_world_size(group: Optional[dist_group_type] = None) -> int:
     """Return world size for the distributed group."""
     if not torch.distributed.is_initialized():
         return 1
     return torch.distributed.get_world_size(group=group)
 
 
-def get_distributed_rank(
-    group: Optional[torch.distributed.ProcessGroup] = None,
-) -> int:
-    """Return rank for the distributed group."""
+@lru_cache
+def get_distributed_rank(group: Optional[dist_group_type] = None) -> int:
+    """Return my rank for the distributed group."""
     if not torch.distributed.is_initialized():
-        return 0
+        raise RuntimeError(
+            "torch.distributed is not initialized. Call torch.distributed.init_process_group() "
+            "before calling get_distributed_rank()."
+        )
     return torch.distributed.get_rank(group=group)
 
 

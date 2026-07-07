@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -281,7 +283,7 @@ __global__ void eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* glo
     dst_scales.store(scales_fp8 + cvt_quant_to_fp4_get_sf_out_offset(row, col + 4, cols / 4));
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols) {
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols, cudaStream_t stream) {
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute[0].val.programmaticStreamSerializationAllowed = 1;
@@ -292,7 +294,7 @@ void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_
     config.blockDim = dim3(8, 32, 1);
     config.gridDim = dim3(cuda::ceil_div(cols, 8*8), rows / 64, 1);
     config.dynamicSmemBytes = 0;
-    config.stream = nullptr;
+    config.stream = stream;
     CUDA_CHECK(cudaLaunchKernelEx(&config, eden_convert_scales_kernel, scales_fp8, global_scale_ptr, scales_bf16, max_scale_ptr, seed, inv_fp8_max, rows, cols));
 }
 
@@ -312,11 +314,12 @@ void group_transform_128_eden_launcher(
     int sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
 
-    CUDA_CHECK(cudaMemset(max_scale, 0, sizeof(unsigned)));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaMemsetAsync(max_scale, 0, sizeof(unsigned), stream));
 
-    cutlass_group_transform_128_eden_kernel<TransposeA><<<sms * blocks, dim3(32, NUM_WARPS), smem>>>(y, scratch_scales, max_scale, h, x, M, N, 1.f / fp4_max);
+    cutlass_group_transform_128_eden_kernel<TransposeA><<<sms * blocks, dim3(32, NUM_WARPS), smem, stream>>>(y, scratch_scales, max_scale, h, x, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, TransposeA ? N : M, TransposeA ? M / 16 : N / 16);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, TransposeA ? N : M, TransposeA ? M / 16 : N / 16, stream);
 }
 
 void group_transform_128_eden(
@@ -374,3 +377,23 @@ void group_transform_128_eden_binding(
         *reinterpret_cast<float *>(seed.data_ptr()),  fp4_max, fp8_max,
         x.size(0), x.size(1), transpose);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void group_transform_128_eden_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max, bool transpose) {
+  throw std::runtime_error("group_transform_128_eden_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

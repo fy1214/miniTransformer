@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -212,7 +214,7 @@ __global__ __launch_bounds__(NUM_WARPS*32, 1) void cutlass_dequant_tp_quant_kern
     }
 }
 
-void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols);
+void launch_eden_convert_scales_kernel(__nv_fp8_e4m3* scales_fp8, float* global_scale_ptr, const nv_bfloat16* scales_bf16, const unsigned* max_scale_ptr, long seed, float inv_fp8_max, int rows, int cols, cudaStream_t stream);
 void dequant_tp_quant_launcher(
     __nv_fp4x2_storage_t* y, __nv_fp8_e4m3* scales_fp8, float* global_scale_ptr,
     nv_bfloat16* scratch_scales, unsigned* max_scale, const nv_bfloat16* h,
@@ -229,12 +231,13 @@ void dequant_tp_quant_launcher(
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, cutlass_dequant_tp_quant_kernel, 32*NUM_WARPS, smem));
     int sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaMemset(max_scale, 0, sizeof(unsigned)));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaMemsetAsync(max_scale, 0, sizeof(unsigned), stream));
 
-    cutlass_dequant_tp_quant_kernel<<<sms * blocks, dim3(32, NUM_WARPS), smem>>>(
+    cutlass_dequant_tp_quant_kernel<<<sms * blocks, dim3(32, NUM_WARPS), smem, stream>>>(
         y, scratch_scales, max_scale, h, x, x_scales, x_global_scale, M, N, 1.f / fp4_max);
     CUDA_CHECK(cudaGetLastError());
-    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, N, M / 16);
+    launch_eden_convert_scales_kernel(scales_fp8, global_scale_ptr, scratch_scales, max_scale, seed, 1.f / fp8_max, N, M / 16, stream);
 }
 
 void dequant_tp_had_quant(
@@ -288,3 +291,25 @@ void dequant_tp_had_quant_binding(
         *reinterpret_cast<float *>(seed.data_ptr()),  fp4_max, fp8_max,
         x.size(0), x.size(1) * 2);
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void dequant_tp_had_quant_binding(
+    at::Tensor& y,
+    at::Tensor& group_scales,
+    at::Tensor& tensor_scale,
+    at::Tensor& scratch,
+    at::Tensor& max_scale,
+    at::Tensor& h,
+    at::Tensor& x,
+    at::Tensor& x_micro_scales,
+    at::Tensor& x_global_scale,
+    at::Tensor& seed,
+    float fp4_max, float fp8_max) {
+  throw std::runtime_error("dequant_tp_had_quant_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

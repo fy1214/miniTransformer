@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#ifndef MINI_TE_NO_BLACKWELL_OPS
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -12,7 +14,7 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <ATen/cuda/Exceptions.h>
 #include <torch/extension.h>
-#include <torch/torch.h>  
+#include <torch/torch.h>
 
 #include "../../../util/quarter/utils.cuh"
 #include "../../../util/quarter/vec.cuh"
@@ -93,13 +95,13 @@ __global__ void eden_fp4_kernel(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr
     result.store(reinterpret_cast<unsigned char*>(y_ptr) + 4 * idx);
 }
 
-void eden_fp4(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr, const nv_bfloat16* x_ptr, const float* amax_ptr, float scale_override, long seed, long rows, long cols) {
+void eden_fp4(__nv_fp4x4_e2m1* y_ptr, __nv_fp8_e4m3* scale_ptr, float* global_scale_ptr, const nv_bfloat16* x_ptr, const float* amax_ptr, float scale_override, long seed, long rows, long cols, cudaStream_t stream) {
     if (cols % 128 != 0) throw std::runtime_error("eden_fp4: cols must be divisible by 128");
     if (rows % 128 != 0) throw std::runtime_error("eden_fp4: rows must be divisible by 128");
     int n_vecs = (rows * cols) / 8;
     int block_size = 256;
     int n_blocks = (n_vecs + block_size - 1) / block_size;
-    eden_fp4_kernel<<<n_blocks, block_size>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, scale_override, seed, n_vecs, cols / 16);
+    eden_fp4_kernel<<<n_blocks, block_size, 0, stream>>>(y_ptr, scale_ptr, global_scale_ptr, x_ptr, amax_ptr, scale_override, seed, n_vecs, cols / 16);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -122,5 +124,25 @@ void eden_fp4_binding(
         reinterpret_cast<float*>(global_scale.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(inp.data_ptr()),
         reinterpret_cast<const float*>(amax_ptr.data_ptr()),
-        scale_override, *reinterpret_cast<float *>(seed.data_ptr()), inp.size(0), inp.size(1));
+        scale_override, *reinterpret_cast<float *>(seed.data_ptr()), inp.size(0), inp.size(1),
+        at::cuda::getCurrentCUDAStream());
 }
+
+#else  // MINI_TE_NO_BLACKWELL_OPS — stubs for non-Blackwell builds
+
+#include "../../../ops.h"
+#include <stdexcept>
+
+void eden_fp4_binding(
+    at::Tensor& out,
+    at::Tensor& scales,
+    at::Tensor& global_scale,
+    const at::Tensor& inp,
+    const at::Tensor& amax_ptr,
+    float scale_override,
+    at::Tensor& seed
+) {
+  throw std::runtime_error("eden_fp4_binding requires Blackwell+ (SM100). Rebuild on SM100 hardware or set MINI_TE_FORCE_BLACKWELL_OPS=1.");
+}
+
+#endif  // MINI_TE_NO_BLACKWELL_OPS

@@ -1,5 +1,13 @@
 #pragma once
 
+#include <cuda.h>
+#ifndef FP4_TYPE_SUPPORTED
+#define FP4_TYPE_SUPPORTED (CUDA_VERSION >= 12080)
+#endif
+#ifndef NVTE_BUILD_NUM_PHILOX_ROUNDS
+#define NVTE_BUILD_NUM_PHILOX_ROUNDS 10
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

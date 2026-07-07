@@ -7,6 +7,9 @@
 /*! \file ptx.cuh
  *  \brief BW PTX
  */
+#ifndef MINITRANSFORMER_PTX_CUH_
+#define MINITRANSFORMER_PTX_CUH_
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp4.h>
@@ -414,3 +417,5 @@ __device__ __forceinline__ void abs_max_2x(vector::bf16x2 &dst, const vector::bf
   NVTE_DEVICE_ERROR("abs_max_2x is only supported on SM 8.9+.");
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
 }
+
+#endif  // MINITRANSFORMER_PTX_CUH_

@@ -1,3 +1,5 @@
+import functools
+
 import torch
 from contextlib import contextmanager
 from typing import Callable, Tuple
@@ -144,3 +146,9 @@ def fp8_autocast(
         yield
     finally:
         FP8GlobalStateManager.set_fp8_autocast_state(fp8_state)
+
+
+@functools.lru_cache(maxsize=None)
+def _empty_tensor() -> torch.Tensor:
+    """Get tensor with no entries and no data"""
+    return torch.Tensor().cuda()

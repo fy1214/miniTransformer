@@ -7,8 +7,10 @@ from typing import Any, Callable, Optional, Union
 
 from . import config
 from ..distributed.distributed import get_distributed_world_size
+from ..utils.env import get_keep_in_bf16_layer_numbers
 from ..utils.utils import get_default_init_method #, FP8GlobalStateManager
 
+_dummy_wgrads = {}
 
 @dataclass
 class _ParameterInitMeta:
@@ -25,6 +27,22 @@ class _ParameterInitMeta:
             self.init_fn = get_default_init_method()
 
 
+def get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
+    """Returns a dummy tensor of given shape."""
+    assert len(shape) == 2
+    global _dummy_wgrads
+    if (shape[0], shape[1], dtype) not in _dummy_wgrads:
+        _dummy_wgrads[(shape[0], shape[1], dtype)] = torch.empty(
+            shape,
+            dtype=dtype,
+            device="cuda",
+            requires_grad=False,
+        )
+    if zero:
+        _dummy_wgrads[(shape[0], shape[1], dtype)].fill_(0)
+    return _dummy_wgrads[(shape[0], shape[1], dtype)].detach()
+
+
 class LayerLinearBaseModule(torch.nn.Module, ABC):
     """Layer Linear Base module."""
 
@@ -37,7 +55,7 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
         if tp_group is None:
             if tp_size == 1:
                 self.tp_size = 1
-                self.set_tensor_parallel_group(tp_group)  # Set tp_group to None
+                self.set_tensor_parallel_group(tp_group)
             else:
                 # tp_group is not initialized and user must call `set_tensor_parallel_group(tp_group)`
                 # method on the initialized module before the forward pass
@@ -49,12 +67,7 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
         self.param_init_meta = {}
-        # JQ: not supported for now
         self.primary_weights_in_fp8 = None
-        # self.primary_weights_in_fp8 = FP8GlobalStateManager.is_fp8_params_enabled()
-        # assert (
-        #     not self.primary_weights_in_fp8
-        # ), "Primary weights in FP8 are not supported yet."
         self.fsdp_group = None
 
     def get_extra_state(self) -> None:
@@ -66,12 +79,12 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
 
     def set_activation_dtype(self, inp: torch.Tensor) -> None:
         """Set activation data type for AMP."""
-        # Native AMP (`torch.autocast`) gets highest priority
+        # Native AMP (torch.autocast) takes highest priority
         if torch.is_autocast_enabled():
             self.activation_dtype = torch.get_autocast_gpu_dtype()
             return
 
-        # All checks after this have already been performed once, thus skip
+        # Skip redundant checks if dtype hasn't changed since last call
         if hasattr(self, "activation_dtype") and self.activation_dtype == inp.dtype:
             return
 
@@ -134,11 +147,9 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
             return
 
         for name, param in self.named_parameters(recurse=False):
-            # Ensure parameter is on a real device
             if param.device == torch.device("meta"):
                 param = torch.nn.Parameter(torch.empty_like(param, device="cuda"))
 
-            # Initialize the parameter values on device
             init_fn = self.param_init_meta[name].init_fn
             get_rng_state_tracker = self.param_init_meta[name].get_rng_state_tracker
             if get_rng_state_tracker is None:
@@ -151,16 +162,13 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
                     with get_rng_state_tracker().fork():
                         init_fn(param)
 
-            # If primary weights are in fp8, wrap the parameter as Float8Tensor
             if self.primary_weights_in_fp8:
                 raise NotImplementedError(
                     "Primary weights in FP8 are not supported yet."
                 )
 
-            # Redo parameter wrap in case we broke it above
-            # NOTE: Currently this can only be broken when primary weights are in Fp8 but
-            #       re-applying the nn.Parameter() wrap is a no-op when the input is already
-            #       a parameter so we always re-apply it just for extra safety.
+            # Re-applying nn.Parameter() is a no-op when input is already a parameter,
+            # but ensures correctness if the wrap was broken above (e.g. by FP8 path).
             setattr(self, name, torch.nn.Parameter(param))
 
     def set_qlinear_params(
@@ -174,7 +182,7 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
 
         if qlinear_params is None:
             qlinear_params = config.get_qlinear_params_from_env_qat_params()
-        if layer_number in config.get_keep_in_bf16_layer_numbers():
+        if layer_number in get_keep_in_bf16_layer_numbers():
             return config.QLinearParams(quantize=False)
         else:
             if layer_name is not None:

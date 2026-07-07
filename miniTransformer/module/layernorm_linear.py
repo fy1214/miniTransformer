@@ -1,8 +1,10 @@
 import torch
+import torch.nn.functional as F
 
 from typing import Callable, Dict, Optional, Tuple, Union, Any
 from miniTransformer.module import config
 from miniTransformer.module.linear import Linear
+from miniTransformer.utils.env import should_switch_to_hybrid_linear
 
 try:
     import transformer_engine as te  # type: ignore
@@ -221,7 +223,6 @@ class LayerNormLinear(Linear):
             qlinear_params=qlinear_params,
         )
 
-        # userbuffer checks
         if any([ub_bulk_wgrad, ub_bulk_dgrad, ub_overlap_ag, ub_overlap_rs_dgrad]):
             assert ub_name is not None, "Userbuffer name [string] is not set."
         assert not (
@@ -236,19 +237,17 @@ class LayerNormLinear(Linear):
             not self.return_layernorm_output_gathered
         ), "return_layernorm_output_gathered is not supported yet."
 
-        # Setup normalization
         assert normalization in [
             "LayerNorm",
             "RMSNorm",
         ], "Unsupported normalization type!"
         self.normalization = normalization
 
-        # use_te_norm is None by default, and will be set to True if we should switch to hybrid linear
         if use_te_norm is None:
-            use_te_norm = config.should_switch_to_hybrid_linear()
+            use_te_norm = should_switch_to_hybrid_linear()
 
         if use_te_norm:
-            self.layer_norm_weight = make_te_norm(
+            _norm = make_te_norm(
                 normalization,
                 in_features,
                 eps=eps,
@@ -258,7 +257,7 @@ class LayerNormLinear(Linear):
                 device=device,
             )
         else:
-            self.layer_norm_weight = make_torch_norm(
+            _norm = make_torch_norm(
                 normalization,
                 in_features,
                 eps=eps,
@@ -267,6 +266,19 @@ class LayerNormLinear(Linear):
                 zero_centered_gamma=zero_centered_gamma,
                 device=device,
             )
+
+        # Register gamma/beta directly on this module to match TE's state_dict layout:
+        #   TE: layer_norm_weight (nn.Parameter)  ← not layer_norm.weight
+        # Storing _norm as a plain attribute (bypassing nn.Module.__setattr__) prevents it
+        # from appearing as a submodule in state_dict.
+        self.register_parameter("layer_norm_weight", _norm._parameters.pop("weight", None))
+        if normalization == "LayerNorm":
+            self.register_parameter("layer_norm_bias", _norm._parameters.pop("bias", None))
+        else:
+            self.layer_norm_bias = None
+
+        self._layer_norm_eps = _norm.eps
+        self._layer_norm_normalized_shape = getattr(_norm, "normalized_shape", (in_features,))
 
     @torch._dynamo.disable(recursive=True)
     def forward(
@@ -298,11 +310,23 @@ class LayerNormLinear(Linear):
         """
         inp = inp.contiguous()
 
-        # Run normalization without fusion
-        ln_out = self.norm(inp)
+        if self.normalization == "LayerNorm":
+            ln_out = F.layer_norm(
+                inp,
+                self._layer_norm_normalized_shape,
+                weight=self.layer_norm_weight,
+                bias=self.layer_norm_bias,
+                eps=self._layer_norm_eps,
+            )
+        else:  # RMSNorm
+            ln_out = F.rms_norm(
+                inp,
+                self._layer_norm_normalized_shape,
+                weight=self.layer_norm_weight,
+                eps=self._layer_norm_eps,
+            )
         input_meta = None
 
-        # Run the linear layer by calling parent's forward
         out = super().forward(ln_out, is_first_microbatch, fp8_output, input_meta)
 
         if self.return_bias:

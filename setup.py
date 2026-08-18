@@ -1,14 +1,25 @@
 import os
 import re
-import glob
 import shutil
 import pathlib
+import importlib.util
 import subprocess
 import setuptools
 from setuptools import setup
 
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _load_csrc_sources():
+    """Load the explicit csrc manifest without requiring an installed package."""
+    path = ROOT_DIR / "miniTransformer" / "csrc" / "source_manifest.py"
+    spec = importlib.util.spec_from_file_location("mini_te_csrc_sources", path)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(f"Could not load csrc source manifest: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def cuda_version() -> tuple[int, ...]:
@@ -107,10 +118,10 @@ def build_extensions() -> list[setuptools.Extension]:
 
     csrc_dir = ROOT_DIR / "miniTransformer" / "csrc"
     cutlass_dir = ROOT_DIR / "third-party" / "cutlass"
-    sources = (
-        [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cpp"), recursive=True)]
-        + [os.path.relpath(p, ROOT_DIR) for p in glob.glob(str(csrc_dir / "**/*.cu"), recursive=True)]
-    )
+    sources_mod = _load_csrc_sources()
+    sources_mod.assert_manifest_covers_glob()
+    sources = sources_mod.all_csrc_sources()
+    print(f"[mini-TE] csrc sources: {sources_mod.format_source_stats()}")
     include_dirs = [
         str(csrc_dir),
         str(cutlass_dir / "include"),

@@ -90,7 +90,7 @@ def build_extensions() -> list[setuptools.Extension]:
         "-std=c++17",
         "-diag-suppress=3189",
     ]
-    link_args = ["-lcuda", "-lnccl", "-lcublasLt"]
+    link_args = ["-lcuda", "-lnccl", "-lcublas", "-lcublasLt"]
 
     if debug_mode:
         print("Compiling in debug mode")

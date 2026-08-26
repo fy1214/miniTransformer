@@ -175,7 +175,35 @@ class QuantizeOpBase:
             input_meta: Metadata for quantization input.
         """
         NotImplementedError()
-    
+
+    def group_quantize(
+        self,
+        x: torch.Tensor,
+        qparams: QParams,
+        m_splits: List[int] = None,
+        return_transpose: bool = False,
+        reduce_amax: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_meta: Optional[QuantizeInputMetaBase] = None,
+        row_amax: Optional[torch.Tensor] = None,
+    ) -> GroupQuantizeResult:
+        """Grouped quantization for GroupedLinear.
+
+        Args:
+            x: Input tensor. Weight is ``[num_gemms, n, k]``; activation / grad
+                is ``[sum_M, k]`` split along dim 0 by ``m_splits``.
+            qparams: Quantization parameters.
+            m_splits: Per-expert token counts.
+            return_transpose: Whether to also produce columnwise / transposed data.
+            reduce_amax: Whether to reduce amax across ``tp_group``.
+            tp_group: Process group for ``reduce_amax``.
+            input_meta: Optional quantization input metadata.
+            row_amax: Optional prefused per-token row abs-max ``(sum_M,)`` fp32,
+                aligned with activation rows (Fuse1 sort/pad, Fuse2 SwiGLU).
+                Ops that can skip K1 consume it; others may ignore it.
+        """
+        raise NotImplementedError
+
     def qgemm(
         self,
         qx: torch.Tensor,

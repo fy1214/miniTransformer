@@ -7,6 +7,7 @@ import sys
 import time
 import argparse
 import inspect
+import types
 
 import pytest
 import torch
@@ -30,6 +31,11 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
+from megatron.core.transformer.moe.moe_utils import (
+    apply_router_token_dropping,
+    compute_routing_scores_for_aux_loss,
+)
+from megatron.core.transformer.moe.router import TopKRouter
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
@@ -79,6 +85,83 @@ def _capture_lowbit_argv():
 
 
 _LOWBIT_ARGV = _capture_lowbit_argv()
+
+
+def _make_random_topk_probs_and_map(logits: torch.Tensor, topk: int):
+    """Build routing outputs with uniform random top-k expert assignment."""
+    num_tokens, num_experts = logits.shape
+    if num_experts < topk:
+        raise ValueError(
+            f"random top-k routing requires num_experts >= topk, "
+            f"got experts={num_experts}, topk={topk}"
+        )
+
+    scores = torch.rand(
+        num_tokens, num_experts, device=logits.device, dtype=torch.float32
+    )
+    _, top_indices = torch.topk(scores, k=topk, dim=1)
+    sel_probs = torch.full(
+        (num_tokens, topk), 1.0 / topk, device=logits.device, dtype=logits.dtype
+    )
+    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, sel_probs)
+    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    return routing_probs, routing_map
+
+
+def _patch_router_random_topk(router: TopKRouter):
+    original_routing = router.routing
+
+    def random_routing(self, logits: torch.Tensor):
+        seq_length, bsz = logits.shape[:2]
+        logits = logits.view(-1, self.config.num_moe_experts)
+        logits = self.apply_z_loss(logits)
+
+        probs, routing_map = _make_random_topk_probs_and_map(logits, self.topk)
+
+        if self.config.moe_expert_capacity_factor is not None:
+            probs, routing_map = apply_router_token_dropping(
+                probs,
+                routing_map,
+                router_topk=self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                drop_policy=self.config.moe_token_drop_policy,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            )
+
+        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                logits,
+                self.topk,
+                self.score_function,
+                fused=self.config.moe_router_fusion,
+            )
+            probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
+            probs = self._apply_seq_aux_loss(
+                probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
+            )
+            probs = self._apply_global_aux_loss(
+                probs, scores_for_aux_loss, routing_map_for_aux_loss
+            )
+
+        self._apply_expert_bias(routing_map)
+        return probs, routing_map
+
+    router.routing = types.MethodType(random_routing, router)
+    return router, original_routing
+
+
+def _patch_model_random_topk_routing(model_chunks):
+    patches = []
+    for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            if isinstance(module, TopKRouter):
+                patches.append(_patch_router_random_topk(module))
+    return patches
+
+
+def _restore_random_topk_routing(patches):
+    for router, original_routing in patches:
+        router.routing = original_routing
 
 
 def enable_forward_pre_hook(model_chunks):
@@ -307,6 +390,13 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
+        moe_enabled = bool(getattr(args, "num_experts", 0))
+        router_patches = []
+        if getattr(self, "random_topk_routing", False):
+            assert moe_enabled, "random_topk_routing requires MoE"
+            router_patches = _patch_model_random_topk_routing(gpt_model)
+            assert router_patches, "random_topk_routing enabled but no TopKRouter found"
+
         cuda_graph_helper = None
         # Hard coded to use cuda_graph_impl="transformer_engine"
         cuda_graph_impl = "transformer_engine"
@@ -337,7 +427,6 @@ class TestFP8Param:
         # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
         # Skip the strict count when MoE is on (different expert weight layout) or
         # when recipe is fp4 (is_float8tensor doesn't match fp4 param tensors).
-        moe_enabled = bool(getattr(args, "num_experts", 0))
         fp4_recipe = bool(getattr(args, "fp4", None))
         if fp8_param_gather and not moe_enabled and not fp4_recipe:
             assert num_fp8_params == 4 * fp8_layers
@@ -366,84 +455,87 @@ class TestFP8Param:
 
         step_times = []
 
-        with prof_ctx as prof:
-            for i in range(total_steps):
-                if not inference:
-                    gpt_model[0].zero_grad_buffer()
-                    optimizer.zero_grad()
+        try:
+            with prof_ctx as prof:
+                for i in range(total_steps):
+                    if not inference:
+                        gpt_model[0].zero_grad_buffer()
+                        optimizer.zero_grad()
 
-                # Capture CUDA graphs after warmup if helper is provided.
-                # Hard coded cuda_graph_warmup_steps = 0.
-                cuda_graph_warmup_steps = 0
-                if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                    if should_disable_forward_pre_hook(args):
-                        disable_forward_pre_hook(gpt_model, param_sync=False)
-                    cuda_graph_helper.create_cudagraphs()
-                    if should_disable_forward_pre_hook(args):
-                        enable_forward_pre_hook(gpt_model)
-                        cuda_graph_helper.cuda_graph_set_manual_hooks()
+                    # Capture CUDA graphs after warmup if helper is provided.
+                    # Hard coded cuda_graph_warmup_steps = 0.
+                    cuda_graph_warmup_steps = 0
+                    if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                        if should_disable_forward_pre_hook(args):
+                            disable_forward_pre_hook(gpt_model, param_sync=False)
+                        cuda_graph_helper.create_cudagraphs()
+                        if should_disable_forward_pre_hook(args):
+                            enable_forward_pre_hook(gpt_model)
+                            cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-                # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-                # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-                # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
-                if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                    for optim_instance in optimizer.chained_optimizers:
-                        if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
-                            optim_instance._copy_main_params_to_param_buffer()
+                    # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+                    # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+                    # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+                    if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                        for optim_instance in optimizer.chained_optimizers:
+                            if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                                optim_instance._copy_main_params_to_param_buffer()
 
-                gpt_model[0].set_is_first_microbatch()
+                    gpt_model[0].set_is_first_microbatch()
 
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
 
-                output = gpt_model[0].forward(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                )
+                    output = gpt_model[0].forward(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        loss_mask=loss_mask,
+                    )
 
-                # Check output shapes
-                assert output.shape[0] == self.micro_batch_size
-                assert output.shape[1] == self.seq_length
+                    # Check output shapes
+                    assert output.shape[0] == self.micro_batch_size
+                    assert output.shape[1] == self.seq_length
 
-                if inference:
+                    if inference:
+                        torch.cuda.synchronize()
+                        step_times.append(time.perf_counter() - t0)
+                        if prof is not None:
+                            prof.step()
+                        continue
+
+                    # Compute masked cross-entropy loss (same as pretrain_gpt.py loss_func)
+                    losses = output.view(-1).float()
+                    loss_mask_flat = loss_mask.view(-1).float()
+                    loss = torch.sum(losses * loss_mask_flat) / loss_mask_flat.sum()
+
+                    # Precision check: loss must be finite
+                    assert torch.isfinite(loss), f"loss is not finite at step {i}: {loss.item()}"
+
+                    loss.backward()
+
+                    if args.overlap_grad_reduce:
+                        gpt_model[0].finish_grad_sync()
+
+                    # Precision check: gradients must be finite
+                    for name, param in gpt_model[0].named_parameters():
+                        assert param.main_grad is not None
+                        assert torch.isfinite(param.main_grad).all(), \
+                            f"non-finite grad in {name} at step {i}"
+
+                    update_successful, _, _ = optimizer.step()
+                    assert update_successful
+
                     torch.cuda.synchronize()
                     step_times.append(time.perf_counter() - t0)
+
+                    loss_list.append(loss.item())
+
                     if prof is not None:
                         prof.step()
-                    continue
-
-                # Compute masked cross-entropy loss (same as pretrain_gpt.py loss_func)
-                losses = output.view(-1).float()
-                loss_mask_flat = loss_mask.view(-1).float()
-                loss = torch.sum(losses * loss_mask_flat) / loss_mask_flat.sum()
-
-                # Precision check: loss must be finite
-                assert torch.isfinite(loss), f"loss is not finite at step {i}: {loss.item()}"
-
-                loss.backward()
-
-                if args.overlap_grad_reduce:
-                    gpt_model[0].finish_grad_sync()
-
-                # Precision check: gradients must be finite
-                for name, param in gpt_model[0].named_parameters():
-                    assert param.main_grad is not None
-                    assert torch.isfinite(param.main_grad).all(), \
-                        f"non-finite grad in {name} at step {i}"
-
-                update_successful, _, _ = optimizer.step()
-                assert update_successful
-
-                torch.cuda.synchronize()
-                step_times.append(time.perf_counter() - t0)
-
-                loss_list.append(loss.item())
-
-                if prof is not None:
-                    prof.step()
+        finally:
+            _restore_random_topk_routing(router_patches)
 
         # ── Speed report ──────────────────────────────────────────────────────
         if step_times:
@@ -671,6 +763,13 @@ def _build_cli_parser():
     parser.add_argument("--moe-token-dispatcher-type", type=str, default="alltoall",
                         choices=["alltoall", "allgather", "alltoall_seq"],
                         help="MoE token dispatcher type (used when --moe).")
+    parser.add_argument("--nvfp4-pertoken-amax-fuse", action="store_true",
+                        help=("Enable the unified MoE NVFP4 per-token amax-fuse path: "
+                              "fc1 sort_chunks row amax + skip-K1 handoff and "
+                              "fc2 fused SwiGLU row amax + skip-K1 handoff."))
+    parser.add_argument("--random-topk-routing", action="store_true",
+                        help=("MoE test-only: patch TopKRouter.routing() to assign each "
+                              "token to random top-k experts with uniform probs."))
     parser.add_argument("--ffn-hidden-size", type=int, default=None,
                         help="Override args.ffn_hidden_size. Default lets megatron derive it.")
     parser.add_argument("--moe-ffn-hidden-size", type=int, default=None,
@@ -736,10 +835,12 @@ def main():
             "moe_grouped_gemm": cli.moe_grouped_gemm,
             "moe_token_dispatcher_type": cli.moe_token_dispatcher_type,
             "moe_ffn_hidden_size": moe_ffn,
+            "nvfp4_pertoken_amax_fuse": bool(cli.nvfp4_pertoken_amax_fuse),
         })
     TestFP8Param._extra_args = extra
 
     obj = TestFP8Param()
+    obj.random_topk_routing = bool(cli.moe and cli.random_topk_routing)
     if not hasattr(obj, cli.method) or not cli.method.startswith("test_"):
         raise SystemExit(f"unknown test method: {cli.method!r}")
     method = getattr(obj, cli.method)

@@ -10,6 +10,7 @@ from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuanti
 from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_v2 import Nvfp4Cursor2CutlassV2QuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op_ref import Nvfp4Cursor2QuantizeOpRef
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
+from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken import Nvfp4TiledQuantizePertokenOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
@@ -104,6 +105,7 @@ class QuantizeRecipe(enum.Enum):
     INT4_SUB_CHANNEL = "int4_subchannel_scaling"
     INT4_MARLIN_FORWARD = "int4_marlin_forward"
     FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
+    FP4_SUB_CHANNEL_PERTOKEN = "fp4_subchannel_scaling_pertoken"
     FP4_SUB_CHANNEL_QUARTET = "fp4_subchannel_scaling_quartet"
     FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
     FP4_SUB_CHANNEL_CURSOR2 = "fp4_subchannel_scaling_cursor2"
@@ -237,6 +239,41 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
         # fmt: on
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN:
+        # TE PR #3045 per-token NVFP4 (rowwise act + per_token_weight_2d weight).
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(16, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Nvfp4TiledQuantizePertokenOp(),
+            allgather_quantize=False,
+        )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2:
         # Pertoken activation (Triton) + tensor-global weight + CuTeDSL grouped GEMM (SM100).
         return QLinearParams(
@@ -598,6 +635,10 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
     if qat_params_idx == 14:
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_V2
+        )
+    if qat_params_idx == 15:
+        return get_qlinear_params_from_predefined(
+            QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN
         )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

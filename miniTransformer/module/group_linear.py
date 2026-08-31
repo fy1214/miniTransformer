@@ -47,6 +47,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         is_first_microbatch: bool | None,
         fuse_wgrad_accumulation: bool,
         disable_backward_quant: bool,
+        input_row_amax: Optional[torch.Tensor],
         *weights,
     ) -> torch.Tensor:
         num_gemms = len(m_splits)
@@ -64,12 +65,18 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         x = cast_if_needed(x, activation_dtype)
 
         # disable_backward_quant skips columnwise quantization since x_t is unused in BF16 backward
+        # Prefused per-token row_amax (Fuse1 sort/pad, Fuse2 SwiGLU) skips K1 in split_quantize.
+        # Only pass the kwarg when set: unused ops need not declare row_amax.
+        x_quant_kwargs = {}
+        if input_row_amax is not None:
+            x_quant_kwargs["row_amax"] = input_row_amax
         with record_function("group_quantize_x"):
             qresult_x_list = quantize_op.group_quantize(
                 x,
                 qlinear_params.x_params,
                 m_splits=m_splits,
-                return_transpose=(is_grad_enabled and not disable_backward_quant)
+                return_transpose=(is_grad_enabled and not disable_backward_quant),
+                **x_quant_kwargs,
             )
         qx, sx, tx, qx_t, sx_t, tx_t = (qresult_x_list.data,
                                           qresult_x_list.scale,
@@ -394,7 +401,8 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
             None,        # is_grad_enabled
             None,        # is_first_microbatch
             None,        # fuse_wgrad_accumulation
-            None,
+            None,        # disable_backward_quant
+            None,        # input_row_amax
             *wgrad_list,      # *weights
         )
 
@@ -625,6 +633,7 @@ class GroupedLinear(LayerLinearBaseModule):
         inp: torch.Tensor,
         m_splits: List[int],
         is_first_microbatch: Optional[bool] = None,
+        input_row_amax: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Apply the linear transformation to the input.
@@ -648,6 +657,10 @@ class GroupedLinear(LayerLinearBaseModule):
                              * it also allows skipping gradient accumulation during the
                                first microbatch (since it is the first gradient being
                                produced)
+        input_row_amax : torch.Tensor, optional
+            Prefused per-token row abs-max ``(sum_M,)`` fp32, aligned with ``inp``
+            after MoE padding (Fuse1 sort/pad for fc1, Fuse2 SwiGLU for fc2).
+            When set, NVFP4 per-token ``split_quantize`` may skip K1.
         """
         assert len(m_splits) == self.num_gemms, "Number of splits should match number of GEMMs."
 
@@ -680,6 +693,7 @@ class GroupedLinear(LayerLinearBaseModule):
             is_first_microbatch,
             self.fuse_wgrad_accumulation,
             self.disable_backward_quant,
+            input_row_amax,
             *weight_tensors,
         )
 

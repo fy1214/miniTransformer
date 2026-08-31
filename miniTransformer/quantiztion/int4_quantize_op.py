@@ -537,6 +537,8 @@ class Int4TiledQuantizeOp(quantization.QuantizeOpBase):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         BF16 grouped GEMM，对应 group_linear.py 中 quantize_op.grouped_gemm 的调用。
@@ -734,6 +736,8 @@ class Int4MarlinForwardQuantizeOp(Int4TiledQuantizeOp):
         use_bias: bool = False,
         qparams_x: Optional[quantization.QParams] = None,
         qparams_w: Optional[quantization.QParams] = None,
+        extra_info_A: Optional[dict] = None,
+        extra_info_B: Optional[dict] = None,
     ) -> torch.Tensor:
         if grad or layout != "TN":
             return super().grouped_gemm(

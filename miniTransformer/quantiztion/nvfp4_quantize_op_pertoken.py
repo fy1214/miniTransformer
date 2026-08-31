@@ -16,7 +16,6 @@ when both operands have ``_per_token=True``.
 from __future__ import annotations
 
 import inspect
-import logging
 from typing import List, Optional, Tuple
 
 import torch
@@ -38,30 +37,34 @@ if "per_token" not in _NVFP4_QUANTIZER_PARAMS:
         "The installed TE has no per_token argument."
     )
 _HAS_PER_TOKEN_WEIGHT_2D = "per_token_weight_2d" in _NVFP4_QUANTIZER_PARAMS
-_SPLIT_QUANTIZE_HAS_ROW_AMAX = False
-try:
-    _SPLIT_QUANTIZE_HAS_ROW_AMAX = "row_amax" in inspect.signature(tex.split_quantize).parameters
-except (TypeError, ValueError):
-    _SPLIT_QUANTIZE_HAS_ROW_AMAX = False
-_warned_missing_split_quantize_row_amax = False
-_logger = logging.getLogger(__name__)
 
 
-def _split_quantize(tensor, m_splits, quantizers, *, row_amax=None):
-    """tex.split_quantize with optional prefused per-token row_amax (skip K1)."""
-    global _warned_missing_split_quantize_row_amax
-    kwargs = {}
+def _split_quantize(
+    tensor,
+    m_splits,
+    quantizers,
+    *,
+    row_amax=None,
+    disable_bulk_allocation: bool = False,
+):
+    """``tex.split_quantize`` with optional prefused per-token ``row_amax`` (skip K1).
+
+    TE bulk-allocates NVFP4Tensor outputs in C++ and runs the grouped per-token
+    kernel; when ``row_amax`` is set only rowwise forward activations skip K1.
+
+    Swizzle is not a ``split_quantize`` kwarg (unlike ``nvfp4_per_token_group_quantize_bulk``).
+    It is driven by ``quantizer.optimize_for_gemm=True``, which maps to ``with_swizzle=1`` in the
+    grouped per-token kernel. Sync ``_with_gemm_swizzled_scales`` on outputs so GEMM reads the
+    same layout the kernel wrote (TE bulk-alloc historically only set this flag for RHT).
+    """
+    kwargs = {"disable_bulk_allocation": disable_bulk_allocation}
     if row_amax is not None:
-        if _SPLIT_QUANTIZE_HAS_ROW_AMAX:
-            kwargs["row_amax"] = row_amax
-        elif not _warned_missing_split_quantize_row_amax:
-            _warned_missing_split_quantize_row_amax = True
-            _logger.warning(
-                "input_row_amax was provided but tex.split_quantize has no row_amax; "
-                "NVFP4 per-token K1 will still run. Need a TE build that accepts "
-                "split_quantize(..., row_amax=)."
-            )
-    return tex.split_quantize(tensor, m_splits, quantizers, **kwargs)
+        kwargs["row_amax"] = row_amax
+    out = tex.split_quantize(tensor, m_splits, quantizers, **kwargs)
+    if quantizers and getattr(quantizers[0], "optimize_for_gemm", False):
+        for t in out:
+            t._with_gemm_swizzled_scales = True
+    return out
 
 
 def _make_per_token_quantizer(
@@ -239,7 +242,7 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
 
         row_amax: optional prefused per-token row abs-max ``(sum_M,)`` fp32,
             aligned with activation rows (Fuse1 sort/pad, Fuse2 SwiGLU).
-            When set and TE ``split_quantize`` accepts it, K1 is skipped.
+            When set, TE ``split_quantize(row_amax=...)`` skips rowwise K1.
         """
         num_gemms = len(m_splits)
         self._refresh_quantizer_cache(num_gemms)
@@ -254,11 +257,13 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
             # ACT / GRAD: per-token 1D (per-row outer amax). columnwise for bwd.
             columnwise = True if qparams.param_type == qparams.param_type.Y else return_transpose
             quantizers = self._x_quantizers_col if columnwise else self._x_quantizers
+            # skip-K1 only applies to rowwise-only forward activations.
+            skip_k1_row_amax = row_amax if (row_amax is not None and not columnwise) else None
             quantize_tensor_list = _split_quantize(
                 x,
                 m_splits,
                 quantizers,
-                row_amax=row_amax,
+                row_amax=skip_k1_row_amax,
             )
 
         return GroupQuantizeResult(

@@ -168,6 +168,7 @@ class Nvfp4Cursor2CutlassV2QuantizeOp(quantization.QuantizeOpBase):
         reduce_amax: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         input_meta: Optional[quantization.QuantizeInputMetaBase] = None,
+        row_amax: Optional[torch.Tensor] = None,
     ) -> GroupQuantizeResult:
         """
         Grouped quantize for ``GroupLinear`` forward (v2 CUTLASS GEMM).
@@ -175,6 +176,9 @@ class Nvfp4Cursor2CutlassV2QuantizeOp(quantization.QuantizeOpBase):
         - Activation (X): per-token NVFP4 → ``extra_info`` with swizzled data/scales
         - Weight: tensor-global NVFP4 → ``extra_info`` with packed data/scales + n/k
         - Weight + ``return_transpose``: also produces TE FP8 columnwise tensors for dgrad
+
+        row_amax: optional prefused per-token row abs-max ``(sum_M,)`` fp32.
+            When set on activation quant, skips K1 in split-amax and uses prefused amax.
         """
         num_gemms = len(m_splits)
         self._refresh_quantizer_cache(num_gemms)
@@ -225,7 +229,9 @@ class Nvfp4Cursor2CutlassV2QuantizeOp(quantization.QuantizeOpBase):
                 quantize_tensor_list = []
 
             with record_function("sq_x_nvfp4_pertoken"):
-                gq = group_quantize_nvfp4_pertoken_split_amax(x, m_splits)
+                gq = group_quantize_nvfp4_pertoken_split_amax(
+                    x, m_splits, row_amax=row_amax,
+                )
 
             return GroupQuantizeResult(
                 data=[gq],

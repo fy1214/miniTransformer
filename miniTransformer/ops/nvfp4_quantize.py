@@ -709,12 +709,16 @@ def group_quantize_nvfp4_pertoken_split_amax(
     *,
     four_six: bool = False,
     scale_override: float = 1.0,
+    row_amax: Optional[torch.Tensor] = None,
 ) -> GroupQuantizeSwizzledResult:
     """Grouped per-token NVFP4 quantization via split-amax (2-kernel).
 
     Kernel 1: fp4_perrow_amax_te — per-row abs-max (grid=num_rows, block=256).
     Kernel 2: rtn_fp4_group_pertoken_split_amax — pure streaming quantize
               (flat 1-D grid, zero __syncthreads, zero shared memory).
+
+    When ``row_amax`` is provided (prefused per-token abs-max from Fuse1/Fuse2),
+    Kernel 1 is skipped and ``row_amax`` is passed directly to Kernel 2.
 
     Total: 2 kernel launches regardless of number of groups.
     No K limit. No M-alignment requirement.
@@ -724,6 +728,7 @@ def group_quantize_nvfp4_pertoken_split_amax(
         m_splits:       Per-group token counts. sum(m_splits) == total_m.
         four_six:       Round-4-or-6 if True; RTN otherwise.
         scale_override: Scalar multiplier for the per-row global scale.
+        row_amax:       Optional prefused per-row abs-max ``(total_m,)`` fp32.
 
     Returns:
         GroupQuantizeSwizzledResult with per-group tcgen05 swizzled scales.
@@ -767,9 +772,16 @@ def group_quantize_nvfp4_pertoken_split_amax(
 
     data = torch.empty((total_m, k // 2), dtype=nvfp4_output_t, device=device)
     global_scale = torch.empty(total_m, dtype=torch.float32, device=device)
-    amax_per_row = torch.empty(total_m, dtype=torch.float32, device=device)
 
-    fp4_gemm.fp4_perrow_amax_te(amax_per_row, x)
+    if row_amax is not None:
+        assert row_amax.shape == (total_m,), (
+            f"row_amax shape {tuple(row_amax.shape)} != ({total_m},)"
+        )
+        assert row_amax.dtype == torch.float32 and row_amax.is_cuda
+        amax_per_row = row_amax
+    else:
+        amax_per_row = torch.empty(total_m, dtype=torch.float32, device=device)
+        fp4_gemm.fp4_perrow_amax_te(amax_per_row, x)
 
     fn = (fp4_gemm.four_six_fp4_group_pertoken_split_amax if four_six
           else fp4_gemm.rtn_fp4_group_pertoken_split_amax)

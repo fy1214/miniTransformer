@@ -1,3 +1,11 @@
+"""CuTeDSL blockscaled NVFP4/MXFP4 grouped GEMM kernel (dev / QAT 6–7 backend).
+
+What: ``Sm100GroupedBlockScaledGemmKernel`` vs ``grouped_blockscaled_reference``.
+Where: underlying kernel for CuTeDSL grouped GEMM paths.
+Compare: Python blockscaled reference; multi-stream / bench are optional.
+
+Markers: ``legacy`` for correctness; ``bench``+``slow`` for timing tests.
+"""
 from typing import Dict, List
 
 import pytest
@@ -9,6 +17,8 @@ from miniTransformer.ops.cuteDSL.nvfp4.group_gemm_blockscaled_nvfp4_mxfp_cute im
     generate_grouped_blockscaled_inputs,
     grouped_blockscaled_reference,
 )
+
+pytestmark = pytest.mark.legacy
 
 
 BENCHMARK_CASES: List[Dict[str, object]] = [
@@ -64,9 +74,12 @@ CASE_MULTISTREAM_PARAMS = [
 
 
 class TestGroupedBlockScaledGemm:
+    """Correctness and optional benches for Sm100GroupedBlockScaledGemmKernel."""
+
     @pytest.mark.parametrize("profile", PROFILE_CASES)
     @pytest.mark.parametrize("case", CASE_PARAMS)
     def test_grouped_gemm_correctness(self, profile, case):
+        """Kernel output matches Python blockscaled reference per group."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
         abc_tensors, sfasfb_tensors, problem_sizes = generate_grouped_blockscaled_inputs(
@@ -105,9 +118,12 @@ class TestGroupedBlockScaledGemm:
                 msg=f"group {idx} mismatch for profile={profile.value}",
             )
 
+    @pytest.mark.bench
+    @pytest.mark.slow
     @pytest.mark.parametrize("case", CASE_MULTISTREAM_PARAMS)
     @pytest.mark.parametrize("num_streams", [2, 4])
     def test_group_gemm_multi_stream_round_robin_nvfp4(self, case, num_streams):
+        """Bench: flashinfer multi-stream round-robin launch (prints; always passes)."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
         pytest.importorskip("flashinfer")
@@ -209,9 +225,12 @@ class TestGroupedBlockScaledGemm:
         )
         assert multi_us > 0.0
 
+    @pytest.mark.bench
+    @pytest.mark.slow
     @pytest.mark.parametrize("profile", PROFILE_CASES)
     @pytest.mark.parametrize("case", CASE_PARAMS)
     def test_grouped_gemm_benchmark_shapes(self, profile, case):
+        """Bench: cold-L2 timed run still matches Python reference."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
         abc_tensors, sfasfb_tensors, problem_sizes = generate_grouped_blockscaled_inputs(

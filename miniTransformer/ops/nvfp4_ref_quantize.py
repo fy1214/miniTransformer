@@ -2,7 +2,7 @@
 NVFP4 quantize-dequantize reference — torch only (no miniTransformer / fp4_gemm).
 
 Matches ``Nvfp4TiledQuantizeRefOp`` in ``nvfp4_quantize_op_ref.py`` for the path
-used by ``tests/python/quantization/test_multi_quant_method.quant_dequant_nvfp4_REF``:
+used by ``tests/python/quantization/eval_format_comparison.quant_dequant_nvfp4_ref``:
 
 - ``quant_tile_shape=(1, 16)``
 - ``pow_2_scales=False``
@@ -228,7 +228,7 @@ def quant_dequant_nvfp4_ref_standalone(
     Quantize ``x`` with the ref NVFP4 scheme and return the dequantized tensor.
 
     Parameters mirror ``nvfp4_quantize_op_ref.Nvfp4TiledQuantizeRefOp`` defaults
-    used by ``quant_dequant_nvfp4_REF`` in the multi-quant test.
+    used by ``quant_dequant_nvfp4_ref`` in the format-comparison eval.
     """
     assert x.ndim == 2, "NVFP4 ref expects a 2D tensor [M, K]"
     assert quant_tile_shape in ((1, 16), (16, 16)), "NVFP4 ref supports (1,16) or (16,16) tiles"

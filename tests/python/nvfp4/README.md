@@ -1,77 +1,160 @@
-test_grouped_cutlass_gemm_per_token_scale.py: 测试QAT_PARAM=8中的算子，
-包括grouped_cutlass_gemm_v2和group_quantize_nvfp4_pertoken_swizzled
+# NVFP4 tests (`tests/python/nvfp4`)
 
+Tests for NVFP4 quantize / dequant / grouped GEMM on Blackwell (sm_100+).
 
-[test_nvfp4_pertoken.py](quantize_nvfp4_pertoken/test_nvfp4_pertoken.py)：
-测试QAT_PARAM=6中的quant算子，即quantize_nvfp4_pertoken 和 quantize_nvfp4_pertoken_swizzled
+## Layout
 
-对比内容：
-1、与pytorch golden比较：test_pertoken_rowmajor_vs_golden_rtn
-2、与two-pass比较：test_fused_linear_bit_exact
+```
+tests/python/nvfp4/
+├── conftest.py              # sm_100 guards, fp4_gemm fixture, pytest markers
+├── helpers/
+│   ├── golden.py            # unpack / unswizzle / dequant / eff-bitwidth
+│   ├── metrics.py           # real-input eval metrics (load, compute, print)
+│   └── shapes.py            # shared MoE / GEMM shape constants
+├── quantize_nvfp4_pertoken/           # single-matrix pertoken quant
+├── group_quantize_nvfp4_pertoken_swizzled/  # MoE activation quant
+├── group_quantize_nvfp4_tensor_global_packed/  # MoE weight quant
+├── grouped_cutlass_gemm/              # CUTLASS v2 grouped GEMM
+└── test_*.py                          # top-level pytest (pertoken GEMM, compile cache, …)
+```
 
-合成输入 pytest 结果（B300，sm_100）：
-- test_pertoken_rowmajor_vs_golden_rtn   : 13/13 PASSED（含 cols>8192 two-pass 路径）
-- test_pertoken_rowmajor_vs_golden_foursix: 13/13 PASSED
-- test_fused_linear_vs_golden            : 11/11 PASSED，2 SKIPPED（cols>8192，预期）
-- test_twopass_linear_vs_golden          : 13/13 PASSED
+**Shared helpers:** import from the nvfp4 test root (pytest adds it via `conftest.py`):
 
----
+```python
+from helpers.golden import unpack_fp4, unswizzle_scale, effective_bitwidth
+from helpers.metrics import load_real_input, run_quant_eval
+from helpers.shapes import FC1_DUMP_PATH, GROUPED_GEMM_V2_CASES
+```
 
-实际输入测试（/tmp/dump/fc1_step0000_inp.pt）：
-脚本：eval_nvfp4_pertoken_real_input.py（依赖 real_input_eval_utils.py）
+Legacy `*/real_input_eval_utils.py` files re-export `helpers.metrics` for backward compatibility.
 
-输入规格：
-- shape: [148480, 2048]，bfloat16，MoE fc1 层真实激活
-- 动态范围：min=-3.30，max=3.42，abs_mean=0.080，abs_std=0.114
-- 行间动态范围均匀：per-token amax 均值 2.08，标准差 0.44
+## Pytest markers
 
-1. Bit-exact 对比（CUDA kernel vs Python golden，同一真实输入）
-   - FP4 data  bit-exact: True
-   - FP8 scale bit-exact: True
-   结论：kernel 量化结果与 Python 参考实现逐 bit 对齐。
+| Marker | Meaning |
+|--------|---------|
+| `@pytest.mark.production` | MoE GroupedLinear forward path (QAT 6–15) |
+| `@pytest.mark.legacy` | Dense GEMM, TE, quartet, exploratory backends |
+| `@pytest.mark.eval` | Needs real fc1 dump (`/tmp/dump/fc1_step0000_inp.pt`) |
+| `@pytest.mark.bench` | Performance only, not correctness |
+| `@pytest.mark.slow` | Long-running (also registered in parent conftest) |
 
-2. 量化精度（RTN，反量化后与原始输入对比）
-   - Effective bitwidth : 3.47（阈值 3.3，通过）
-   - Mean MSE           : 1.62e-4
-   - Mean cosine sim    : 0.9897
-   - Mean row rel-L2    : 9.0%
-   注：99% 行的 rel-L2 > 5% 是 FP4 E2M1 格式固有特性（行内小值相对于行最大值粒度粗），
-       effective bitwidth 是正确的整体精度指标。
+Markers are registered in `conftest.py` and applied on remaining tests (P2):
+- `production` — MoE quant/GEMM mainline + pad-fuse API
+- `legacy` — TE tiled quant / binding smoke / CuTeDSL blockscaled kernel
+- `bench`+`slow` — micro-benches inside pytest files
 
-3. global amax vs per-token amax 对比（Python ref，同一输入）
-   | 方法            | Eff-bits | Mean cosine | Mean MSE  |
-   |-----------------|----------|-------------|-----------|
-   | Global amax     |  3.4570  |  0.989665   | 1.64e-4   |
-   | Per-token amax  |  3.4658  |  0.989705   | 1.62e-4   |
-   | 差值             | +0.009   | +4.1e-5     | -1.9e-6   |
+Example: `pytest tests/python/nvfp4 -m "production and not bench" -v`
 
-   per-row 胜负：62.8% per-token 更好，36.0% per-token 更差，1.2% 相同
-   更差行的 cos 平均降低 9.1e-5（噪声量级）
+## Fixtures (`conftest.py`)
 
-   结论：两种策略精度等价。原因是该输入行间动态范围均匀（amax std/mean≈21%），
-         per-token 没有发挥空间；36% 行更差源于 FP8 scale 量化舍入方向差异，非策略缺陷。
+| Fixture | Skips when |
+|---------|------------|
+| `require_cuda` | No CUDA |
+| `require_sm100` | GPU major < 10 |
+| `require_fp4_gemm` | Extension missing or sm_100 unavailable |
+| `fp4_gemm_module` | Same as `require_fp4_gemm`, returns `fp4_gemm` module |
 
-4. RTN vs Round-4-or-6
-   - RTN eff-bits: 3.4658
-   - 4/6 eff-bits: 3.5198，提升 +0.054 bit
+Run from repo root:
 
----
+```bash
+pytest tests/python/nvfp4/quantize_nvfp4_pertoken/test_nvfp4_pertoken.py -v
+pytest tests/python/nvfp4/grouped_cutlass_gemm/ -v
+pytest tests/python/nvfp4 --nvfp4-cuda-device cuda:0 -k "pertoken" -v
+```
 
-实际输入测试复用说明：
-新的量化算子只需新建一个 eval 脚本，修改 Section A 的 wrapper 即可，其余不变：
+## QAT_PARAMS → production API → tests
 
-  Section A（唯一需要改的部分）：
-    def my_op(x):                        # fn(x) -> x_dq，同 shape/device
-        res = my_quantize(x, ...)
-        return my_dequantize(res)
+Default training recipe: `QAT_PARAMS=6` (`FP4_SUB_CHANNEL_CURSOR2_REF`).
 
-  Section B（可选）：bit-exact 对比，各算子自定义
-  Section C：调用 run_quant_eval()，完全复用
+| QAT | Recipe | Quant (X / W) | GEMM | Primary tests |
+|-----|--------|---------------|------|----------------|
+| 3 | `FP4_SUB_CHANNEL_REF` | TE tiled ref | TE / ref | `test_nvfp4_quantize_exact.py` |
+| 4–5 | ref / quartet | legacy | — | *(removed — no dedicated tests)* |
+| **6** | **`FP4_SUB_CHANNEL_CURSOR2_REF`** | **`quantize_nvfp4_pertoken*`**, **`group_quantize_nvfp4_*`** | CuTeDSL ref | **`quantize_nvfp4_pertoken/`**, **`group_quantize_nvfp4_*/`** |
+| 7 | `FP4_SUB_CHANNEL_CURSOR2` | same quant ops | CuTeDSL | `test_grouped_gemm_pertoken.py` |
+| **8** | **`FP4_SUB_CHANNEL_CURSOR2_CUTLASS`** | group quant | **`grouped_cutlass_gemm_v2`** | **`grouped_cutlass_gemm/test_grouped_cutlass_gemm_v2_vs_golden.py`** |
+| 12 | `CURSOR2_CUTLASS_BWD` | group quant | CUTLASS v2 | `grouped_cutlass_gemm/` |
+| **14** | **`CURSOR2_CUTLASS_V2`** | group quant | **`grouped_cutlass_gemm_v2_evt`** | **`grouped_cutlass_gemm/test_grouped_cutlass_gemm_v2_evt_vs_golden.py`** |
+| **15** | **`FP4_SUB_CHANNEL_PERTOKEN`** | **`group_quantize_nvfp4_pertoken_split_amax`** | CUTLASS v2 | **missing — add in P5** |
 
-    run_quant_eval(x, {"RTN": my_op_rtn, "4/6": my_op_46}, title="My Op")
+## File index
 
-公共工具：real_input_eval_utils.py
-  - load_real_input()   — 加载 dump，flatten 到 2D
-  - run_quant_eval()    — 主入口，接收 {label: fn}，输出指标表 + per-row 胜负
-  - compute_metrics()   — 返回 eff-bits / MSE / cosine / rel-L2 字典
-  - print_metrics_table() / print_row_comparison() — 格式化输出
+### Production quant (MoE)
+
+| File | API under test | Compare against |
+|------|----------------|-----------------|
+| `quantize_nvfp4_pertoken/test_nvfp4_pertoken.py` | `quantize_nvfp4_pertoken`, `_swizzled` | Python golden, fused vs two-pass |
+| `group_quantize_nvfp4_pertoken_swizzled/test_nvfp4_group_pertoken_quantize.py` | `group_quantize_nvfp4_pertoken_swizzled`, `group_quantize_nvfp4_tensor_global_packed`, `quantize_weight_nvfp4_swizzled` | per-group ref |
+| `group_quantize_nvfp4_pertoken_swizzled/test_nvfp4_group_pertoken_pad_fuse.py` | pad-fuse CUDA kernels | legacy grouped pertoken |
+| `group_quantize_nvfp4_pertoken_swizzled/test_nvfp4_group_pertoken_pad_fuse_wrapper.py` | `fuse_pad=True` wrapper | direct kernel |
+| `group_quantize_nvfp4_tensor_global_packed/test_swizzle_arg_parity.py` | `group_quantize_nvfp4_tensor_global_packed(swizzle=…)` | swizzle on/off parity |
+
+### Production GEMM (MoE)
+
+| File | API under test | Compare against |
+|------|----------------|-----------------|
+| `grouped_cutlass_gemm/test_grouped_cutlass_gemm_v2_vs_golden.py` | `grouped_cutlass_gemm_v2` | dequant-then-GEMM Python golden |
+| `grouped_cutlass_gemm/test_grouped_cutlass_gemm_v2_evt_vs_golden.py` | v2 + EVT epilogue | v2 baseline |
+| `test_grouped_gemm_pertoken.py` | CuTeDSL grouped pertoken GEMM | Python reference matmul |
+
+### Other pytest
+
+| File | Notes |
+|------|-------|
+| `test_nvfp4_quantize_exact.py` | legacy: TE tiled + CUDA transpose vs TE + binding smoke / `quantize_nvfp4_cuda` |
+| `test_grouped_gemm_compile_cache.py` | compile cache helpers (no CUDA) |
+| `test_group_gemm_blockscaled_nvfp4_mxfp_cute.py` | CuTeDSL blockscaled kernel dev |
+
+### Real-input eval (manual, needs dump)
+
+| File | Operator |
+|------|----------|
+| `quantize_nvfp4_pertoken/eval_nvfp4_pertoken_real_input.py` | single-matrix pertoken + weight swizzled |
+| `group_quantize_nvfp4_pertoken_swizzled/eval_group_quantize_pertoken_swizzled_real_input.py` | grouped pertoken swizzled |
+| `group_quantize_nvfp4_pertoken_swizzled/eval_pad_fuse_real_input.py` | pad fuse path |
+| `group_quantize_nvfp4_tensor_global_packed/eval_group_quantize_tensor_global_packed_real_input.py` | grouped weight packed |
+| `grouped_cutlass_gemm/eval_grouped_cutlass_gemm_v2_real_input.py` | end-to-end quant + GEMM v2 |
+
+Collect dump:
+
+```bash
+export LINEAR_STATS_STEPS=1
+export LINEAR_STATS_CLASS=grouped
+export LINEAR_STATS_DUMP_DIR=/tmp/dump
+export LINEAR_STATS_BWD=0
+# run training / forward once → fc1_step0000_inp.pt
+```
+
+### Bench scripts (manual, not CI)
+
+| File | Purpose |
+|------|---------|
+| `group_quantize_nvfp4_tensor_global_packed/bench_swizzle_arg.py` | swizzle arg micro-bench |
+| `group_quantize_nvfp4_pertoken_swizzled/bench_nvfp4_group_pertoken_chunked_vs_legacy.py` | chunked vs legacy scheduler |
+
+## Removed (2026-09 batch 1)
+
+Deleted as unused or superseded by production v2 / grouped quant tests:
+
+- Dense GEMM: `test_nvfp4_gemm_{te,cutlass,cute,triton}.py`
+- Legacy paths: `test_nvfp4_quartet_*.py`, `test_grouped_gemm_nvfp4_vs_bf16_diff.py`
+- Non-NVFP4: `test_group_gemm_fp16_bf16_cute.py`, `test_group_gemm_blockwise_fp8_cute.py`
+- No-value: `test_nvfp4_per_token_gemm.py`, `test_quantize_pertoken_triton.py`
+- CUTLASS v1 (dead API): `grouped_cutlass_gemm/test_grouped_cutlass_gemm_per_token_scale.py`
+- Profile/bench tools: `profile_*.py`, `bench_te_per_token_quant_paths.py`
+
+## Subdirectory READMEs
+
+- `quantize_nvfp4_pertoken/README.md` — QAT 6 single-matrix quant
+- `group_quantize_nvfp4_pertoken_swizzled/README.md` — MoE activation quant
+- `group_quantize_nvfp4_tensor_global_packed/README.md` — MoE weight quant
+- `grouped_cutlass_gemm/README.md` — CUTLASS v2 golden methodology
+
+## Next steps
+
+| Phase | Work |
+|-------|------|
+| ~~P2~~ | ~~Add docstrings + `@pytest.mark.*`~~ (done) |
+| ~~P3~~ | ~~Merge binding into `test_nvfp4_quantize_exact.py`~~ (done) |
+| P4 | Move bench scripts to `tools/`, trim `test_bench_*` inside pertoken tests |
+| P5 | Add `group_quantize_nvfp4_pertoken_split_amax` tests (QAT 15) |

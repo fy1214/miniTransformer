@@ -1,12 +1,13 @@
-"""
-Exact / precision checks for NVFP4 quantization:
+"""TE / CUDA NVFP4 tiled quant + ``quantize_transpose_nvfp4`` binding smoke.
 
-1. Transformer Engine ``NVFP4Quantizer`` vs miniTransformer ``Nvfp4TiledQuantizeRefOp``.
-2. CUDA ``fp4_gemm.quantize_transpose_nvfp4`` vs TE ``NVFP4Quantizer`` for both
-   ``with_2d_quantization=True`` (2D kernel) and ``with_2d_quantization=False`` on BF16
-   (TE-aligned ``quantize_transpose_tuned_1D`` port).
+What:
+  - TE ``NVFP4Quantizer`` vs ``Nvfp4TiledQuantizeRefOp``
+  - CUDA ``quantize_transpose_nvfp4`` vs TE (2D bit-exact)
+  - Binding smoke: launch shapes, zero input, ``quantize_nvfp4_cuda`` wrapper
+Where: QAT 3 ``FP4_SUB_CHANNEL_REF``; low-level weight / TE alignment helpers.
+Compare: TE bit-exact (2D); wrapper shapes + global amax.
 
-The custom CUDA kernel targets Blackwell (sm_100+); TE-vs-CUDA checks are skipped on older GPUs.
+Markers: ``legacy``. Binding smoke needs fp4_gemm+sm_100; TE tests also need TE.
 """
 
 from __future__ import annotations
@@ -30,22 +31,28 @@ except ImportError:
     NVFP4Quantizer = None
     tex = None
 
+pytestmark = pytest.mark.legacy
+
 nvfp4_output_t = torch.uint8
 nvfp4_scale_t = torch.float8_e4m3fn
 
-_SKIP_CUDA_TE = None
+# Binding / wrapper smoke: only needs CUDA extension (no TE).
+_SKIP_CUDA: str | None = None
 if fp4_gemm is None:
-    _SKIP_CUDA_TE = "fp4_gemm extension not built"
-elif NVFP4Quantizer is None:
-    _SKIP_CUDA_TE = "transformer_engine not installed"
+    _SKIP_CUDA = "fp4_gemm extension not built"
 elif not torch.cuda.is_available():
-    _SKIP_CUDA_TE = "CUDA not available"
+    _SKIP_CUDA = "CUDA not available"
 else:
     _maj, _min = torch.cuda.get_device_capability()
     if _maj < 10:
-        _SKIP_CUDA_TE = (
+        _SKIP_CUDA = (
             f"quantize_transpose_nvfp4 requires sm_100+ (got capability {_maj}.{_min})"
         )
+
+# TE parity: same as _SKIP_CUDA plus TE install.
+_SKIP_CUDA_TE: str | None = _SKIP_CUDA
+if _SKIP_CUDA_TE is None and NVFP4Quantizer is None:
+    _SKIP_CUDA_TE = "transformer_engine not installed"
 
 
 def unpack_fp4(x: torch.Tensor) -> torch.Tensor:
@@ -256,8 +263,76 @@ def check_quantization_cuda_versus_te(
         torch.testing.assert_close(out_st.view(torch.uint8), st_te.view(torch.uint8), atol=0.0, rtol=0.0)
 
 
+# ---------------------------------------------------------------------------
+# Binding smoke (from former test_quantize_transpose_nvfp4_binding.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(_SKIP_CUDA is not None, reason=_SKIP_CUDA or "")
+@pytest.mark.parametrize("use_2d_quantization", [False, True])
+@pytest.mark.parametrize("return_transpose", [False, True])
+def test_quantize_transpose_nvfp4_runs(use_2d_quantization, return_transpose):
+    """Binding smoke: kernel launches and returns expected output shapes."""
+    rows, cols = 128, 128
+    inp = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+    out, out_s, out_t, out_st = _alloc_cuda_quant_buffers(rows, cols, return_transpose)
+    amax_row = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    amax_col = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    fp4_gemm.quantize_transpose_nvfp4(
+        inp,
+        amax_row,
+        amax_col,
+        out,
+        out_s,
+        out_t,
+        out_st,
+        use_2d_quantization,
+        return_transpose,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == (rows, cols // 2)
+    assert out_s.shape == (rows, cols // 16)
+    if return_transpose:
+        assert out_t.shape == (cols, rows // 2)
+        assert out_st.shape == (cols, rows // 16)
+
+
+@pytest.mark.skipif(_SKIP_CUDA is not None, reason=_SKIP_CUDA or "")
+def test_quantize_transpose_nvfp4_zeros_deterministic():
+    """All-zero input completes with finite scale tensors."""
+    rows, cols = 256, 256
+    inp = torch.zeros(rows, cols, device="cuda", dtype=torch.bfloat16)
+    out, out_s, out_t, out_st = _alloc_cuda_quant_buffers(rows, cols, return_transpose=True)
+    amax_row = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    amax_col = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+    fp4_gemm.quantize_transpose_nvfp4(
+        inp,
+        amax_row,
+        amax_col,
+        out,
+        out_s,
+        out_t,
+        out_st,
+        False,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out_s.to(torch.float32)).all()
+    assert torch.isfinite(out_st.to(torch.float32)).all()
+
+
+# ---------------------------------------------------------------------------
+# TE parity + wrapper
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.skipif(NVFP4Quantizer is None, reason="transformer_engine not installed")
 def test_te_vs_reference_bf16():
+    """TE NVFP4Quantizer vs Nvfp4TiledQuantizeRefOp on BF16 (2D, with transpose)."""
     check_quantization_nvfp4_versus_reference(
         x_dtype=torch.bfloat16,
         M=1024,
@@ -271,6 +346,7 @@ def test_te_vs_reference_bf16():
 @pytest.mark.parametrize("return_transpose", [False, True])
 @pytest.mark.parametrize("with_2d_quantization", [False, True])
 def test_cuda_quantize_transpose_vs_te(return_transpose: bool, with_2d_quantization: bool):
+    """CUDA ``quantize_transpose_nvfp4`` vs TE (2D bit-exact; 1D non-strict)."""
     # Keep 1D parity restoration as a separate follow-up task; 2D remains bit-exact.
     bit_exact = with_2d_quantization
     check_quantization_cuda_versus_te(
@@ -282,10 +358,11 @@ def test_cuda_quantize_transpose_vs_te(return_transpose: bool, with_2d_quantizat
     )
 
 
-@pytest.mark.skipif(_SKIP_CUDA_TE is not None, reason=_SKIP_CUDA_TE or "")
+@pytest.mark.skipif(_SKIP_CUDA is not None, reason=_SKIP_CUDA or "")
 @pytest.mark.parametrize("return_transpose", [False, True])
-def test_quantize_nvfp4_cuda_wrapper_global_amax(return_transpose: bool):
-    M, N = 1024, 4096
+def test_quantize_nvfp4_cuda_wrapper(return_transpose: bool):
+    """``quantize_nvfp4_cuda`` shapes, optional transpose fields, and global amax."""
+    M, N = 128, 128
     x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
     result = quantize_nvfp4_cuda(
         x,
@@ -294,10 +371,18 @@ def test_quantize_nvfp4_cuda_wrapper_global_amax(return_transpose: bool):
     )
     expected = torch.max(torch.abs(x)).to(torch.float32).view(1)
 
-    assert result.tensor_scale is not None
+    assert result.data.shape == (M, N // 2)
+    assert result.scale.shape == (M, N // 16)
+    assert result.tensor_scale is not None and result.tensor_scale.shape == (1,)
     torch.testing.assert_close(result.tensor_scale, expected, atol=0.0, rtol=0.0)
+
     if return_transpose:
-        assert result.tensor_scale_t is not None
+        assert result.data_t is not None and result.data_t.shape == (N, M // 2)
+        assert result.scale_t is not None and result.scale_t.shape == (N, M // 16)
+        assert result.tensor_scale_t is not None and result.tensor_scale_t.shape == (1,)
+    else:
+        assert result.data_t is None
+        assert result.scale_t is None
 
 
 if __name__ == "__main__":

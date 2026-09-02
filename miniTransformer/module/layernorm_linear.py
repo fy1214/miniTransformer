@@ -11,7 +11,6 @@ try:
 
     HAVE_TE = True
 except ImportError:
-
     HAVE_TE = False
 
 
@@ -24,7 +23,8 @@ def make_te_norm(
     zero_centered_gamma: bool,
     device: Union[torch.device, str],
 ) -> Any:
-    assert HAVE_TE, "Transformer Engine is not available."
+    """Build a norm module from the external TE package when available."""
+    assert HAVE_TE, "transformer_engine is required for this norm backend."
 
     if normalization == "LayerNorm":
         return te.pytorch.LayerNorm(
@@ -35,7 +35,7 @@ def make_te_norm(
             zero_centered_gamma=zero_centered_gamma,
             device=device,
         )
-    elif normalization == "RMSNorm":
+    if normalization == "RMSNorm":
         return te.pytorch.RMSNorm(
             in_features,
             eps=eps,
@@ -44,8 +44,7 @@ def make_te_norm(
             zero_centered_gamma=zero_centered_gamma,
             device=device,
         )
-    else:
-        raise ValueError(f"Normalization type {normalization} is not supported.")
+    raise ValueError(f"Normalization type {normalization} is not supported.")
 
 
 def make_torch_norm(
@@ -57,11 +56,13 @@ def make_torch_norm(
     zero_centered_gamma: bool,
     device: Union[torch.device, str],
 ) -> Union[torch.nn.LayerNorm, torch.nn.RMSNorm]:
-
-    assert (
-        not zero_centered_gamma
-    ), "Zero centered gamma is not supported for TorchNorm."
-    assert not sequence_parallel, "Sequence parallelism is not supported for TorchNorm."
+    """Build a norm module with native PyTorch ops."""
+    assert not zero_centered_gamma, (
+        "zero_centered_gamma is not supported for the torch norm backend."
+    )
+    assert not sequence_parallel, (
+        "sequence_parallel is not supported for the torch norm backend."
+    )
 
     if normalization == "LayerNorm":
         return torch.nn.LayerNorm(
@@ -70,105 +71,21 @@ def make_torch_norm(
             dtype=params_dtype,
             device=device,
         )
-    elif normalization == "RMSNorm":
+    if normalization == "RMSNorm":
         return torch.nn.RMSNorm(
             in_features,
             eps=eps,
             dtype=params_dtype,
             device=device,
         )
-    else:
-        raise ValueError(f"Normalization type {normalization} is not supported.")
+    raise ValueError(f"Normalization type {normalization} is not supported.")
 
 
 class LayerNormLinear(Linear):
-    r"""
-    Applies layer normalization followed by linear transformation to the incoming data.
+    """LayerNorm (or RMSNorm) followed by :class:`Linear`.
 
-    We inherit from Linear to keep compatability with TE/Megatron checkpoints.
-    If we inherit from LinearBaseModule, we will see Kitchen's weight parameter stored in following format: linear_fc1.linear.weight.
-    MCore MLP's ShardedStateDict would expect linear_fc1.weight directly: https://github.com/NVIDIA/Megatron-LM/blob/05ac33c6aa5b7e7712907e10401fa4726b694655/megatron/core/transformer/mlp.py#L139
-
-    Parameters
-    ----------
-    in_features : int
-                 size of each input sample.
-    out_features : int
-                  size of each output sample.
-    eps : float, default = 1e-5
-         a value added to the denominator of layer normalization for numerical stability.
-    bias : bool, default = `True`
-          if set to `False`, the layer will not learn an additive bias.
-    normalization : { 'LayerNorm', 'RMSNorm' }, default = 'LayerNorm'
-                   type of normalization applied.
-    init_method : Callable, default = `None`
-                 used for initializing weights in the following way: `init_method(weight)`.
-                 When set to `None`, defaults to `torch.nn.init.normal_(mean=0.0, std=0.023)`.
-    return_layernorm_output : bool, default = `False`
-                             if set to `True`, output of layernorm is returned from the forward
-                             together with the output of the linear transformation.
-                             Example use case: residual connection for transformer module is
-                             taken post layernorm.
-    return_layernorm_output_gathered : bool, default = `False`
-                             if set to `True`, output of layernorm is returned after the all
-                             gather operation. Ignored if return_layernorm_output is False.
-                             Example use case: with sequence parallel, input to residual connection
-                             for transformer module (e.g. LoRA) will need to be gathered.
-                             Returning layernorm output gathered will prevent a redundant gather.
-    parameters_split : Optional[Union[Tuple[str, ...], Dict[str, int]]], default = None
-                      Configuration for splitting the weight and bias tensors along dim 0 into
-                      multiple PyTorch parameters. If a list or tuple of strings is provided,
-                      they are used to make the names of equally-sized parameters. If a dict
-                      (preferably an OrderedDict) is provided, the keys are used as names and
-                      values as split sizes along dim 0. The resulting parameters will have
-                      names that end in `_weight` or `_bias`, so trailing underscores are
-                      stripped from any provided names.
-    zero_centered_gamma : bool, default = 'False'
-                         if set to 'True', gamma parameter in LayerNorm is initialized to 0 and
-                         the LayerNorm formula changes to
-
-                         .. math::
-                            y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \varepsilon}} *
-                            (1 + \gamma) + \beta
-    device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will be allocated. It is the user's
-          responsibility to ensure all parameters are moved to the GPU before running the
-          forward pass.
-
-    Parallelism parameters
-    ----------------------
-    sequence_parallel : bool, default = `False`
-                       if set to `True`, uses sequence parallelism.
-    tp_group : ProcessGroup, default = `None`
-              tensor parallel process group.
-    tp_size : int, default = 1
-             used as TP (tensor parallel) world size when TP groups are not formed during
-             initialization. In this case, users must call the
-             `set_tensor_parallel_group(tp_group)` method on the initialized module before the
-             forward pass to supply the tensor parallel group needed for tensor and sequence
-             parallel collectives.
-    parallel_mode : {None, 'column', 'row'}, default = `None`
-                   used to decide whether this Linear layer is Column Parallel Linear or Row
-                   Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
-                   When set to `None`, no communication is performed.
-
-    Optimization parameters
-    -----------------------
-    fuse_wgrad_accumulation : bool, default = 'False'
-                             if set to `True`, enables fusing of creation and accumulation of
-                             the weight gradient. When enabled, it is assumed that the weights
-                             have an additional `main_grad` attribute (used instead of the
-                             regular `grad`) which is a pre-allocated buffer of the correct
-                             size to accumulate gradients in.
-    return_bias : bool, default = `False`
-                 when set to `True`, this module will not apply the additive bias itself, but
-                 instead return the bias value during the forward pass together with the
-                 output of the linear transformation :math:`y = xA^T`. This is useful when
-                 the bias addition can be fused to subsequent operations.
-    params_dtype : torch.dtype, default = `torch.get_default_dtype()`
-                  it controls the type used to allocate the initial parameters. Useful when
-                  the model is trained with lower precision and the original FP32 parameters
-                  would not fit in GPU memory.
+    Inherits from ``Linear`` so checkpoint keys stay ``layer_norm_weight`` /
+    ``weight`` at this module level rather than under a nested submodule.
     """
 
     def __init__(
@@ -220,27 +137,24 @@ class LayerNormLinear(Linear):
             ub_overlap_ag=ub_overlap_ag,
             ub_name=ub_name,
             layer_number=layer_number,
-            qlinear_params=qlinear_params,
+            qlinear_params=qlinear_params,  # forwarded; selects quantize_op on Linear
         )
 
         if any([ub_bulk_wgrad, ub_bulk_dgrad, ub_overlap_ag, ub_overlap_rs_dgrad]):
             assert ub_name is not None, "Userbuffer name [string] is not set."
         assert not (
             ub_bulk_wgrad or ub_bulk_dgrad or ub_overlap_rs_dgrad
-        ), "Userbuffer optimizations for bulk_wgrad, bulk_dgrad and overlap_rs_dgrad are not supported yet."
+        ), "bulk_wgrad, bulk_dgrad and overlap_rs_dgrad are not supported."
 
         self.return_layernorm_output = return_layernorm_output
         self.return_layernorm_output_gathered = return_layernorm_output_gathered
+        assert not self.return_layernorm_output_gathered, (
+            "return_layernorm_output_gathered is not supported yet."
+        )
 
-        # does not support return_layernorm_output_gathered for now to keep the code simple
-        assert (
-            not self.return_layernorm_output_gathered
-        ), "return_layernorm_output_gathered is not supported yet."
-
-        assert normalization in [
-            "LayerNorm",
-            "RMSNorm",
-        ], "Unsupported normalization type!"
+        assert normalization in ("LayerNorm", "RMSNorm"), (
+            f"Unsupported normalization type: {normalization}"
+        )
         self.normalization = normalization
 
         if use_te_norm is None:
@@ -267,18 +181,21 @@ class LayerNormLinear(Linear):
                 device=device,
             )
 
-        # Register gamma/beta directly on this module to match TE's state_dict layout:
-        #   TE: layer_norm_weight (nn.Parameter)  ← not layer_norm.weight
-        # Storing _norm as a plain attribute (bypassing nn.Module.__setattr__) prevents it
-        # from appearing as a submodule in state_dict.
-        self.register_parameter("layer_norm_weight", _norm._parameters.pop("weight", None))
+        # Hoist norm weights to this module for checkpoint name compatibility.
+        self.register_parameter(
+            "layer_norm_weight", _norm._parameters.pop("weight", None)
+        )
         if normalization == "LayerNorm":
-            self.register_parameter("layer_norm_bias", _norm._parameters.pop("bias", None))
+            self.register_parameter(
+                "layer_norm_bias", _norm._parameters.pop("bias", None)
+            )
         else:
             self.layer_norm_bias = None
 
         self._layer_norm_eps = _norm.eps
-        self._layer_norm_normalized_shape = getattr(_norm, "normalized_shape", (in_features,))
+        self._layer_norm_normalized_shape = getattr(
+            _norm, "normalized_shape", (in_features,)
+        )
 
     @torch._dynamo.disable(recursive=True)
     def forward(
@@ -287,29 +204,10 @@ class LayerNormLinear(Linear):
         is_first_microbatch: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Apply layer normalization to the input followed by a linear transformation.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-             Input tensor.
-        is_first_microbatch : {True, False, None}, default = None
-                             During training using either gradient accumulation or
-                             pipeline parallelism a minibatch of data is further split
-                             into microbatches. Between the microbatches of the same minibatch
-                             the model weights are not updated. Setting this parameter indicates
-                             whether the current microbatch is the first in a minibatch or not.
-                             When set, this parameter enables additional optimizations:
-
-                             * during FP8 training, it allows caching of the FP8 versions of
-                               the weights
-                             * it also allows skipping gradient accumulation during the
-                               first microbatch (since it is the first gradient being
-                               produced)
-        """
+        """Apply norm, then delegate to :class:`Linear` (quant op path unchanged)."""
         inp = inp.contiguous()
 
+        # Norm runs in high precision; output becomes Linear input (then x_params quant).
         if self.normalization == "LayerNorm":
             ln_out = F.layer_norm(
                 inp,
@@ -318,25 +216,28 @@ class LayerNormLinear(Linear):
                 bias=self.layer_norm_bias,
                 eps=self._layer_norm_eps,
             )
-        else:  # RMSNorm
+        else:
             ln_out = F.rms_norm(
                 inp,
                 self._layer_norm_normalized_shape,
                 weight=self.layer_norm_weight,
                 eps=self._layer_norm_eps,
             )
-        input_meta = None
 
+        # --- op path starts in Linear -------------------------------------------
+        # super().forward -> _QuantizedLinear or _NonQuantizedLinear
+        #   quant path: quantize_op.quantize(ln_out, x_params) -> qgemm(TN)
+        #   dense path: torch.nn.functional.linear(ln_out, weight)
+        # qlinear_params / quantize_op come from Linear.__init__ (QAT_PARAMS or override).
+        input_meta = None  # reserved for passing norm-side metadata into x quant
         out = super().forward(ln_out, is_first_microbatch, fp8_output, input_meta)
 
         if self.return_bias:
             out, returned_bias = out
             if self.return_layernorm_output:
                 return out, returned_bias, ln_out
-            else:
-                return out, returned_bias
-        else:
-            if self.return_layernorm_output:
-                return out, ln_out
-            else:
-                return out
+            return out, returned_bias
+
+        if self.return_layernorm_output:
+            return out, ln_out
+        return out

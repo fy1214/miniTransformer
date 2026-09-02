@@ -11,7 +11,7 @@ from miniTransformer.distributed.distributed import (
     get_distributed_rank,
     gather_along_first_dim,
     reduce_scatter_along_first_dim,
-    set_tensor_model_parallel_attributes, get_distributed_world_size,
+    set_tensor_model_parallel_attributes,
 )
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp
@@ -28,31 +28,13 @@ logger = logging.getLogger(__name__)
 
 
 class _NonQuantizedLinear(torch.autograd.Function):
-    """Non-quantized Linear function (FP32, FP16, BF16)
+    """Dense linear in BF16/FP16/FP32 via ``torch.nn.functional.linear``.
 
-    1) Row Major GEMM Equation
-    Suppose x is [m, k], w is [n, k], and Y is [m, n]. Note that the
-    [weight](https://pytorch.org/docs/stable/generated/torch.nn.Linear.html)
-    tensor in PyTorch is initialized with shape [n, k] instead of [k, n].
+    PyTorch weight layout is [n, k]. Equivalent cuBLAS-style layouts:
 
-    fwd:    Y = x @ w.t()  # [m, k] x [k, n] = [m, n]
-    dgrad: dX = dY @ w     # [m, n] x [n, k] = [m, k]
-    wgrad: dW = dY.t() @ x # [n, m] x [m, k] = [n, k]
-
-    2) GEMM Equation in cuBLAS terms
-
-    The GEMM Layout in cuBLAS terms (TN, NN, NT) uses letters T/N to indicate whether
-    the tensor is transposed in memory. The first letter refers to argument A, and
-    the second to argument B. Note that in cuBLAS, the order of A and B is switched
-    compared to the above equations.
-
-    BF16/FP32 GEMM supports different GEMM layouts without requiring explicit
-    transposition in memory. And torch.matmul automatically selects the most efficient
-    GEMM layout.
-
-    fwd   (TN):  Y = w @ x      # [n, k] x [m, k] = [m, n]
-    dgrad (NN): dX = w @ dY     # [n, k] x [m, n] = [m, k]
-    wgrad (NT): dW = x @ dY     # [m, k] x [m, n] = [n, k]
+    fwd   (TN):  Y = w @ x      # [n, k] x [m, k] -> [m, n]
+    dgrad (NN): dX = w @ dY     # [n, k] x [m, n] -> [m, k]
+    wgrad (NT): dW = x @ dY     # [m, k] x [m, n] -> [n, k]
     """
 
     @staticmethod
@@ -61,7 +43,7 @@ class _NonQuantizedLinear(torch.autograd.Function):
         x: torch.Tensor,
         x_meta: Optional[quantization.QuantizeInputMetaBase],
         w: torch.Tensor,
-        weight_qresult_cache: quantization.QuantizeResult,
+        weight_qresult_cache: quantization.QuantizeResultCache,
         bias: Union[torch.Tensor, None],
         sequence_parallel: bool,
         tp_group: Optional[torch.distributed.ProcessGroup],
@@ -74,19 +56,18 @@ class _NonQuantizedLinear(torch.autograd.Function):
         fuse_wgrad_accumulation: bool,
         disable_backward_quant: bool
     ) -> torch.Tensor:
-        # Set dtypes, shapes and bias
         x_shape = x.shape
-        x = x.view(-1, x.shape[-1])
-        x = cast_if_needed(x, activation_dtype)
+        x = cast_if_needed(x.view(-1, x.shape[-1]), activation_dtype)
         use_bias = bias is not None
         if use_bias:
-            assert bias is not None
             bias = cast_if_needed(bias, activation_dtype)
 
+        # Column + sequence parallel: AllGather activation before GEMM.
         if parallel_mode == "column" and sequence_parallel:
             assert tp_group is not None
             x, _ = gather_along_first_dim(x, tp_group)
 
+        # Dense path: no quantize_op; standard fused linear in activation_dtype.
         y = torch.nn.functional.linear(x, w, bias)
 
         if is_grad_enabled:
@@ -130,7 +111,7 @@ class _NonQuantizedLinear(torch.autograd.Function):
 
         dgrad = torch.matmul(dy, w)
 
-        # Overlap dgrad communication with wgrad GEMM
+        # Launch column-parallel dgrad comm async; overlap with wgrad below.
         if ctx.parallel_mode == "column" and ctx.sequence_parallel:
             dgrad, handle = reduce_scatter_along_first_dim(dgrad, ctx.tp_group, True)
         elif ctx.parallel_mode == "column" and ctx.tp_size > 1:
@@ -179,20 +160,17 @@ class _NonQuantizedLinear(torch.autograd.Function):
         )
 
 class _QuantizedLinear(torch.autograd.Function):
-    """Optimized Linear Function with quantization support.
+    """Linear autograd function with quantization support.
 
-    The tensors x, w, bias, y, dy, wgrad, dgrad and bgrad should
-    have the same dtype (FP32, BF16 or FP16). The GEMM output
-    (y, wgrad, dgrad, bgrad) dtype could be further controlled
-    by the qlinear_params.mm_(fprop|dgrad|wgrad).out_dtype.
+    Quantize and GEMM are delegated to ``qlinear_params.quantize_op``
+    (``quantize`` + ``qgemm``). High-precision activations use
+    ``qlinear_params.mm_(fprop|dgrad|wgrad).out_dtype`` when set.
 
-    GEMM Equation in cuBLAS terms for TN layout
+    Quantized GEMM layouts (cuBLAS notation):
 
-    Hopper FP8 GEMM only supports TN layout. So, the equations become:
-
-    fwd   (TN):  Y = w @ x            # [n, k] x [m, k] = [m, n]
-    dgrad (TN): dX = w.t() @ dY       # [k, n] x [m, n] = [m, k]
-    wgrad (TN): dW = x.t() @ dY.t()   # [k, m] x [n, m] = [n, k]
+    fwd   (TN):  Y = w @ x
+    dgrad (NN): dX = w.t() @ dY       # via qgemm layout="NN"
+    wgrad (NT): dW = x.t() @ dY.t()   # via qgemm layout="NT"
     """
 
     @staticmethod
@@ -224,14 +202,14 @@ class _QuantizedLinear(torch.autograd.Function):
             if qlinear_params.mm_fprop.out_dtype is None
             else qlinear_params.mm_fprop.out_dtype
         )
-        x = x.view(-1, x.shape[-1])
-        x = cast_if_needed(x, activation_dtype)
+        x = cast_if_needed(x.view(-1, x.shape[-1]), activation_dtype)
         use_bias = bias is not None
         if use_bias:
-            assert bias is not None
             bias = cast_if_needed(bias, activation_dtype)
 
-        # Quantize x; also performs AllGather when sequence_parallel + column_parallel
+        # --- op: quantize activation (x_params) ---------------------------------
+        # Input [m, k] bf16/fp16. return_transpose=True also builds columnwise qx_t
+        # for backward NN/NT qgemm unless disable_backward_quant skips that path.
         gather_required = parallel_mode == "column" and sequence_parallel
         qresult_x = _QuantizedLinear.quantize_optionally_allgather(
             quantize_op,
@@ -242,33 +220,47 @@ class _QuantizedLinear(torch.autograd.Function):
             allgather_quantize=qlinear_params.allgather_quantize,
             tp_group=tp_group,
         )
+        # qx/sx/tensor_scale are op-specific (NVFP4 tensor, FP8 wrapper, etc.).
+        qx, sx, qx_global_amax_row = (
+            qresult_x.data,
+            qresult_x.scale,
+            qresult_x.tensor_scale,
+        )
 
-        qx, sx, qx_global_amax_row = qresult_x.data, qresult_x.scale, qresult_x.tensor_scale
-
-        update_quantize_weights = is_first_microbatch or is_first_microbatch is None
-        if quantize_op.should_update_quantize_weights:
-            # Quantize w (with optional transpose)
+        # --- op: quantize weight (w_params) -------------------------------------
+        # Weight quant cache: first microbatch quantizes and stores; later ones reuse.
+        refresh_quantized_weights = (
+            is_first_microbatch is None or is_first_microbatch
+        )
+        if quantize_op.should_update_quantize_weights or refresh_quantized_weights:
+            # return_transpose=True produces qw_t used by dgrad qgemm (layout NN).
             qresult_w = quantize_op.quantize(
                 w, qlinear_params.w_params, return_transpose=True
             )
-            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
-        elif update_quantize_weights:
-            qresult_w = quantize_op.quantize(
-                w, qlinear_params.w_params, return_transpose=True
+            qw, sw, qw_global_amax_row = (
+                qresult_w.data,
+                qresult_w.scale,
+                qresult_w.tensor_scale,
             )
-            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
-            # save quantized weight cache between microbatches
-            weight_qresult_cache.data = qresult_w.data
-            weight_qresult_cache.scale = qresult_w.scale
-            weight_qresult_cache.data_t = qresult_w.data_t
-            weight_qresult_cache.scale_t = qresult_w.scale_t
-            weight_qresult_cache.global_amax_row = qresult_w.tensor_scale
-            weight_qresult_cache.global_amax_col = qresult_w.tensor_scale_t
+            if not quantize_op.should_update_quantize_weights:
+                # Cache lives on the module; reused until next first microbatch.
+                weight_qresult_cache.data = qresult_w.data
+                weight_qresult_cache.scale = qresult_w.scale
+                weight_qresult_cache.data_t = qresult_w.data_t
+                weight_qresult_cache.scale_t = qresult_w.scale_t
+                weight_qresult_cache.global_amax_row = qresult_w.tensor_scale
+                weight_qresult_cache.global_amax_col = qresult_w.tensor_scale_t
         else:
             qresult_w = weight_qresult_cache.to_qresult()
-            qw, sw, qw_global_amax_row = qresult_w.data, qresult_w.scale, qresult_w.tensor_scale
-            assert qw is not None, "quantized weight cache should not be None"
+            qw, sw, qw_global_amax_row = (
+                qresult_w.data,
+                qresult_w.scale,
+                qresult_w.tensor_scale,
+            )
+            assert qw is not None, "quantized weight cache must not be None"
 
+        # --- op: forward qgemm (TN, mm_fprop) -----------------------------------
+        # y = qw @ qx (+ bias when fused). Kernel choice is inside quantize_op.
         y = quantize_op.qgemm(
             qx,
             qw,
@@ -300,6 +292,7 @@ class _QuantizedLinear(torch.autograd.Function):
             ctx.activation_dtype = activation_dtype
             ctx.disable_backward_quant = disable_backward_quant
 
+            # Columnwise quant from forward; consumed by backward qgemm unless STE path.
             qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col = (
                 qresult_x.data_t,
                 qresult_x.scale_t,
@@ -309,14 +302,12 @@ class _QuantizedLinear(torch.autograd.Function):
                 qresult_w.tensor_scale_t,
             )
 
-            # If memory saving is enabled, we only save a shard of the qx_t tensor.
-            # The full tensor will need to be AllGathered in the backward pass.
+            # memory_saving: store only this rank's qx_t shard; AllGather in backward.
             if qlinear_params.memory_saving and gather_required:
-                # Clone to free the original full qx_t tensor; PyTorch won't release it otherwise
-                # due to reference counting when the full gather result is still reachable.
                 qx_t = torch.chunk(qx_t, tp_size, dim=0)[ctx.tp_rank].detach().clone()
 
             if disable_backward_quant:
+                # STE path: save rowwise qx/qw for dequant in backward; keep high-precision w.
                 ctx.save_for_backward(
                     qx,
                     sx,
@@ -327,6 +318,7 @@ class _QuantizedLinear(torch.autograd.Function):
                     w,
                 )
             else:
+                # Quant backward: save columnwise qx_t/qw_t for NN/NT qgemm.
                 ctx.save_for_backward(
                     qx_t,
                     sx_t,
@@ -337,41 +329,39 @@ class _QuantizedLinear(torch.autograd.Function):
                     w,
                 )
 
-        # Reduce scatter for row and sequence parallel
+        # Row parallel: ReduceScatter (sequence parallel) or AllReduce output.
         if parallel_mode == "row" and sequence_parallel:
             assert tp_group is not None
             y, _ = reduce_scatter_along_first_dim(y, tp_group)
-        # Allreduce for rowwise parallel
-        # TODO: symmetric_all_reduce to replace allreduce
         elif parallel_mode == "row" and tp_size > 1:
             y, _ = allreduce(y, tp_group)
 
+        # Restore leading dims stripped before [m, k] quant/gemm.
         return y.view(-1, *x_shape[1:-1], y.shape[-1])
 
     @staticmethod
     def backward(ctx, *dy_tup: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
-        # Get saved tensors and sanity checks
         assert len(dy_tup) == 1
         dy = dy_tup[0]
-        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, w) = ctx.saved_tensors
+        # Same seven slots for both backward modes; names map to rowwise or columnwise tensors.
+        (qx_t, sx_t, qx_global_amax_col, qw_t, sw_t, qw_global_amax_col, w) = (
+            ctx.saved_tensors
+        )
 
         assert qw_t is not None and sw_t is not None
         assert qx_t is not None and sx_t is not None
 
-        # Set dtypes, shapes
         out_dtype_dgrad = (
             dy.dtype
             if ctx.qlinear_params.mm_dgrad.out_dtype is None
             else ctx.qlinear_params.mm_dgrad.out_dtype
         )
-        dy = dy.contiguous()
-        dy = dy.view(-1, dy.shape[-1])
+        dy = dy.contiguous().view(-1, dy.shape[-1])
 
-        # Bias gradient
         b_grad = torch.sum(dy, dim=0) if ctx.use_bias else None
 
-        # Quantize dy; also performs AllGather when sequence_parallel + row_parallel
-        # TODO: overlap x allgather with w quantization
+        # --- op: quantize grad_output (g_params) --------------------------------
+        # Builds qdy + qdy_t for dgrad/wgrad qgemm. AllGather dy first when row+SP.
         gather_required = ctx.parallel_mode == "row" and ctx.sequence_parallel
         qresult_dy = _QuantizedLinear.quantize_optionally_allgather(
             ctx.quantize_op,
@@ -393,15 +383,20 @@ class _QuantizedLinear(torch.autograd.Function):
 
         qx_t_handle = None
         if ctx.qlinear_params.memory_saving and ctx.x_gather_required:
+            # Restore full qx_t shard saved during forward before wgrad qgemm.
             assert ctx.tp_group is not None
             qx_t, qx_t_handle = gather_along_first_dim(
                 qx_t, ctx.tp_group, async_op=True
             )
 
         if ctx.disable_backward_quant:
+            # --- op: dequantize + BF16 dgrad ------------------------------------
+            # Saved slots hold rowwise qx/qw; dequantize then high-precision matmul.
             dq_w_t = ctx.quantize_op.dequantize(qw_t, sw_t, qw_global_amax_col)
             dgrad = dy @ dq_w_t
         else:
+            # --- op: dgrad qgemm (NN, mm_dgrad) ---------------------------------
+            # dgrad = qdy @ qw_t using g_params for dy and w_params for weight side.
             dgrad = ctx.quantize_op.qgemm(
                 qdy,
                 qw_t,
@@ -422,7 +417,8 @@ class _QuantizedLinear(torch.autograd.Function):
 
         if qx_t_handle is not None:
             qx_t_handle.wait()
-        # Overlap dgrad communication with wgrad GEMM
+
+        # Overlap column-parallel dgrad comm with wgrad qgemm.
         if ctx.parallel_mode == "column" and ctx.sequence_parallel:
             dgrad, handle = reduce_scatter_along_first_dim(dgrad, ctx.tp_group, True)
         elif ctx.parallel_mode == "column" and ctx.tp_size > 1:
@@ -437,16 +433,19 @@ class _QuantizedLinear(torch.autograd.Function):
         else:
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
-        out_dtype_wgrad = w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
-        # GEMM wgrad nt.
+        out_dtype_wgrad = (
+            w.main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
+        )
         if ctx.disable_backward_quant:
+            # --- op: dequantize + BF16 wgrad ------------------------------------
             dq_x_t = ctx.quantize_op.dequantize(qx_t, sx_t, qx_global_amax_col)
             wgrad = dy.T @ dq_x_t
-            if accumulate_wgrad_into_param_main_grad:
-                if ctx.fuse_wgrad_accumulation:
-                    w.main_grad.add_(wgrad)
-                    wgrad = w.main_grad
+            if accumulate_wgrad_into_param_main_grad and ctx.fuse_wgrad_accumulation:
+                w.main_grad.add_(wgrad)
+                wgrad = w.main_grad
         else:
+            # --- op: wgrad qgemm (NT, mm_wgrad) ---------------------------------
+            # wgrad = qdy_t @ qx_t; out=main_grad when accumulating across microbatches.
             wgrad = ctx.quantize_op.qgemm(
                 qdy_t,
                 qx_t,
@@ -455,7 +454,7 @@ class _QuantizedLinear(torch.autograd.Function):
                 sdy_t,
                 sx_t,
                 None,
-                out=w.main_grad if ctx.fuse_wgrad_accumulation else None,  # main_grad is fp32 dtype
+                out=w.main_grad if ctx.fuse_wgrad_accumulation else None,
                 grad=True,
                 accumulate=accumulate_wgrad_into_param_main_grad,
                 layout="NT",
@@ -464,10 +463,8 @@ class _QuantizedLinear(torch.autograd.Function):
                 qparams_x=ctx.qlinear_params.g_params,
                 qparams_w=ctx.qlinear_params.x_params,
             )
-        # Handle wgrad accumulation for mcore if needed
-        wgrad = _QuantizedLinear.reset_wgrad_if_needed(ctx, w, wgrad)
 
-        # Wait for communication to finish
+        wgrad = _QuantizedLinear.reset_wgrad_if_needed(ctx, w, wgrad)
         if handle is not None:
             handle.wait()
 
@@ -500,16 +497,15 @@ class _QuantizedLinear(torch.autograd.Function):
         allgather_quantize: bool,
         tp_group: Optional[torch.distributed.ProcessGroup],
     ):
-        """
-        Quantize the input with optional AllGather.
-        If AllGather is required, it support two paths:
-            1) Quantize the local tensor shard (with amax reduction if needed), then AllGather in quantize type
-            2) AllGather in BF16, then quantize the full tensor
-        If AllGather is not required, it will just quantize the local tensor shard.
+        """Call ``quantize_op.quantize`` with optional sequence-parallel AllGather.
+
+        When AllGather is required:
+          1) quantize local shard (with amax reduction), then AllGather quant tensors, or
+          2) AllGather in high precision, then quantize the full tensor.
         """
         if allgather_required:
-            # 1) AllGather in quantize
             if allgather_quantize:
+                # Path 1: quantize local shard (reduce amax across TP), then AllGather qx.
                 assert quantize_op.supports_allgather
                 assert tp_group is not None
                 qresult_x = quantize_op.quantize(
@@ -520,8 +516,8 @@ class _QuantizedLinear(torch.autograd.Function):
                     tp_group=tp_group,
                 )
                 qresult_x.data, _ = gather_along_first_dim(qresult_x.data, tp_group)
-            # 2) AllGather in BF16
             else:
+                # Path 2: AllGather high-precision x, then quantize the full tensor.
                 assert tp_group is not None
                 x, _ = gather_along_first_dim(x, tp_group)
                 qresult_x = quantize_op.quantize(
@@ -531,8 +527,8 @@ class _QuantizedLinear(torch.autograd.Function):
                     reduce_amax=False,
                     tp_group=tp_group,
                 )
-        # AllGather not required
         else:
+            # No sequence-parallel gather: quantize the local [m, k] tensor directly.
             qresult_x = quantize_op.quantize(
                 x,
                 qparams,
@@ -544,16 +540,9 @@ class _QuantizedLinear(torch.autograd.Function):
 
     @staticmethod
     def reset_wgrad_if_needed(ctx, w, wgrad):
-        """
-        When wgrad is already accumulated into w.main_grad, we need to either:
-        1) Set wgrad to None so that the PyTorch autograd system does not handle wgrad anymore.
-        2) For mcore, it has custom logic that requires resetting wgrad to an empty tensor or zeros to prevent deadlocks.
-           See: https://github.com/NVIDIA/Megatron-LM/blob/215a2eb2c5cad942cd095976539bc74c6ae9d622/megatron/core/tensor_parallel/layers.py#L521-L544
-        """
+        """Return wgrad for autograd after optional main_grad fusion."""
         if w.requires_grad:
-            # Handle wgrad accumulation for mcore
             if ctx.fuse_wgrad_accumulation and hasattr(w, "grad_added_to_main_grad"):
-                # Choose between torch.zeros or torch.empty based on zero_out_wgrad attribute.
                 if getattr(w, "zero_out_wgrad", False):
                     wgrad = torch.zeros(
                         w.main_grad.shape,
@@ -569,95 +558,16 @@ class _QuantizedLinear(torch.autograd.Function):
                         requires_grad=False,
                     )
                 w.grad_added_to_main_grad = True
-            # set wgrad to None if wgrad is already accumulated into main grad
             elif ctx.fuse_wgrad_accumulation:
                 wgrad = None
-            # else wgrad is unchanged
         else:
-            # set wgrad to None if w does not requires grad
             wgrad = None
 
         return wgrad
 
 
 class Linear(LayerLinearBaseModule):
-    """Applies a linear transformation to the incoming data :math:`y = xA^T + b`
-
-    On NVIDIA GPUs it is a drop-in replacement for `torch.nn.Linear`.
-
-    Parameters
-    ----------
-    in_features : int
-                 size of each input sample.
-    out_features : int
-                  size of each output sample.
-    bias : bool, default = `True`
-          if set to `False`, the layer will not learn an additive bias.
-    init_method : Callable, default = `None`
-                 used for initializing weights in the following way: `init_method(weight)`.
-                 When set to `None`, defaults to `torch.nn.init.normal_(mean=0.0, std=0.023)`.
-    get_rng_state_tracker : Callable, default = `None`
-                 used to get the random number generator state tracker for initializing weights.
-    rng_tracker_name : str, default = `None`
-                 the param passed to get_rng_state_tracker to get the specific rng tracker.
-    parameters_split : Optional[Union[Tuple[str, ...], Dict[str, int]]], default = None
-                      Configuration for splitting the weight and bias tensors along dim 0 into
-                      multiple PyTorch parameters. If a list or tuple of strings is provided,
-                      they are used to make the names of equally-sized parameters. If a dict
-                      (preferably an OrderedDict) is provided, the keys are used as names and
-                      values as split sizes along dim 0. The resulting parameters will have
-                      names that end in `_weight` or `_bias`, so trailing underscores are
-                      stripped from any provided names.
-    device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will be allocated. It is the user's
-          responsibility to ensure all parameters are moved to the GPU before running the
-          forward pass.
-
-    Parallelism parameters
-    ----------------------
-    sequence_parallel : bool, default = `False`
-                       if set to `True`, uses sequence parallelism.
-    tp_group : ProcessGroup, default = `None`
-              tensor parallel process group.
-    tp_size : int, default = 1
-             used as TP (tensor parallel) world size when TP groups are not formed during
-             initialization. In this case, users must call the
-             `set_tensor_parallel_group(tp_group)` method on the initialized module before the
-             forward pass to supply the tensor parallel group needed for tensor and sequence
-             parallel collectives.
-    parallel_mode : {None, 'column', 'row'}, default = `None`
-                   used to decide whether this Linear layer is Column Parallel Linear or Row
-                   Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
-                   When set to `None`, no communication is performed.
-    ub_overlap_rs : bool, default = `False`
-                    Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
-    ub_overlap_ag : bool, default = `False`
-                    All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
-
-    Optimization parameters
-    -----------------------
-    fuse_wgrad_accumulation : bool, default = 'False'
-                             if set to `True`, enables fusing of creation and accumulation of
-                             the weight gradient. When enabled, it is assumed that the weights
-                             have an additional `main_grad` attribute (used instead of the
-                             regular `grad`) which is a pre-allocated buffer of the correct
-                             size to accumulate gradients in.
-    return_bias : bool, default = `False`
-                 when set to `True`, this module will not apply the additive bias itself, but
-                 instead return the bias value during the forward pass together with the
-                 output of the linear transformation :math:`y = xA^T`. This is useful when
-                 the bias addition can be fused to subsequent operations.
-    params_dtype : torch.dtype, default = `torch.get_default_dtype()`
-                  it controls the type used to allocate the initial parameters. Useful when
-                  the model is trained with lower precision and the original FP32 parameters
-                  would not fit in GPU memory.
-
-    Quantization parameters
-    -----------------------
-    qlinear_params : Optional[config.QLinearParams], default = `None`
-                     used to set quantization linear parameters for the linear layer.
-                     If not provided, currently it will be determined from ENV Variable `QAT_PARAMS`.
-    """
+    """Linear layer ``y = x @ W.T + b`` with optional quantization and tensor parallelism."""
 
     _profiler_instance_count: int = 0
     _stats_instance_count: int = 0
@@ -716,12 +626,12 @@ class Linear(LayerLinearBaseModule):
         ub_overlap_rs: bool = False,
         ub_overlap_ag: bool = False,
         ub_name: Optional[str] = None,
-        # JQ: hybrid addtional args
         layer_number: Optional[int] = None,
         save_original_input: bool = False,
         qlinear_params: Optional[config.QLinearParams] = None,
     ) -> None:
         super().__init__(tp_group, tp_size, sequence_parallel)
+        del save_original_input  # reserved for API compatibility
 
         params_dtype = (
             torch.get_default_dtype() if params_dtype is None else params_dtype
@@ -732,19 +642,16 @@ class Linear(LayerLinearBaseModule):
         self.use_bias = bias
         self.return_bias = return_bias
         self.apply_bias = bias and not return_bias
-        self.ub_overlap_rs = ub_overlap_rs
-        self.ub_overlap_ag = ub_overlap_ag
         if ub_overlap_rs or ub_overlap_ag:
             assert ub_name is not None, "Userbuffer name [string] is not set."
-        self.ub_name = ub_name
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
-        self.save_original_input = save_original_input
         self.layer_name = ub_name
         self.layer_number = layer_number
 
         self.disable_backward_quant = should_keep_backward_in_bf16()
 
+        # Resolve quant recipe (env QAT_PARAMS or caller override) and pick quantize_op.
         self.qlinear_params = self.set_qlinear_params(
             qlinear_params=qlinear_params,
             layer_number=self.layer_number,
@@ -752,13 +659,14 @@ class Linear(LayerLinearBaseModule):
         )
         if isinstance(self.qlinear_params.quantize_op, Int4MarlinForwardQuantizeOp):
             logger.info(
-                "INT4 Marlin real-forward is GroupedLinear-only; keeping regular Linear in BF16."
+                "INT4 Marlin forward is GroupedLinear-only; keeping dense Linear in BF16."
             )
             self.qlinear_params = config.QLinearParams(quantize=False)
 
         if is_rank_0():
             logger.info(
-                f"local_qlinear_params for layer {layer_number} linear module {self.layer_name} is set to {self.qlinear_params}"
+                f"Linear layer={layer_number} name={self.layer_name} "
+                f"qlinear_params={self.qlinear_params}"
             )
 
         if device == "meta":
@@ -874,15 +782,13 @@ class Linear(LayerLinearBaseModule):
 
         self.reset_parameters(defer_init=(device == "meta"))
 
+        # Per-layer cache shared across microbatches in the same minibatch.
         self.weight_qresult_cache = quantization.QuantizeResultCache(
             data=None, scale=None, data_t=None, scale_t=None
         )
 
-        # For row parallel linear, bias must be added after TP collectives and cannot be fused into GEMM.
-        if self.parallel_mode == "row" and self.apply_bias:
-            self.gemm_bias_unfused_add = True
-        else:
-            self.gemm_bias_unfused_add = False
+        # Row parallel + bias: add bias after TP collectives, not inside qgemm.
+        self.gemm_bias_unfused_add = self.parallel_mode == "row" and self.apply_bias
 
         Linear._try_attach_profiler(self)
         Linear._try_attach_tensor_stats(self)
@@ -920,27 +826,7 @@ class Linear(LayerLinearBaseModule):
         fp8_output: Optional[bool] = False,
         inp_meta: Optional[quantization.QuantizeInputMetaBase] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Apply the linear transformation to the input.
-
-        Parameters
-        ----------
-        inp : torch.Tensor
-             Input tensor.
-        is_first_microbatch : {True, False, None}, default = None
-                             During training using either gradient accumulation or
-                             pipeline parallelism a minibatch of data is further split
-                             into microbatches. Between the microbatches of the same minibatch
-                             the model weights are not updated. Setting this parameter indicates
-                             whether the current microbatch is the first in a minibatch or not.
-                             When set, this parameter enables additional optimizations:
-
-                             * during FP8 training, it allows caching of the FP8 versions of
-                               the weights
-                             * it also allows skipping gradient accumulation during the
-                               first microbatch (since it is the first gradient being
-                               produced)
-        """
+        """Apply linear transform; dispatches to quant or dense autograd path."""
 
         self.set_activation_dtype(inp)
         inp = inp.contiguous()
@@ -950,8 +836,9 @@ class Linear(LayerLinearBaseModule):
         assert isinstance(
             self.weight_qresult_cache, quantization.QuantizeResultCache
         ), "weight_qresult_cache must be QuantizeResultCache"
-        assert fp8_output is False, "FP8 output is not supported yet"
+        assert fp8_output is False, "quantized fp8 output is not supported"
 
+        # noop_cat merges split QKV weights without copy when already contiguous.
         weight_tensor = noop_cat(
             [getattr(self, name) for name in self.weight_names]
         )
@@ -960,37 +847,40 @@ class Linear(LayerLinearBaseModule):
                 [getattr(self, name) for name in self.bias_names],
             )
         else:
-            bias_tensor = getattr(self, self.bias_names[0])  # Unused
+            bias_tensor = getattr(self, self.bias_names[0])
 
-        LinearFunction = (
+        linear_cls = (
             _QuantizedLinear if self.qlinear_params.quantize else _NonQuantizedLinear
         )
 
+        # _QuantizedLinear routes to qlinear_params.quantize_op (quantize + qgemm).
+        # _NonQuantizedLinear uses torch.nn.functional.linear (BF16/FP16 path).
         if torch.is_grad_enabled():
-            linear_fn = LinearFunction.apply
+            linear_fn = linear_cls.apply
             args: List[Any] = []
         else:
-            linear_fn = LinearFunction.forward
+            linear_fn = linear_cls.forward
             args = [None]
         args += (
             inp,
-            inp_meta,
+            inp_meta,  # optional QuantizeInputMeta for future x-side op hooks
             weight_tensor,
-            self.weight_qresult_cache,
+            self.weight_qresult_cache,  # microbatch weight-quant cache for quant path
             bias_tensor if self.apply_bias and not self.gemm_bias_unfused_add else None,
             self.sequence_parallel,
             self.tp_group,
             self.tp_size,
             self.parallel_mode,
-            self.qlinear_params,
+            self.qlinear_params,  # carries quantize_op + x/w/g QParams + mm_* settings
             self.activation_dtype,
             torch.is_grad_enabled(),
             is_first_microbatch,
             self.fuse_wgrad_accumulation,
-            self.disable_backward_quant
+            self.disable_backward_quant,  # DISABLE_BACKWARD_QUANT=1 -> STE backward
         )
         out = linear_fn(*args)
 
+        # Row-parallel qgemm cannot fuse bias; add after TP collectives inside autograd.
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(bias_tensor, self.activation_dtype)
 

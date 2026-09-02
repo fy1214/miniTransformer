@@ -9,6 +9,49 @@ import argparse
 import inspect
 import types
 
+if os.environ.get("TE_FP4_PERTOKEN") == "1":
+    import transformer_engine.common.recipe as _te_fp4_recipe_mod
+    import megatron.core.fp4_utils as _megatron_fp4_utils
+    from contextlib import nullcontext
+
+    def _te_native_pertoken_fp4_recipe(config):
+        del config
+        return _te_fp4_recipe_mod.NVFP4PerTokenBlockScaling()
+
+    def _te_native_pertoken_fp4_context(config, layer_no: int = -1, is_init: bool = False):
+        """NVFP4 per-token recipe cannot use Megatron's amax-reduction process group."""
+        num_bf16_layers_at_start = (
+            config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
+        )
+        num_bf16_layers_at_end = (
+            config.num_layers_at_end_in_bf16 if config.first_last_layers_bf16 else 0
+        )
+        is_first_layer = layer_no < num_bf16_layers_at_start
+        is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
+        need_fp4_context = config.fp4 if not is_init else config.fp4_param
+        if (
+            not need_fp4_context
+            or (layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer))
+        ):
+            return nullcontext()
+
+        fp4_recipe = _te_native_pertoken_fp4_recipe(config)
+        import transformer_engine.pytorch
+
+        if not is_init:
+            return transformer_engine.pytorch.fp8_autocast(
+                enabled=True, fp8_recipe=fp4_recipe, fp8_group=None
+            )
+        import inspect as _inspect
+
+        context_args = {"enabled": True}
+        if "recipe" in _inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters:
+            context_args["recipe"] = fp4_recipe
+        return transformer_engine.pytorch.fp8_model_init(**context_args)
+
+    _megatron_fp4_utils.get_fp4_recipe = _te_native_pertoken_fp4_recipe
+    _megatron_fp4_utils.get_fp4_context = _te_native_pertoken_fp4_context
+
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
@@ -766,7 +809,9 @@ def _build_cli_parser():
     parser.add_argument("--nvfp4-pertoken-amax-fuse", action="store_true",
                         help=("Enable the unified MoE NVFP4 per-token amax-fuse path: "
                               "fc1 sort_chunks row amax + skip-K1 handoff and "
-                              "fc2 fused SwiGLU row amax + skip-K1 handoff."))
+                              "fc2 fused SwiGLU row amax + skip-K1 handoff. "
+                              "Requires TE with moe_sort_chunks_by_index(compute_row_amax=) "
+                              "(fy1214/TransformerEngine#8 on grouped-per-token-sf-swizzle)."))
     parser.add_argument("--random-topk-routing", action="store_true",
                         help=("MoE test-only: patch TopKRouter.routing() to assign each "
                               "token to random top-k experts with uniform probs."))

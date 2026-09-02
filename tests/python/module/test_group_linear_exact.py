@@ -40,6 +40,7 @@ AVAILABLE_TESTS = {
     4: ("test_group_linear_multiple_microbatches", "Multiple microbatches (weight caching)"),
     5: ("test_group_linear_perf", "Performance profiling with large inputs"),
     6: ("test_group_linear_logprob_vs_train", "Forward-only (no_grad) vs train: w-transpose skip"),
+    7: ("test_group_linear_input_row_amax", "GroupedLinear forward/backward with prefused row_amax"),
 }
 
 # ==================== Available Quantization Recipes ====================
@@ -53,6 +54,7 @@ AVAILABLE_QPARAMS = {
     6: ("FP4_SUB_CHANNEL_CURSOR2", QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2, "FP4 cursor2 recipe"),
     7: ("FP4_SUB_CHANNEL_CURSOR2_CUTLASS", QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS, "FP4 cursor2 CUTLASS kernel"),
     8: ("FP4_SUB_CHANNEL_CURSOR2_CUTLASS_BWD", QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_BWD, "FP4 cursor2 CUTLASS + MXFP8 backward"),
+    9: ("FP4_SUB_CHANNEL_PERTOKEN", QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN, "TE PR #3045 per-token NVFP4 (amax-fuse path)"),
 }
 
 
@@ -555,6 +557,77 @@ class TestGroupLinearExact:
                   f"(lower = more w-transpose quant skipped)")
         print(f"{'='*60}\n")
 
+    def test_group_linear_input_row_amax(self, qparam: QuantizeRecipe):
+        """Megatron-style smoke: GroupedLinear with prefused input_row_amax (skip K1)."""
+        if qparam != QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN:
+            print(f"Skipping row_amax test for recipe {qparam} (requires FP4_SUB_CHANNEL_PERTOKEN)")
+            return
+
+        print(f"\n{'='*60}")
+        print("Testing GroupedLinear with input_row_amax (amax-fuse path)")
+        print(f"Quantization Recipe: {qparam}")
+        print(f"{'='*60}")
+
+        num_gemms = 4
+        in_features = 4096
+        out_features = 4096
+        batch_size = 1024
+        m_splits = [256, 256, 256, 256]
+
+        group_linear = self.build_group_linear(
+            num_gemms=num_gemms,
+            in_features=in_features,
+            out_features=out_features,
+            qparam=qparam,
+        )
+        for i in range(num_gemms):
+            weight = getattr(group_linear, f"weight{i}")
+            weight.main_grad = torch.zeros_like(weight.data, dtype=torch.float32)
+
+        torch.manual_seed(1234)
+        inp = torch.randn(
+            batch_size, in_features, device="cuda", dtype=torch.bfloat16
+        )
+        row_amax = inp.detach().abs().amax(dim=-1).to(torch.float32)
+
+        # Forward without prefused amax (baseline K1+K2).
+        out_baseline = group_linear(
+            inp, m_splits=m_splits, is_first_microbatch=True
+        )
+
+        # Forward with prefused amax (rowwise skip K1).
+        out_fused = group_linear(
+            inp,
+            m_splits=m_splits,
+            is_first_microbatch=True,
+            input_row_amax=row_amax,
+        )
+
+        print(f"Output shape: {out_fused.shape}")
+        max_fwd_diff = (out_baseline.float() - out_fused.float()).abs().max().item()
+        print(f"Forward max |baseline - fused|: {max_fwd_diff:.6g}")
+        assert torch.isfinite(out_fused).all(), "Fused forward output contains non-finite values"
+        torch.testing.assert_close(out_baseline, out_fused, rtol=0, atol=0)
+
+        # Backward with prefused amax (hybrid: rowwise skip K1 + columnwise K1).
+        inp_grad = inp.clone().requires_grad_(True)
+        out = group_linear(
+            inp_grad,
+            m_splits=m_splits,
+            is_first_microbatch=True,
+            input_row_amax=row_amax,
+        )
+        out.sum().backward()
+
+        assert inp_grad.grad is not None, "Input gradient should not be None"
+        for i in range(num_gemms):
+            weight = getattr(group_linear, f"weight{i}")
+            assert weight.main_grad is not None, f"Weight{i} main_grad should not be None"
+
+        print("Input gradient shape:", inp_grad.grad.shape)
+        print("✓ GroupedLinear input_row_amax forward/backward successful!")
+        print(f"{'='*60}\n")
+
 
 # ==================== Argument Parser ====================
 
@@ -589,7 +662,7 @@ Examples:
         "--tests",
         type=int,
         nargs="+",
-        choices=[1, 2, 3, 4, 5, 6],
+        choices=[1, 2, 3, 4, 5, 6, 7],
         default=None,
         help="Specify which tests to run (default: all tests)"
     )
@@ -597,9 +670,9 @@ Examples:
     parser.add_argument(
         "--qparam",
         type=int,
-        choices=[1, 2, 3, 4, 5, 6, 7, 8],
+        choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
         default=4,
-        help="Quantization recipe: 1=NON_QUANTIZE, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=CURSOR2, 7=CURSOR2_CUTLASS, 8=CUTLASS_BWD (default: 4)"
+        help="Quantization recipe: 1=NON_QUANTIZE, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=CURSOR2, 7=CURSOR2_CUTLASS, 8=CUTLASS_BWD, 9=FP4_PERTOKEN (default: 4)"
     )
     
     parser.add_argument(

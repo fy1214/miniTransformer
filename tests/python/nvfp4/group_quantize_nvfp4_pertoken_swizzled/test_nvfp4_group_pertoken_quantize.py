@@ -1,22 +1,13 @@
-"""
-Precision and speed tests for group_quantize_nvfp4_pertoken_swizzled.
+"""MoE grouped activation + weight NVFP4 quant (QAT 6–14 production path).
 
-Precision methodology
----------------------
-1. Exact match: compare grouped-kernel output against per-group reference
-   (fp4_gemm.rtn_fp4_pertoken called once per group).  FP4 data and global
-   scale must be bit-for-bit identical; scale_views must match after unswizzling.
+What:
+  - ``group_quantize_nvfp4_pertoken_swizzled`` (GroupedLinear X)
+  - ``group_quantize_nvfp4_tensor_global_packed`` / ``quantize_weight_nvfp4_swizzled`` (W)
+Where: ``nvfp4_cursor2_op*.group_quantize`` for QAT 6–8 / 12 / 14.
+Compare: per-group ``rtn_fp4_pertoken`` reference; per-expert weight swizzled.
 
-2. Dequant quality: effective bit-width > 3.3 on Gaussian inputs.
-
-Speed methodology
------------------
-Compare wall-clock time of:
-  A) new grouped kernel  (one CUDA launch, all groups)
-  B) old path            (per-group rtn_fp4_pertoken Python loop  +  per-group
-                          _make_cute_sf CPU round-trip)
-
-Skip conditions: fp4_gemm not built, CUDA unavailable, GPU < sm_100.
+Markers: ``production``; weight tests also production; ``bench``+``slow`` for micro-benches.
+Requires: fp4_gemm, CUDA sm_100+.
 """
 
 from __future__ import annotations
@@ -48,7 +39,10 @@ else:
             f"group FP4 pertoken kernel requires sm_100+ (got {_maj}.{_min})"
         )
 
-pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
+pytestmark = [
+    pytest.mark.production,
+    pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or ""),
+]
 
 # ---------------------------------------------------------------------------
 # Import the new operator
@@ -495,13 +489,11 @@ def _old_path(x: torch.Tensor, m_splits: List[int]) -> None:
         offset += m_i
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("m_splits,k,label", _MOE_BENCH_CONFIGS)
 def test_bench_grouped_vs_old_path(m_splits, k, label):
-    """
-    Benchmark new grouped kernel vs old per-group D2H+CPU+H2D path.
-    Prints µs and speedup; always passes.
-    """
+    """Bench: grouped kernel vs per-group loop + CuTe scale path (prints; always passes)."""
     total_m = sum(m_splits)
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
 
@@ -525,10 +517,11 @@ def test_bench_grouped_vs_old_path(m_splits, k, label):
         print(f"\n[{label}]  new={us_new:.1f} µs  (old path unavailable)")
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("m_splits,k,label", _MOE_BENCH_CONFIGS)
 def test_bench_grouped_kernel_only(m_splits, k, label):
-    """Standalone benchmark: just the new grouped kernel.  Always passes."""
+    """Bench: ``group_quantize_nvfp4_pertoken_swizzled`` alone (prints; always passes)."""
     total_m = sum(m_splits)
     x = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda")
     group_quantize_nvfp4_pertoken_swizzled(x, m_splits)  # warmup JIT

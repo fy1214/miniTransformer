@@ -1,15 +1,11 @@
-"""Wrapper-level tests for ``group_quantize_nvfp4_pertoken_swizzled(fuse_pad=...)``.
+"""Python wrapper tests for ``group_quantize_nvfp4_pertoken_swizzled(fuse_pad=...)``.
 
-We already have a kernel-level test (``test_nvfp4_group_pertoken_pad_fuse.py``)
-that covers the C++ binding directly. These tests target the Python wrapper:
+What: wrapper offset construction + ``fuse_pad`` True/False dispatch.
+Where: same as pad-fuse kernel tests; production default is ``fuse_pad=False``.
+Compare: direct ``fp4_gemm.*_pad_fuse`` / ``*_group_pertoken``; legacy path on
+         pre-padded input must match ``fuse_pad=True`` on unpadded input.
 
-* ``fuse_pad=True``   – output must be bit-identical to invoking
-  ``fp4_gemm.rtn_fp4_group_pertoken_pad_fuse`` with the same offsets that the
-  wrapper builds internally. The wrapper also exposes
-  ``unpadded_row_offsets_gpu`` for the caller to slice real rows back.
-* ``fuse_pad=False``  – legacy path: bit-identical to
-  ``fp4_gemm.rtn_fp4_group_pertoken`` (this is what the wrapper called before
-  the change), and ``unpadded_row_offsets_gpu`` is ``None``.
+Markers: ``production``.
 """
 from __future__ import annotations
 
@@ -17,6 +13,8 @@ from typing import List
 
 import pytest
 import torch
+
+pytestmark = pytest.mark.production
 
 # Skip the whole module on hardware that lacks NVFP4 PTX support.
 if not torch.cuda.is_available():
@@ -141,6 +139,7 @@ def _direct_legacy(
 )
 @pytest.mark.parametrize("four_six", [False, True], ids=["rtn", "four_six"])
 def test_fuse_pad_true_matches_direct_kernel(m_splits, k, four_six):
+    """fuse_pad=True wrapper bit-matches direct pad_fuse kernel with same offsets."""
     x = _make_input(m_splits, k)
     scale_override = 1.0
 
@@ -192,6 +191,7 @@ def test_fuse_pad_true_empty_input():
 )
 @pytest.mark.parametrize("four_six", [False, True], ids=["rtn", "four_six"])
 def test_legacy_path_matches_direct_kernel(m_splits, k, four_six):
+    """fuse_pad=False wrapper bit-matches rtn_fp4_group_pertoken on pre-aligned splits."""
     x = _make_input(m_splits, k)
     scale_override = 1.0
 

@@ -1,64 +1,37 @@
 """
-Linear TP-SP 正确性测试
-=======================
+Linear TP/SP correctness tests for miniTransformer Linear.
 
-验证 miniTransformer Linear 在 Tensor Parallel (TP) + Sequence Parallel (SP) 下的
-forward/backward 数学等价性，覆盖 Column Parallel 和 Row Parallel 两种模式。
+Checks column/row parallel forward and backward against a tp=1 baseline.
+Integer {-1,0,1} inputs/weights/grads keep bf16 sums exact for bit-exact checks
+(except column forward, which uses rtol/atol=1e-2).
 
-验证策略：
-  - 整数初始化（x, w ∈ {-1,0,1}，dy = 整数），乘积和累加均为整数
-  - bf16 在 [-2048, 2048] 可精确表示整数，bit-exact 验证（rtol=0, atol=0）
-
-运行：
+Run:
   torchrun --nproc_per_node=2 test_linear_tp.py --qparam 6 --tp-size 2
   torchrun --nproc_per_node=2 test_linear_tp.py --qparam 6 --tp-size 2 --no-sp
 """
+
 import argparse
-import os
 import traceback
 
 import torch
 import torch.distributed as dist
 
+from helpers import (
+    broadcast_tensor,
+    cleanup_distributed,
+    create_tp_group,
+    initialize_distributed,
+    randint_bf16,
+    require_torchrun,
+)
 from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
 from miniTransformer.module.linear import Linear
 
 
-# ── Distributed utilities ─────────────────────────────────────────────────────
-
-def initialize_distributed():
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
-            init_method="env://",
-        )
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def create_tp_group(tp_size: int):
-    world_size = dist.get_world_size()
-    if tp_size > world_size:
-        raise ValueError(f"tp_size ({tp_size}) > world_size ({world_size})")
-    tp_group = dist.new_group(ranks=list(range(tp_size)))
-    return tp_group if dist.get_rank() < tp_size else None
-
-
-def broadcast_tensor(tensor: torch.Tensor, tp_group) -> torch.Tensor:
-    dist.broadcast(tensor, src=0, group=tp_group)
-    return tensor
-
-
 def sync_linear_weight(linear, tp_group) -> None:
-    """Broadcast rank-0 weight to all ranks so every rank starts from the same baseline."""
+    """Broadcast rank-0 weight so all ranks share the same baseline."""
     dist.broadcast(linear.weight.data, src=0, group=tp_group)
 
-
-# ── Linear builder ────────────────────────────────────────────────────────────
 
 def build_linear(
     in_features: int,
@@ -96,22 +69,14 @@ def build_linear(
     )
 
 
-# ── Column parallel tests ─────────────────────────────────────────────────────
-
 def test_column_parallel_forward(
     qparam: QuantizeRecipe, tp_size: int = 2, sequence_parallel: bool = True
 ):
     """
-    Column parallel forward 数学等价性验证。
+    Column parallel forward vs tp=1 baseline.
 
-    out_features 沿 TP ranks 分割；每个 rank 计算 [batch, out//tp] 的输出分片。
-
-    SP=False：每个 rank 收到完整 input [batch, in]
-              out_tp [batch, out//tp]  ==  out_baseline[:, col_shard]
-
-    SP=True ：每个 rank 收到 seq shard [batch//tp, in]
-              linear 内部 AllGather 还原完整 input 再 GEMM
-              out_tp [batch, out//tp]  ==  out_baseline[:, col_shard]
+    Output is sharded on out_features. With SP, each rank gets a seq shard and
+    AllGather restores the full input before GEMM.
     """
     print(f"\n{'='*60}")
     print(f"Column Parallel Forward  (tp={tp_size}, sp={sequence_parallel})")
@@ -125,7 +90,9 @@ def test_column_parallel_forward(
     if tp_size > 1:
         sync_linear_weight(baseline, tp_group)
 
-    linear_tp = build_linear(in_features, out_features, "column", tp_size, tp_group, qparam, seed, sequence_parallel)
+    linear_tp = build_linear(
+        in_features, out_features, "column", tp_size, tp_group, qparam, seed, sequence_parallel
+    )
     if tp_size > 1:
         chunk_out = out_features // tp_size
         with torch.no_grad():
@@ -146,17 +113,21 @@ def test_column_parallel_forward(
 
     with torch.no_grad():
         out_baseline = baseline(inp_full, is_first_microbatch=True)
-        out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
+        out_tp = linear_tp(inp_tp, is_first_microbatch=True)
 
     if rank < tp_size:
         chunk_out = out_features // tp_size
         ref = out_baseline[:, rank * chunk_out:(rank + 1) * chunk_out]
         diff = (ref - out_tp).abs()
-        print(f"  Rank {rank}:  out_tp={out_tp.shape}  "
-              f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-        torch.testing.assert_close(ref, out_tp, rtol=1e-2, atol=1e-2,
-                                   msg=f"Column parallel forward mismatch at rank {rank}")
-        print(f"  ✓ Column parallel forward verified")
+        print(
+            f"  Rank {rank}:  out_tp={out_tp.shape}  "
+            f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+        )
+        torch.testing.assert_close(
+            ref, out_tp, rtol=1e-2, atol=1e-2,
+            msg=f"Column parallel forward mismatch at rank {rank}",
+        )
+        print("  ✓ Column parallel forward verified")
 
     print(f"{'='*60}\n")
 
@@ -165,14 +136,9 @@ def test_column_parallel_backward(
     qparam: QuantizeRecipe, tp_size: int = 2, sequence_parallel: bool = True
 ):
     """
-    Column parallel backward 数学等价性验证（bit-exact）。
+    Column parallel backward (bit-exact with integer inputs).
 
-    dgrad  dx = sum_r(dy_r @ W_r.T)，经 AllReduce 后每个 rank 得完整 dx
-      SP=False: inp_tp.grad  ==  inp_baseline.grad
-      SP=True : inp_tp.grad  ==  inp_baseline.grad[seq_shard, :]
-
-    wgrad  dw_r = dy_r.T @ x_full，每个 rank 独立计算，无需通信
-      linear_tp.weight.main_grad  ==  baseline.weight.main_grad[col_shard, :]
+    dgrad is AllReduced; wgrad is local to each out-shard.
     """
     print(f"\n{'='*60}")
     print(f"Column Parallel Backward (tp={tp_size}, sp={sequence_parallel})")
@@ -187,15 +153,14 @@ def test_column_parallel_backward(
         sync_linear_weight(baseline, tp_group)
     baseline.weight.main_grad = torch.zeros_like(baseline.weight.data, dtype=torch.float32)
 
-    linear_tp = build_linear(in_features, out_features, "column", tp_size, tp_group, qparam, seed, sequence_parallel)
+    linear_tp = build_linear(
+        in_features, out_features, "column", tp_size, tp_group, qparam, seed, sequence_parallel
+    )
     linear_tp.weight.main_grad = torch.zeros_like(linear_tp.weight.data, dtype=torch.float32)
 
-    # 整数初始化 weight
     torch.manual_seed(seed)
     with torch.no_grad():
-        baseline.weight.data.copy_(
-            torch.randint(-1, 2, baseline.weight.shape, device="cuda").to(torch.bfloat16)
-        )
+        baseline.weight.data.copy_(randint_bf16(*baseline.weight.shape))
     if tp_size > 1:
         sync_linear_weight(baseline, tp_group)
         chunk_out = out_features // tp_size
@@ -204,8 +169,7 @@ def test_column_parallel_backward(
         )
         linear_tp.weight.main_grad = torch.zeros_like(linear_tp.weight.data, dtype=torch.float32)
 
-    # 整数初始化 input
-    inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
+    inp_full = randint_bf16(batch_size, in_features)
     if tp_size > 1:
         broadcast_tensor(inp_full, tp_group)
 
@@ -217,22 +181,20 @@ def test_column_parallel_backward(
     else:
         inp_tp = inp_full.clone().requires_grad_(True)
 
-    # 整数初始化 dy
-    dy_full = torch.randint(-1, 2, (batch_size, out_features), device="cuda").to(torch.bfloat16)
+    dy_full = randint_bf16(batch_size, out_features)
     if tp_size > 1:
         broadcast_tensor(dy_full, tp_group)
 
-    # column parallel output shape 始终为 [batch, out//tp]，与 SP 无关
+    # Column parallel output is always [batch, out//tp], independent of SP.
     chunk_out = out_features // tp_size
     dy_tp = dy_full[:, rank * chunk_out:(rank + 1) * chunk_out].contiguous()
 
     out_baseline = baseline(inp_baseline, is_first_microbatch=True)
-    out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
+    out_tp = linear_tp(inp_tp, is_first_microbatch=True)
     out_baseline.backward(dy_full)
     out_tp.backward(dy_tp)
 
     if rank < tp_size:
-        # dgrad
         if inp_baseline.grad is not None and inp_tp.grad is not None:
             if sequence_parallel and tp_size > 1:
                 chunk_seq = batch_size // tp_size
@@ -241,37 +203,40 @@ def test_column_parallel_backward(
                 ref_dgrad = inp_baseline.grad
 
             diff = (ref_dgrad - inp_tp.grad).abs()
-            print(f"  Rank {rank} dgrad:  shape={inp_tp.grad.shape}  "
-                  f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-            torch.testing.assert_close(ref_dgrad, inp_tp.grad, rtol=0, atol=0,
-                                       msg=f"Column parallel dgrad mismatch at rank {rank}")
+            print(
+                f"  Rank {rank} dgrad:  shape={inp_tp.grad.shape}  "
+                f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+            )
+            torch.testing.assert_close(
+                ref_dgrad, inp_tp.grad, rtol=0, atol=0,
+                msg=f"Column parallel dgrad mismatch at rank {rank}",
+            )
 
-        # wgrad
         if baseline.weight.main_grad is not None and linear_tp.weight.main_grad is not None:
             ref_wgrad = baseline.weight.main_grad[rank * chunk_out:(rank + 1) * chunk_out, :]
             diff = (ref_wgrad - linear_tp.weight.main_grad).abs()
-            print(f"  Rank {rank} wgrad:  shape={linear_tp.weight.main_grad.shape}  "
-                  f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-            torch.testing.assert_close(ref_wgrad, linear_tp.weight.main_grad, rtol=0, atol=0,
-                                       msg=f"Column parallel wgrad mismatch at rank {rank}")
+            print(
+                f"  Rank {rank} wgrad:  shape={linear_tp.weight.main_grad.shape}  "
+                f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+            )
+            torch.testing.assert_close(
+                ref_wgrad, linear_tp.weight.main_grad, rtol=0, atol=0,
+                msg=f"Column parallel wgrad mismatch at rank {rank}",
+            )
 
-        print(f"  ✓ Column parallel backward verified")
+        print("  ✓ Column parallel backward verified")
 
     print(f"{'='*60}\n")
 
-
-# ── Row parallel tests ────────────────────────────────────────────────────────
 
 def test_row_parallel_forward(
     qparam: QuantizeRecipe, tp_size: int = 2, sequence_parallel: bool = True
 ):
     """
-    Row parallel forward 数学等价性验证（bit-exact）。
+    Row parallel forward (bit-exact with integer inputs).
 
-    in_features 沿 TP ranks 分割：inp_r = inp[:, in_shard]，W_r = W[:, in_shard]
-
-    SP=False：AllReduce 后 out_tp [batch, out]  ==  out_baseline
-    SP=True ：ReduceScatter 后 out_tp [batch//tp, out]  ==  out_baseline[seq_shard, :]
+    Input and weight are sharded on in_features. SP uses ReduceScatter on output;
+    otherwise AllReduce.
     """
     print(f"\n{'='*60}")
     print(f"Row Parallel Forward     (tp={tp_size}, sp={sequence_parallel})")
@@ -285,18 +250,17 @@ def test_row_parallel_forward(
     if tp_size > 1:
         sync_linear_weight(baseline, tp_group)
 
-    linear_tp = build_linear(in_features, out_features, "row", tp_size, tp_group, qparam, seed, sequence_parallel)
+    linear_tp = build_linear(
+        in_features, out_features, "row", tp_size, tp_group, qparam, seed, sequence_parallel
+    )
 
-    # 整数初始化 input 和 weight
     torch.manual_seed(seed)
-    inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
+    inp_full = randint_bf16(batch_size, in_features)
     if tp_size > 1:
         broadcast_tensor(inp_full, tp_group)
 
     with torch.no_grad():
-        baseline.weight.data.copy_(
-            torch.randint(-1, 2, baseline.weight.shape, device="cuda").to(torch.bfloat16)
-        )
+        baseline.weight.data.copy_(randint_bf16(*baseline.weight.shape))
     if tp_size > 1:
         sync_linear_weight(baseline, tp_group)
         chunk_in = in_features // tp_size
@@ -304,7 +268,6 @@ def test_row_parallel_forward(
             baseline.weight.data[:, rank * chunk_in:(rank + 1) * chunk_in]
         )
 
-    # row parallel: 按 in_features 维度切分 input
     if tp_size > 1:
         chunk_in = in_features // tp_size
         inp_tp = inp_full[:, rank * chunk_in:(rank + 1) * chunk_in].contiguous()
@@ -313,7 +276,7 @@ def test_row_parallel_forward(
 
     with torch.no_grad():
         out_baseline = baseline(inp_full, is_first_microbatch=True)
-        out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
+        out_tp = linear_tp(inp_tp, is_first_microbatch=True)
 
     if rank < tp_size:
         if sequence_parallel and tp_size > 1:
@@ -323,11 +286,15 @@ def test_row_parallel_forward(
             ref = out_baseline
 
         diff = (ref - out_tp).abs()
-        print(f"  Rank {rank}:  out_tp={out_tp.shape}  "
-              f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-        torch.testing.assert_close(ref, out_tp, rtol=0, atol=0,
-                                   msg=f"Row parallel forward mismatch at rank {rank}")
-        print(f"  ✓ Row parallel forward verified")
+        print(
+            f"  Rank {rank}:  out_tp={out_tp.shape}  "
+            f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+        )
+        torch.testing.assert_close(
+            ref, out_tp, rtol=0, atol=0,
+            msg=f"Row parallel forward mismatch at rank {rank}",
+        )
+        print("  ✓ Row parallel forward verified")
 
     print(f"{'='*60}\n")
 
@@ -336,13 +303,9 @@ def test_row_parallel_backward(
     qparam: QuantizeRecipe, tp_size: int = 2, sequence_parallel: bool = True
 ):
     """
-    Row parallel backward 数学等价性验证（bit-exact）。
+    Row parallel backward (bit-exact with integer inputs).
 
-    dgrad  dx_r = dy @ W_r.T，每个 rank 直接算自己的 in_features 切片，无需通信
-      inp_tp.grad [batch, in//tp]  ==  inp_baseline.grad[:, in_shard]
-
-    wgrad  dw_r = dy.T @ x_r，SP 时 dy 先 AllGather，其余与非 SP 一致
-      linear_tp.weight.main_grad [out, in//tp]  ==  baseline.weight.main_grad[:, in_shard]
+    dgrad is local per in-shard; wgrad AllGathers dy under SP before the local GEMM.
     """
     print(f"\n{'='*60}")
     print(f"Row Parallel Backward    (tp={tp_size}, sp={sequence_parallel})")
@@ -357,15 +320,14 @@ def test_row_parallel_backward(
         sync_linear_weight(baseline, tp_group)
     baseline.weight.main_grad = torch.zeros_like(baseline.weight.data, dtype=torch.float32)
 
-    linear_tp = build_linear(in_features, out_features, "row", tp_size, tp_group, qparam, seed, sequence_parallel)
+    linear_tp = build_linear(
+        in_features, out_features, "row", tp_size, tp_group, qparam, seed, sequence_parallel
+    )
     linear_tp.weight.main_grad = torch.zeros_like(linear_tp.weight.data, dtype=torch.float32)
 
-    # 整数初始化 weight
     torch.manual_seed(seed)
     with torch.no_grad():
-        baseline.weight.data.copy_(
-            torch.randint(-1, 2, baseline.weight.shape, device="cuda").to(torch.bfloat16)
-        )
+        baseline.weight.data.copy_(randint_bf16(*baseline.weight.shape))
     if tp_size > 1:
         sync_linear_weight(baseline, tp_group)
         chunk_in = in_features // tp_size
@@ -374,8 +336,7 @@ def test_row_parallel_backward(
         )
         linear_tp.weight.main_grad = torch.zeros_like(linear_tp.weight.data, dtype=torch.float32)
 
-    # 整数初始化 input
-    inp_full = torch.randint(-1, 2, (batch_size, in_features), device="cuda").to(torch.bfloat16)
+    inp_full = randint_bf16(batch_size, in_features)
     if tp_size > 1:
         broadcast_tensor(inp_full, tp_group)
 
@@ -387,13 +348,11 @@ def test_row_parallel_backward(
     else:
         inp_tp = inp_full.clone().requires_grad_(True)
 
-    # 整数初始化 dy
-    dy_full = torch.randint(-1, 2, (batch_size, out_features), device="cuda").to(torch.bfloat16)
+    dy_full = randint_bf16(batch_size, out_features)
     if tp_size > 1:
         broadcast_tensor(dy_full, tp_group)
 
-    # SP=True : out_tp shape [batch//tp, out]（ReduceScatter）→ dy_tp = dy_full[seq_shard]
-    # SP=False: out_tp shape [batch, out]（AllReduce）→ dy_tp = dy_full
+    # SP: out is seq-sharded after ReduceScatter; else full batch after AllReduce.
     if sequence_parallel and tp_size > 1:
         chunk_seq = batch_size // tp_size
         dy_tp = dy_full[rank * chunk_seq:(rank + 1) * chunk_seq, :].contiguous()
@@ -401,37 +360,41 @@ def test_row_parallel_backward(
         dy_tp = dy_full.contiguous()
 
     out_baseline = baseline(inp_baseline, is_first_microbatch=True)
-    out_tp       = linear_tp(inp_tp, is_first_microbatch=True)
+    out_tp = linear_tp(inp_tp, is_first_microbatch=True)
     out_baseline.backward(dy_full)
     out_tp.backward(dy_tp)
 
     if rank < tp_size:
         chunk_in = in_features // tp_size
 
-        # dgrad
         if inp_baseline.grad is not None and inp_tp.grad is not None:
             ref_dgrad = inp_baseline.grad[:, rank * chunk_in:(rank + 1) * chunk_in]
             diff = (ref_dgrad - inp_tp.grad).abs()
-            print(f"  Rank {rank} dgrad:  shape={inp_tp.grad.shape}  "
-                  f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-            torch.testing.assert_close(ref_dgrad, inp_tp.grad, rtol=0, atol=0,
-                                       msg=f"Row parallel dgrad mismatch at rank {rank}")
+            print(
+                f"  Rank {rank} dgrad:  shape={inp_tp.grad.shape}  "
+                f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+            )
+            torch.testing.assert_close(
+                ref_dgrad, inp_tp.grad, rtol=0, atol=0,
+                msg=f"Row parallel dgrad mismatch at rank {rank}",
+            )
 
-        # wgrad
         if baseline.weight.main_grad is not None and linear_tp.weight.main_grad is not None:
             ref_wgrad = baseline.weight.main_grad[:, rank * chunk_in:(rank + 1) * chunk_in]
             diff = (ref_wgrad - linear_tp.weight.main_grad).abs()
-            print(f"  Rank {rank} wgrad:  shape={linear_tp.weight.main_grad.shape}  "
-                  f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}")
-            torch.testing.assert_close(ref_wgrad, linear_tp.weight.main_grad, rtol=0, atol=0,
-                                       msg=f"Row parallel wgrad mismatch at rank {rank}")
+            print(
+                f"  Rank {rank} wgrad:  shape={linear_tp.weight.main_grad.shape}  "
+                f"max_diff={diff.max():.4e}  mean_diff={diff.mean():.4e}"
+            )
+            torch.testing.assert_close(
+                ref_wgrad, linear_tp.weight.main_grad, rtol=0, atol=0,
+                msg=f"Row parallel wgrad mismatch at rank {rank}",
+            )
 
-        print(f"  ✓ Row parallel backward verified")
+        print("  ✓ Row parallel backward verified")
 
     print(f"{'='*60}\n")
 
-
-# ── Runner ────────────────────────────────────────────────────────────────────
 
 _QPARAM_MAP = {
     1: QuantizeRecipe.NON_QUANTIZE,
@@ -477,21 +440,26 @@ def run_tests(qparam_id: int = 6, tp_size: int = 2, sequence_parallel: bool = Tr
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Linear TP-SP Correctness Tests")
-    parser.add_argument("--qparam", type=int, choices=list(_QPARAM_MAP), default=6,
-                        help="Quantization recipe (1=NON, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=BF16_REF)")
+    parser.add_argument(
+        "--qparam", type=int, choices=list(_QPARAM_MAP), default=6,
+        help="Quantization recipe (1=NON, 2=INT4, 3=FP4_REF, 4=FP4, 5=FP4_QUARTET, 6=BF16_REF)",
+    )
     parser.add_argument("--tp-size", type=int, default=2)
-    parser.add_argument("--sp",    dest="sequence_parallel", action="store_true",  default=True)
+    parser.add_argument("--sp", dest="sequence_parallel", action="store_true", default=True)
     parser.add_argument("--no-sp", dest="sequence_parallel", action="store_false")
     parser.add_argument("--local-rank", type=int, default=0)
     args = parser.parse_args()
 
-    if "RANK" not in os.environ:
-        print("ERROR: run with torchrun")
-        print("  torchrun --nproc_per_node=2 test_linear_tp.py --qparam 6 --tp-size 2")
-        raise SystemExit(1)
+    require_torchrun(
+        "torchrun --nproc_per_node=2 test_linear_tp.py --qparam 6 --tp-size 2",
+    )
 
     initialize_distributed()
     try:
-        run_tests(qparam_id=args.qparam, tp_size=args.tp_size, sequence_parallel=args.sequence_parallel)
+        run_tests(
+            qparam_id=args.qparam,
+            tp_size=args.tp_size,
+            sequence_parallel=args.sequence_parallel,
+        )
     finally:
         cleanup_distributed()

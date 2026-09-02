@@ -1,24 +1,16 @@
+"""CuteDSL Sm100GroupedBlockScaledGemmKernel NVFP4 path tests.
+
+TestGroupedGemmCuteDSLAdapter
+  Kernel-level: cuteDSL vs dequant+matmul on mock NVFP4 tensors.
+
+TestGroupLinearCuteDSLForward
+  End-to-end: MiniGroupedLinear (FP4_SUB_CHANNEL) hits _grouped_gemm_cutedsl
+  and is compared against te.GroupedLinear (NVFP4BlockScaling).
 """
-Tests for the cuteDSL Sm100GroupedBlockScaledGemmKernel NVFP4 path.
-
-Two test classes:
-
-  TestGroupedGemmCuteDSLAdapter
-    Kernel-level alignment: cuteDSL vs dequant+matmul reference using mock
-    NVFP4 tensors with synthetic true-scale float8_e4m3fn scales.
-
-  TestGroupLinearCuteDSLForward
-    End-to-end forward: MiniGroupedLinear (FP4_SUB_CHANNEL) hitting
-    _grouped_gemm_cutedsl, verified via mock.patch and compared against
-    te.GroupedLinear (NVFP4BlockScaling).
-"""
-import sys
 import pytest
 import torch
 from unittest import mock
 
-# Ensure the editable TE source is on the path so the pytorch extension loads correctly.
-sys.path.insert(0, "/home/admin/yanglin/workspace/TransformerEngine")
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 
@@ -33,21 +25,14 @@ from miniTransformer.module.group_linear import GroupedLinear as MiniGroupedLine
 from miniTransformer.quantiztion.nvfp4_quantize_op import _is_sm100, _grouped_gemm_cutedsl
 from miniTransformer.quantiztion.quantization import QParams, ParamType
 
-
-# ── shared constants ──────────────────────────────────────────────────────────
-
 _FP4_MAX = 6.0
 _SF_VEC_SIZE = 16
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Adapter test helpers (kernel-level, mock tensors with true block scales)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class _MockNVFP4Tensor:
     def __init__(self, rowwise_data, rowwise_scale_inv):
-        self._rowwise_data = rowwise_data        # (M, K//2) uint8
-        self._rowwise_scale_inv = rowwise_scale_inv  # (M, K//16) float8_e4m3fn true scales
+        self._rowwise_data = rowwise_data
+        self._rowwise_scale_inv = rowwise_scale_inv
 
 
 def _make_nvfp4(x_fp32: torch.Tensor) -> _MockNVFP4Tensor:
@@ -117,8 +102,6 @@ def _adapter_grouped_gemm_cutedsl(A, B, m_splits, out_dtype):
     return torch.cat(results, dim=0)
 
 
-# ── adapter test cases ────────────────────────────────────────────────────────
-
 ADAPTER_CASES = [
     {"m": [128, 256], "N": 4096, "K": 2048},
     {"m": [80, 176, 128], "N": 4096, "K": 7168},
@@ -127,10 +110,6 @@ ADAPTER_CASES = [
 ]
 ADAPTER_CASE_PARAMS = [pytest.param(c, id=f"case_{i}") for i, c in enumerate(ADAPTER_CASES)]
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# End-to-end forward test helpers
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def make_nvfp4_recipe() -> recipe.NVFP4BlockScaling:
     r = recipe.NVFP4BlockScaling()
@@ -219,17 +198,11 @@ def sync_weights_te_to_mini(
             mini_w.copy_(te_w)
 
 
-# ── forward test cases ────────────────────────────────────────────────────────
-
 FORWARD_CASES = [
-    pytest.param(4,  512,  512,  128, id="4x512x512_m128"),
-    pytest.param(8, 4096, 4096,  128, id="8x4096x4096_m128"),
+    pytest.param(4, 512, 512, 128, id="4x512x512_m128"),
+    pytest.param(8, 4096, 4096, 128, id="8x4096x4096_m128"),
 ]
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Test classes
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class TestGroupedGemmCuteDSLAdapter:
     """Kernel alignment: cuteDSL vs dequant+matmul reference (mock true-scale tensors)."""
@@ -281,7 +254,7 @@ class TestGroupLinearCuteDSLForward:
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
         if not _is_sm100():
-            pytest.skip("Requires SM100 (Blackwell) GPU — _grouped_gemm_cutedsl not triggered")
+            pytest.skip("Requires SM100 GPU — _grouped_gemm_cutedsl not triggered")
 
         m_splits = [m_per_expert] * num_gemms
         total_m = sum(m_splits)
@@ -294,12 +267,10 @@ class TestGroupLinearCuteDSLForward:
         torch.manual_seed(142)
         inp = torch.randn(total_m, in_features, device="cuda", dtype=torch.bfloat16)
 
-        # TE forward (reference)
         with torch.no_grad():
             with te.autocast(enabled=True, recipe=nvfp4_recipe):
                 out_te = te_model(inp.clone(), m_splits, is_first_microbatch=True)
 
-        # mini forward — wrap _grouped_gemm_cutedsl to assert it is called
         with mock.patch(
             "miniTransformer.quantiztion.nvfp4_quantize_op._grouped_gemm_cutedsl",
             wraps=_grouped_gemm_cutedsl,
@@ -308,8 +279,9 @@ class TestGroupLinearCuteDSLForward:
                 out_mini = mini_model(inp.clone(), m_splits=m_splits, is_first_microbatch=True)
 
         assert mock_cutedsl.called, (
-            "_grouped_gemm_cutedsl was NOT called — dispatch condition not met "
-            "(expected: is_quantized=True, layout=TN, grad=False, gelu=False, accumulate=False, SM100)"
+            "_grouped_gemm_cutedsl was not called — dispatch condition not met "
+            "(expected: is_quantized=True, layout=TN, grad=False, gelu=False, "
+            "accumulate=False, SM100)"
         )
 
         diff = (out_te - out_mini).abs()
@@ -324,11 +296,13 @@ class TestGroupLinearCuteDSLForward:
         )
 
         torch.testing.assert_close(
-            out_te, out_mini,
-            rtol=0.02, atol=0.06,
+            out_te,
+            out_mini,
+            rtol=0.02,
+            atol=0.06,
             msg=(
                 f"[cuteDSL forward vs TE] mismatch: "
                 f"num_gemms={num_gemms} in={in_features} out={out_features}"
             ),
         )
-        print(f"  cuteDSL dispatch confirmed, output matches TE (rtol=0.02, atol=0.06)")
+        print("  cuteDSL dispatch confirmed, output matches TE (rtol=0.02, atol=0.06)")

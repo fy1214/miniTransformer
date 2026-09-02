@@ -1,13 +1,12 @@
-"""NVFP4 vs MXFP8 quantization precision comparison using TransformerEngine.
-
-Supports multiple input distributions to simulate real LLM activation patterns.
+"""TE NVFP4 vs MXFP8 quantization precision under several activation distributions.
 
 Usage:
-    python test_quant_precision.py
-    python test_quant_precision.py --shape 1024 4096 --dtype bfloat16
-    python test_quant_precision.py --dist outlier
-    python test_quant_precision.py --all-dist
+    python eval_te_nvfp4_vs_mxfp8.py
+    python eval_te_nvfp4_vs_mxfp8.py --shape 1024 4096 --dtype bfloat16
+    python eval_te_nvfp4_vs_mxfp8.py --dist outlier
+    python eval_te_nvfp4_vs_mxfp8.py --all-dist
 """
+
 import argparse
 
 import torch
@@ -15,8 +14,6 @@ import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import NVFP4Quantizer
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-
-# ── Quantize + dequantize ─────────────────────────────────────────────────────
 
 def quant_dequant_nvfp4(x: torch.Tensor, rowwise: bool = True) -> torch.Tensor:
     quantizer = NVFP4Quantizer(rowwise=rowwise, columnwise=False)
@@ -33,8 +30,6 @@ def quant_dequant_mxfp8(x: torch.Tensor, rowwise: bool = True) -> torch.Tensor:
     qt = quantizer.update_quantized(x, qt)
     return qt.dequantize(dtype=x.dtype)
 
-
-# ── Metrics ───────────────────────────────────────────────────────────────────
 
 def compute_metrics(x_orig: torch.Tensor, x_dq: torch.Tensor, name: str) -> dict:
     x_f, d_f = x_orig.float(), x_dq.float()
@@ -59,8 +54,6 @@ def compute_metrics(x_orig: torch.Tensor, x_dq: torch.Tensor, name: str) -> dict
     return m
 
 
-# ── Input distributions ───────────────────────────────────────────────────────
-
 def make_activation_tensor(shape, dtype, dist: str, device: str = "cuda") -> torch.Tensor:
     torch.manual_seed(42)
     if dist == "randn":
@@ -70,19 +63,19 @@ def make_activation_tensor(shape, dtype, dist: str, device: str = "cuda") -> tor
     elif dist == "outlier":
         x = torch.randn(shape, device=device, dtype=torch.float32)
         n = max(1, int(x.numel() * 0.01))
-        x.flatten()[torch.randperm(x.numel(), device=device)[:n]] = \
+        x.flatten()[torch.randperm(x.numel(), device=device)[:n]] = (
             torch.randn(n, device=device) * 50
+        )
     elif dist == "small_outlier":
         x = torch.randn(shape, device=device, dtype=torch.float32)
         n = max(1, int(x.numel() * 0.001))
-        x.flatten()[torch.randperm(x.numel(), device=device)[:n]] = \
+        x.flatten()[torch.randperm(x.numel(), device=device)[:n]] = (
             torch.randn(n, device=device) * 200
+        )
     else:
         raise ValueError(f"unknown dist: {dist!r}  (randn/uniform/outlier/small_outlier)")
     return x.to(dtype)
 
-
-# ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_nvfp4_vs_mxfp8(shape, dtype, dist: str) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,7 +83,7 @@ def run_nvfp4_vs_mxfp8(shape, dtype, dist: str) -> None:
     x_f = x.float()
 
     print(f"\n{'=' * 60}")
-    print(f"Input tensor")
+    print("Input tensor")
     print(f"{'=' * 60}")
     print(f"  shape       : {list(x.shape)}")
     print(f"  dtype       : {x.dtype}")
@@ -101,7 +94,7 @@ def run_nvfp4_vs_mxfp8(shape, dtype, dist: str) -> None:
     print(f"  outlier>3σ  : {(x_f.abs() > 3 * x_f.std()).float().mean():.4%}")
 
     print(f"\n{'=' * 60}")
-    print(f"Quantization precision comparison")
+    print("Quantization precision comparison")
     print(f"{'=' * 60}")
 
     r_nvfp4, r_mxfp8 = None, None
@@ -124,16 +117,21 @@ def run_nvfp4_vs_mxfp8(shape, dtype, dist: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="TE NVFP4 vs MXFP8 precision")
     parser.add_argument("--shape", type=int, nargs="+", default=[1024, 4096])
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    parser.add_argument("--dist", choices=["randn", "uniform", "outlier", "small_outlier"],
-                        default="randn")
+    parser.add_argument(
+        "--dist",
+        choices=["randn", "uniform", "outlier", "small_outlier"],
+        default="randn",
+    )
     parser.add_argument("--all-dist", action="store_true")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     shape = tuple(args.shape)
-    dists = ["randn", "uniform", "outlier", "small_outlier"] if args.all_dist else [args.dist]
+    dists = (
+        ["randn", "uniform", "outlier", "small_outlier"] if args.all_dist else [args.dist]
+    )
     for dist in dists:
         run_nvfp4_vs_mxfp8(shape, dtype, dist)

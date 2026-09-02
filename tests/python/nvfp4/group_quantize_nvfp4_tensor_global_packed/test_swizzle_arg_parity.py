@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""
-Parity test: rtn_fp4_group_tensor_global with swizzle=True followed by
-_unswizzle_scale must equal swizzle=False (bit-exact on SF, identical on FP4).
+"""Swizzle-arg parity for ``rtn_fp4_group_tensor_global`` (MoE weight quant).
 
-Run (on the B300 / GPU box, inside container):
-  cd tests/python/nvfp4/group_quantize_nvfp4_tensor_global_packed
-  pytest test_swizzle_arg_parity.py -v
+What: ``swizzle=True`` then ``_unswizzle_scale`` == ``swizzle=False`` (bit-exact SF).
+Where: underlying kernel for ``group_quantize_nvfp4_tensor_global_packed`` (QAT 6–14 W).
+Compare: same kernel with opposite ``swizzle`` flag on identical input.
+
+Markers: ``production``.
 """
 import pytest
 import torch
 
 import fp4_gemm
 from miniTransformer.ops.nvfp4_quantize import _unswizzle_scale
+
+pytestmark = pytest.mark.production
 
 
 def _alloc_buffers(rows, cols, num_groups, device):
@@ -33,6 +35,7 @@ def _alloc_buffers(rows, cols, num_groups, device):
     (96, 2048),      # non-128-aligned rows
 ])
 def test_swizzle_arg_parity_single_group(rows, cols):
+    """Single group: swizzled+unswizzle SF matches linear SF; FP4 data identical."""
     device = "cuda"
     torch.manual_seed(0)
     x = torch.randn(rows, cols, dtype=torch.bfloat16, device=device) * 4.0
@@ -69,7 +72,7 @@ def test_swizzle_arg_parity_single_group(rows, cols):
     "four_six_fp4_group_tensor_global",
 ])
 def test_swizzle_arg_parity_multi_group(num_candidates_fn_name):
-    """3 groups with mixed sizes (each 128-aligned for simplicity)."""
+    """Multi-group RTN/4-6: swizzle on/off SF parity after unswizzle."""
     device = "cuda"
     torch.manual_seed(1)
     cols = 2048
@@ -119,7 +122,7 @@ def test_swizzle_arg_parity_multi_group(num_candidates_fn_name):
 
 
 def test_swizzle_arg_cap_relaxation_cols_8192():
-    """Smoke test: cap is now 8192, was 4096."""
+    """Smoke: K=8192 accepted (cap raised from 4096); must not raise."""
     device = "cuda"
     rows, cols = 128, 8192  # DeepSeek-V3 hidden + headroom
     x = torch.randn(rows, cols, dtype=torch.bfloat16, device=device)

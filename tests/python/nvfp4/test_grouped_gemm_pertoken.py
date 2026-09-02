@@ -1,4 +1,11 @@
-"""Grouped NVFP4 GEMM with per-token activation quantization (CuTeDSL path)."""
+"""CuTeDSL grouped NVFP4 GEMM with per-token activation (QAT 6–7).
+
+What: ``grouped_gemm_cutedsl_pertoken`` + quant helpers in ``grouped_gemm_nvfp4_api``.
+Where: ``Nvfp4Cursor2QuantizeOp`` / ``Nvfp4Cursor2QuantizeOpRef`` forward GEMM.
+Compare: ``reference_grouped_gemm_pertoken``; pack/depack vs Triton grid helpers.
+
+Markers: ``production``. Requires CUDA sm_100+.
+"""
 
 import pytest
 import torch
@@ -16,6 +23,8 @@ from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_nvfp4_api import (
     reference_grouped_gemm_pertoken,
 )
 from miniTransformer.ops.triton.nvfp4_quantization import dequant_nvfp4_pertoken
+
+pytestmark = pytest.mark.production
 
 
 def _require_cuda():
@@ -38,6 +47,8 @@ PERTOKEN_CASES = [
 
 
 class TestPertokenGroupedGemmHelpers:
+    """Unit checks for pack/scale helpers used by the CuTeDSL pertoken path."""
+
     @staticmethod
     def _error_metrics(pred: torch.Tensor, ref: torch.Tensor):
         err = (pred.float() - ref.float()).abs()
@@ -45,6 +56,7 @@ class TestPertokenGroupedGemmHelpers:
         return float(err.max().item()), float(err.mean().item()), float(rmse.item())
 
     def test_pack_depack_matches_triton_grid(self):
+        """FP4x2 pack/depack round-trip matches Triton grid encoding."""
         _require_cuda()
         from miniTransformer.ops.nvfp4_ref_quantize import cast_from_fp4x2, cast_to_fp4x2
         from miniTransformer.ops.triton.nvfp4_quantization import (
@@ -63,6 +75,7 @@ class TestPertokenGroupedGemmHelpers:
         assert max_err <= 0.26
 
     def test_block_sfa_plus_alpha_list_matches_merged_sfa(self):
+        """Merged SFA == block SF × per-row alpha; alpha apply helper is sane."""
         _require_cuda()
         torch.manual_seed(11)
         m, k, n = 64, 128, 32
@@ -92,6 +105,7 @@ class TestPertokenGroupedGemmHelpers:
         torch.testing.assert_close(corrected.float(), expected, rtol=1e-5, atol=1e-5)
 
     def test_triton_dequant_matches_helper(self):
+        """``dequant_pertoken_nvfp4`` matches Triton dequant on same quant output."""
         _require_cuda()
         from miniTransformer.ops.triton.nvfp4_quantization import (
             quant_nvfp4_pertoken_triton,
@@ -112,6 +126,8 @@ class TestPertokenGroupedGemmHelpers:
 
 
 class TestPertokenGroupedGemmCorrectness:
+    """End-to-end CuTeDSL grouped GEMM vs Python reference matmul."""
+
     @staticmethod
     def _error_metrics(pred: torch.Tensor, ref: torch.Tensor):
         err = (pred.float() - ref.float()).abs()
@@ -120,6 +136,7 @@ class TestPertokenGroupedGemmCorrectness:
 
     @pytest.mark.parametrize("case", PERTOKEN_CASES)
     def test_reference_grouped_matmul(self, case):
+        """Python reference path returns expected [sum(m), N] shape."""
         _require_cuda()
         torch.manual_seed(7)
         device = "cuda"
@@ -145,6 +162,7 @@ class TestPertokenGroupedGemmCorrectness:
 
     @pytest.mark.parametrize("case", PERTOKEN_CASES)
     def test_cutedsl_matches_reference(self, case):
+        """CuTeDSL GEMM (pertoken A × tensor-global W) matches Python reference."""
         _require_sm100()
         torch.manual_seed(9)
         device = "cuda"
@@ -179,6 +197,7 @@ class TestPertokenGroupedGemmCorrectness:
 
     @pytest.mark.parametrize("case", PERTOKEN_CASES)
     def test_both_sides_pertoken(self, case):
+        """CuTeDSL GEMM when both A and B are pertoken-quantized tensors."""
         _require_sm100()
         torch.manual_seed(13)
         device = "cuda"

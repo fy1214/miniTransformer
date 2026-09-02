@@ -1,13 +1,10 @@
-"""
-Precision validation for grouped_cutlass_gemm_v2 against a Python golden reference.
+"""CUTLASS grouped NVFP4 GEMM v2 vs Python golden (QAT 8 / 12 / 14).
 
-The Python golden dequantizes packed FP4 activations and weights using their
-tcgen05-swizzled FP8 scale factors and per-row / per-expert global scales, then
-computes the grouped GEMM in float32. This is independent of any CUDA quantize
-kernel and exercises the full V2GemmInputs → output pipeline.
+What: ``grouped_cutlass_gemm_v2`` (contiguous packed A/B + swizzled SF).
+Where: ``nvfp4_cursor2_op_cutlass`` / ``_cutlass_backward`` / shared by v2 EVT path.
+Compare: dequant-then-float32 GEMM golden; also FP32 ground-truth bounds.
 
-Run (SM100 required):
-    pytest test_grouped_cutlass_gemm_v2_vs_golden.py -v -s
+Markers: ``production``. Requires fp4_gemm, CUDA sm_100+.
 """
 
 from __future__ import annotations
@@ -24,6 +21,8 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 pytest.importorskip("fp4_gemm")
+
+pytestmark = pytest.mark.production
 
 from miniTransformer.quantiztion import quantization
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
@@ -287,6 +286,7 @@ class TestGroupedCutlassGemmV2VsGolden:
     @pytest.mark.parametrize("m_splits, n, k", V2_CASES)
     @pytest.mark.parametrize("seed", [42, 7])
     def test_v2_vs_golden(self, m_splits, n, k, seed):
+        """Kernel vs dequant-then-GEMM golden: cosine > 0.999, bounded abs error."""
         _require_sm100()
         device = "cuda"
 

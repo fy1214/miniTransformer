@@ -1,31 +1,12 @@
-"""Precision and performance tests for per-token NVFP4 quantization kernels.
+"""Single-matrix per-token NVFP4 quant (QAT 6 foundation / Cursor2Ref STE).
 
-Covers:
-  quantize_nvfp4_pertoken          – row-major scale layout (RTN and Round-4-or-6)
-  quantize_nvfp4_pertoken_swizzled – tcgen05 swizzled scale layout
-  fp4_pertoken_fused / rtn_fp4_pertoken_fused  – single-launch fused kernels
-  fp4_pertoken / rtn_fp4_pertoken              – two-pass reference kernels
+What:  ``quantize_nvfp4_pertoken`` and ``quantize_nvfp4_pertoken_swizzled``.
+Where: QAT 6 ``Nvfp4Cursor2QuantizeOpRef``; building block for grouped MoE X quant.
+Compare: Python golden (``quantize_nvfp4_ref_pertoken_amax``), fused vs two-pass
+         bit-exact, row-major vs unswizzled scales.
 
-Precision methodology
----------------------
-Per-token kernels: dequantize output and compute effective bit-width.
-Fused vs two-pass: results must be bit-exact.
-All kernels vs Python golden: bit-exact FP4 data and FP8 scale.
-Swizzled vs golden: unswizzle scale and compare bit-exact to Python golden.
-scale_override != 1.0: global scale must scale proportionally.
-Large-cols (>8192) two-pass path: bit-exact vs Python golden.
-
-Performance methodology
------------------------
-Wall-clock time (per-token kernels) and CUDA events (fused vs two-pass).
-
-Run all tests:
-    pytest tests/python/nvfp4/test_nvfp4_pertoken.py -v
-
-Run benchmarks only:
-    python tests/python/nvfp4/test_nvfp4_pertoken.py
-
-Skip conditions: fp4_gemm extension not built, CUDA unavailable, or GPU < sm_100.
+Markers: ``production`` (correctness), ``bench``+``slow`` (micro-benches).
+Requires: fp4_gemm, CUDA sm_100+.
 """
 
 from __future__ import annotations
@@ -60,7 +41,10 @@ else:
     if _maj < 10:
         _SKIP_REASON = f"per-token FP4 kernels require sm_100+ (got {_maj}.{_min})"
 
-pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
+pytestmark = [
+    pytest.mark.production,
+    pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or ""),
+]
 
 # ---------------------------------------------------------------------------
 # FP4 E2M1 lookup table and dequantization helpers
@@ -578,10 +562,11 @@ def _throughput_gbs(rows: int, cols: int, us: float) -> float:
     return rows * cols * 2.5 / (us * 1e-6) / 1e9
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("rows,cols", FUSED_BENCH_SHAPES)
 def test_bench_fused_vs_twopass(rows: int, cols: int):
-    """Fused must not be slower than two-pass (5% tolerance)."""
+    """Bench: fused kernel wall time ≤ two-pass + amax (5% tolerance)."""
     x   = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
     x_c = x.contiguous()
     amax = x_c.abs().amax(dim=1).to(torch.float32)
@@ -611,30 +596,33 @@ def test_bench_fused_vs_twopass(rows: int, cols: int):
     )
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("m,n", PERTOKEN_BENCH_SHAPES)
 def test_bench_pertoken_rowmajor(m: int, n: int):
-    """Benchmark: quantize_nvfp4_pertoken row-major. Prints ms; always passes."""
+    """Bench: ``quantize_nvfp4_pertoken`` row-major throughput (prints; always passes)."""
     x    = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
     ms   = _wall_bench(lambda t: quantize_nvfp4_pertoken(t), x)
     gb_s = (m * n * 2) / (ms * 1e-3) / 1e9
     print(f"\n[rowmajor] {m}x{n}: {ms:.3f} ms | ~{gb_s:.1f} GB/s")
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("m,n", PERTOKEN_BENCH_SHAPES)
 def test_bench_pertoken_swizzled(m: int, n: int):
-    """Benchmark: quantize_nvfp4_pertoken_swizzled. Prints ms; always passes."""
+    """Bench: ``quantize_nvfp4_pertoken_swizzled`` throughput (prints; always passes)."""
     x    = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
     ms   = _wall_bench(lambda t: quantize_nvfp4_pertoken_swizzled(t), x)
     gb_s = (m * n * 2) / (ms * 1e-3) / 1e9
     print(f"\n[swizzled] {m}x{n}: {ms:.3f} ms | ~{gb_s:.1f} GB/s")
 
 
+@pytest.mark.bench
 @pytest.mark.slow
 @pytest.mark.parametrize("m,n", PERTOKEN_BENCH_SHAPES)
 def test_bench_four_six_vs_rtn(m: int, n: int):
-    """Benchmark: RTN vs Round-4-or-6 overhead (row-major layout)."""
+    """Bench: RTN vs Round-4-or-6 wall-time overhead (row-major)."""
     x      = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
     ms_rtn = _wall_bench(lambda t: quantize_nvfp4_pertoken(t, four_six=False), x)
     ms_46  = _wall_bench(lambda t: quantize_nvfp4_pertoken(t, four_six=True),  x)

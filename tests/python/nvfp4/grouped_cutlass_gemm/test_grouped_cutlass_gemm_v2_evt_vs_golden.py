@@ -1,22 +1,17 @@
-"""Precision validation for grouped_cutlass_gemm_v2_evt vs the v2 path and a
-Python golden reference.
+"""CUTLASS grouped NVFP4 GEMM v2 EVT epilogue (QAT 14).
 
-The EVT path differs from the unfused v2 path only in the post-GEMM scale:
+What: ``grouped_cutlass_gemm_v2_evt`` — FP32 fused per-token scale in epilogue.
+Where: ``nvfp4_cursor2_op_cutlass_v2``.
+Compare: same Python golden as v2; EVT must be no worse than unfused v2.
 
-  v2     :  D = bf16(acc) * bf16(scale)        (two bf16 muls, post-GEMM kernel)
-  v2_evt :  D = bf16(acc_fp32 * scale_fp32)    (one fp32 mul, fused in epilogue)
-
-Tolerances mirror test_grouped_cutlass_gemm_v2_vs_golden.py — v2_evt should be
-*strictly tighter* against the golden than v2 (the EVT path skips the
-bf16-domain multiply, so accumulated rounding noise drops by ~36 dB).
-
-Run:
-    pytest test_grouped_cutlass_gemm_v2_evt_vs_golden.py -v -s
+Markers: ``production``. Requires fp4_gemm, CUDA sm_100+.
 """
 from __future__ import annotations
 
 import pytest
 import torch
+
+pytestmark = pytest.mark.production
 
 # Reuse the v2 test's golden + input builder — they are pure helpers and do not
 # call the kernel, so they apply equally to the EVT path.
@@ -42,6 +37,7 @@ class TestGroupedCutlassGemmV2EvtVsGolden:
     @pytest.mark.parametrize("m_splits, n, k", V2_CASES)
     @pytest.mark.parametrize("seed", [42, 7])
     def test_v2_evt_vs_golden(self, m_splits, n, k, seed):
+        """EVT kernel vs dequant-then-GEMM golden (same thresholds as v2)."""
         _require_sm100()
         device = "cuda"
 
@@ -136,6 +132,7 @@ class TestGroupedCutlassGemmV2EvtVsGolden:
 
     @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
     def test_v2_evt_seed_sweep(self, seed):
+        """Multi-seed robustness on a standard MoE shape (EVT path)."""
         _require_sm100()
         m_splits, n, k = [128] * 4, 4096, 2048
         device = "cuda"

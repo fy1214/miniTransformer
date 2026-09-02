@@ -1,31 +1,13 @@
-"""
-Precision tests for NVFP4 grouped pertoken quantize with **fused Fp8Padding**.
+"""Pad-fuse CUDA kernels for MoE activation quant (optional ``fuse_pad`` path).
 
-Kernel under test
------------------
-``fp4_gemm.rtn_fp4_group_pertoken_pad_fuse`` (and the ``four_six_…`` twin) take
-the *unpadded* activation tensor plus two offset arrays — ``padded_row_offsets``
-(128-aligned, what the GEMM expects) and ``unpadded_row_offsets`` (the actual
-token counts) — and produce exactly the same output as the existing per-row
-kernel would after a separate ``Fp8Padding`` D2D copy.
+What: ``fp4_gemm.rtn_fp4_group_pertoken_pad_fuse`` / ``four_six_…`` (unpadded X →
+      padded FP4 buffers; pad rows zeroed for GEMM).
+Where: ``group_quantize_nvfp4_pertoken_swizzled(fuse_pad=True)``; not yet wired
+       in production cursor2 ops (default ``fuse_pad=False``).
+Compare: zero-pad then ``rtn_fp4_group_pertoken``; pad rows must be exact zero.
 
-The pad rows that lie between ``unpad_off+m_unp`` and ``pad_off+m_pad`` carry
-no information; the kernel must emit zero-bytes for FP4 data and FP4 block-scale
-so that the downstream GEMM produces ``0 · W = 0`` on those rows (which then
-get sliced away by ``Fp8Unpadding``).
-
-Test strategy mirrors ``test_nvfp4_group_pertoken_quantize.py``:
-1. **Bit-exact vs reference** — reference = zero-pad activation with
-   ``index_copy_`` then call ``rtn_fp4_group_pertoken`` on the padded buffer.
-   Compare every byte of ``data`` / ``scale`` / ``global_scale``.
-2. **Pad rows are exact zero** — explicitly verify the padding region.
-3. **Dequant precision** — eff-bits > 3.3 on Gaussian input (real rows only).
-4. **Empty groups** (``m_unp = 0``) and irregular RL-style splits.
-5. **All-zero input** — must not produce NaN/Inf.
-6. **four_six variant** — same suite, abridged.
-
-Run on B300 inside the build container:
-    PYTHONPATH=. pytest tests/python/nvfp4/group_quantize_nvfp4_pertoken_swizzled/test_nvfp4_group_pertoken_pad_fuse.py -v
+Markers: ``production`` (API/kernel shipped; keep until fuse_pad is removed).
+Requires: fp4_gemm with pad_fuse binding, CUDA sm_100+.
 """
 
 from __future__ import annotations
@@ -59,7 +41,10 @@ else:
             f"NVFP4 pertoken pad-fuse kernel requires sm_100+ (got {_maj}.{_min})"
         )
 
-pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
+pytestmark = [
+    pytest.mark.production,
+    pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or ""),
+]
 
 
 # ---------------------------------------------------------------------------

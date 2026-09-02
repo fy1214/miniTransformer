@@ -1,4 +1,4 @@
-from wsgiref.util import request_uri
+"""BF16 Linear backward accuracy vs an FP32 reference chain (no quantization)."""
 
 import pytest
 import torch
@@ -6,41 +6,17 @@ import torch
 from miniTransformer.module.linear import Linear
 
 
-def build_linear(
-    in_features=None,
-    out_features=None
-):
-    in_features = in_features
-    out_features = out_features
-    sequence_parallel = False
-    fuse_wgrad_accumulation = False
-    tp_group = None
-    tp_size = 1
-    get_rng_state_tracker = None
-    rng_tracker_name = None
-    init_method = None
-    bias = False
-    return_bias = False
-    params_dtype = torch.bfloat16
-    parallel_mode = 'column'
-    parameters_split = None
-    device = "cuda"
-    ub_overlap_rs = False
-    ub_overlap_ag = False
-    ub_name = None
-    # JQ: hybrid additional args
-    layer_number = 0
-
+def build_linear(in_features, out_features):
     linear = Linear(
         in_features=in_features,
         out_features=out_features,
-        bias=bias,
-        device=device,
+        bias=False,
+        device="cuda",
         params_dtype=torch.bfloat16,
     )
-    # mock main_grad
     linear.weight.main_grad = torch.zeros_like(linear.weight.data, dtype=torch.float32)
     return linear
+
 
 def ref_in_fp32(H, x, y, head, w1, w2, w3):
     w1_ref = build_linear(H, H)
@@ -57,15 +33,19 @@ def ref_in_fp32(H, x, y, head, w1, w2, w3):
     hid = w3_ref(hid, is_first_microbatch=True, fp8_output=False, inp_meta=None)
     loss = (hid @ head - y).pow(2).mean()
     loss.backward()
-    return w1_ref.weight.grad.float().detach(), w2_ref.weight.grad.float().detach(), w3_ref.weight.grad.float().detach()
+    return (
+        w1_ref.weight.grad.float().detach(),
+        w2_ref.weight.grad.float().detach(),
+        w3_ref.weight.grad.float().detach(),
+    )
 
 
-def eval(res, ref):
+def eval_metrics(res, ref):
     with torch.no_grad():
         res = res.float()
         ref = ref.float()
         quad_err = (res - ref).pow(2).mean() / ref.pow(2).mean()
-        eff_bitwidth = (-torch.log2(quad_err) / 2)
+        eff_bitwidth = -torch.log2(quad_err) / 2
         cosine = (res.flatten() @ ref.flatten()) / (ref.flatten() @ ref.flatten())
         return quad_err.item(), eff_bitwidth.item(), cosine.item()
 
@@ -75,22 +55,22 @@ def print_error(name, quad_err, eff_bitwidth, cosine):
 
 
 def evaluate_accuracy(B, T, H, steps):
-    x = torch.randn((B, T, H), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((B, T, 1), device='cuda', dtype=torch.bfloat16)
+    x = torch.randn((B, T, H), device="cuda", dtype=torch.bfloat16)
+    y = torch.randn((B, T, 1), device="cuda", dtype=torch.bfloat16)
 
     W1 = build_linear(H, H)
     W2 = build_linear(H, H)
     W3 = build_linear(H, H)
 
     with torch.no_grad():
-        W1.weight /= (H**0.5 * W1.weight.std())
-        W2.weight /= (H**0.5 * W2.weight.std())
-        W3.weight /= (H**0.5 * W3.weight.std())
+        W1.weight /= H**0.5 * W1.weight.std()
+        W2.weight /= H**0.5 * W2.weight.std()
+        W3.weight /= H**0.5 * W3.weight.std()
 
-    head = torch.randn(H, 1, device='cuda', dtype=torch.bfloat16)
-
-
-    w1_ref_grad, w2_ref_grad, w3_ref_grad = ref_in_fp32(H, x, y, head, W1.weight, W2.weight, W3.weight)
+    head = torch.randn(H, 1, device="cuda", dtype=torch.bfloat16)
+    w1_ref_grad, w2_ref_grad, w3_ref_grad = ref_in_fp32(
+        H, x, y, head, W1.weight, W2.weight, W3.weight
+    )
 
     hid = x @ W1.weight.T
     hid = torch.nn.functional.relu(hid)
@@ -113,13 +93,11 @@ def evaluate_accuracy(B, T, H, steps):
         R2 /= steps
         R3 /= steps
 
-        w1_err = eval(R1, w1_ref_grad)
+        w1_err = eval_metrics(R1, w1_ref_grad)
         print_error("W1", *w1_err)
-
-        w2_err = eval(R2, w2_ref_grad)
+        w2_err = eval_metrics(R2, w2_ref_grad)
         print_error("W2", *w2_err)
-
-        w3_err = eval(R3, w3_ref_grad)
+        w3_err = eval_metrics(R3, w3_ref_grad)
         print_error("W3", *w3_err)
 
     return w1_err, w2_err, w3_err
@@ -127,15 +105,19 @@ def evaluate_accuracy(B, T, H, steps):
 
 torch.manual_seed(42)
 
+
 @pytest.mark.parametrize(
     "steps, expected",
-    [(1, (1.9, 2.5, 3.8, 0.03)),
-     (1, (2.9, 3.4, 4.0, 0.02)),
-     (1, (3.9, 4.5, 6.4, 0.01)),
-     (1, (4.9, 5.5, 7.5, 0.01)),
-     (1, (5.9, 6.5, 8.3, 0.005)),
-     (1, (6.9, 7.5, 8.9, 0.002)),
-     (1, (7.6, 8.2, 8.9, 0.001))])
+    [
+        (1, (1.9, 2.5, 3.8, 0.03)),
+        (1, (2.9, 3.4, 4.0, 0.02)),
+        (1, (3.9, 4.5, 6.4, 0.01)),
+        (1, (4.9, 5.5, 7.5, 0.01)),
+        (1, (5.9, 6.5, 8.3, 0.005)),
+        (1, (6.9, 7.5, 8.9, 0.002)),
+        (1, (7.6, 8.2, 8.9, 0.001)),
+    ],
+)
 def test_backward_accuracy(steps, expected):
     B = 8
     T = 16
@@ -143,12 +125,10 @@ def test_backward_accuracy(steps, expected):
     print(f"{steps=}:")
     w1e, w2e, w3e = evaluate_accuracy(B, T, H, steps)
 
-    # bits
     assert w1e[1] >= expected[0]
     assert w2e[1] >= expected[1]
     assert w3e[1] >= expected[2]
 
-    # cosine
     cmax = 1.0 + expected[3]
     cmin = 1.0 - expected[3]
     assert cmin < w1e[2] < cmax
@@ -158,8 +138,13 @@ def test_backward_accuracy(steps, expected):
 
 def test_compile_fwd():
     W = build_linear(128, 256)
-    def fwd(x): return W(x)
-    torch.compile(fwd, fullgraph=True)(torch.randn(1, 128, 128, device='cuda', dtype=torch.bfloat16))
+
+    def fwd(x):
+        return W(x)
+
+    torch.compile(fwd, fullgraph=True)(
+        torch.randn(1, 128, 128, device="cuda", dtype=torch.bfloat16)
+    )
 
 
 def test_result_fwd():
@@ -167,6 +152,6 @@ def test_result_fwd():
     x = torch.randn((1, 512, 128), device="cuda", dtype=torch.bfloat16)
     y = W(x)
     y_ref = x @ W.weight.T
-    se, bits, cos = eval(y, y_ref)
+    _, bits, cos = eval_metrics(y, y_ref)
     assert cos > 0.99
     assert bits > 2.8

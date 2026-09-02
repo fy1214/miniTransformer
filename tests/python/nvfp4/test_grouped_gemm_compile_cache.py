@@ -1,5 +1,13 @@
-"""Unit tests for grouped CuTeDSL compile cache helpers (no CUDA required)."""
+"""Unit tests for grouped CuTeDSL compile cache helpers (no CUDA required).
 
+What: ``infer_alpha_modes``, ``build_grouped_compile_cache_key``, clear cache.
+Where: ``grouped_gemm_compile_cache`` used by CuTeDSL grouped GEMM (QAT 6–7).
+Compare: pure Python key stability / alpha mode inference.
+
+Markers: ``production``.
+"""
+
+import pytest
 import torch
 
 from miniTransformer.ops.cuteDSL.nvfp4.blockwise_group_gemm_cute_alpha_epilogue import (
@@ -12,8 +20,11 @@ from miniTransformer.ops.cuteDSL.nvfp4.grouped_gemm_compile_cache import (
     profile_cfg_cache_tuple,
 )
 
+pytestmark = pytest.mark.production
+
 
 def test_infer_alpha_modes_scalar_and_row():
+    """Scalar alpha → mode 0; per-row tensor alpha → mode 1."""
     ps = [(64, 512, 1024, 1), (64, 512, 1024, 1)]
     scalars = [0.5, 1.0]
     assert infer_alpha_modes(scalars, ps) == (0, 0)
@@ -23,6 +34,7 @@ def test_infer_alpha_modes_scalar_and_row():
 
 
 def test_compile_cache_key_stable():
+    """Identical inputs produce identical cache keys."""
     profile = GroupedBlockScaledProfile.NVFP4
     cfg = profile.config
     ps = [(64, 512, 1024, 1), (64, 512, 1024, 1)]
@@ -51,4 +63,5 @@ def test_compile_cache_key_stable():
 
 
 def test_clear_cache():
+    """``clear_grouped_gemm_compile_cache`` is callable (smoke)."""
     clear_grouped_gemm_compile_cache()

@@ -334,12 +334,21 @@ class TestFP8Param:
                 args.first_last_layers_bf16 = True
                 args.num_layers_at_start_in_bf16 = args.num_layers
                 args.num_layers_at_end_in_bf16 = 0
+        elif recipe == "bf16":
+            args.fp8 = None
+            args.fp8_recipe = None
+            args.fp8_param_gather = False
+            args.fp4 = None
+            args.fp4_recipe = None
+            args.fp4_param = False
         else:
             args.fp8 = "e4m3"
             args.fp8_recipe = recipe
             args.fp8_param_gather = fp8_param_gather
         args.ddp_bucket_size = 1024  # Create more buckets to test the rs/ag overlap.
         args.attention_backend = AttnBackend.flash
+        # Container may lack apex fused_weight_gradient_mlp_cuda.
+        args.gradient_accumulation_fusion = False
         # MXFP8 test settings
         if recipe == "mxfp8" and fp8_param_gather:
             args.reuse_grad_buf_for_mxfp8_param_ag = True
@@ -349,13 +358,18 @@ class TestFP8Param:
             args.cuda_graph_warmup_steps = 0
 
         # Merge class-level extras first (from CLI main()), then per-call kwargs
-        # so kwargs win on conflict.
+        # so kwargs win on conflict. Allow optional extension attrs that are not
+        # always registered on older Megatron arg parsers.
         for key, value in type(self)._extra_args.items():
-            assert hasattr(args, key), f"unknown megatron arg: {key}"
+            if not hasattr(args, key):
+                setattr(args, key, value)
+                continue
             setattr(args, key, value)
 
         for key, value in kwargs.items():
-            assert hasattr(args, key)
+            if not hasattr(args, key):
+                setattr(args, key, value)
+                continue
             setattr(args, key, value)
 
         validate_args(args)

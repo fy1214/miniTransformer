@@ -11,6 +11,9 @@ from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_v2 import Nvfp4Cursor2
 from miniTransformer.quantiztion.nvfp4_cursor2_op_ref import Nvfp4Cursor2QuantizeOpRef
 from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
 from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken import Nvfp4TiledQuantizePertokenOp
+from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken_bf16_bwd import (
+    Nvfp4PertokenBf16BackwardOp,
+)
 from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
 from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
 from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
@@ -106,6 +109,7 @@ class QuantizeRecipe(enum.Enum):
     INT4_MARLIN_FORWARD = "int4_marlin_forward"
     FP4_SUB_CHANNEL = "fp4_subchannel_scaling"
     FP4_SUB_CHANNEL_PERTOKEN = "fp4_subchannel_scaling_pertoken"
+    FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD = "fp4_subchannel_scaling_pertoken_bf16_bwd"
     FP4_SUB_CHANNEL_QUARTET = "fp4_subchannel_scaling_quartet"
     FP4_SUB_CHANNEL_REF = "fp4_subchannel_scaling_ref"
     FP4_SUB_CHANNEL_CURSOR2 = "fp4_subchannel_scaling_cursor2"
@@ -272,6 +276,42 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
                 param_type=ParamType.Y,
             ),
             quantize_op=Nvfp4TiledQuantizePertokenOp(),
+            allgather_quantize=False,
+        )
+    elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD:
+        # NVFP4 per-token forward (same as QAT15) + TE-style BF16 dgrad/wgrad.
+        # data_t stores BF16 splits (no physical transpose); bwd uses layout NN/NT.
+        return QLinearParams(
+            quantize=True,
+            quantize_type=QuantizeType.NVFP4,
+            x_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.X,
+            ),
+            w_params=QParams(
+                output_dtype=torch.uint8,
+                scaling_dtype=torch.float8_e4m3fn,
+                quant_tile_shape=(16, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.WEIGHT,
+            ),
+            g_params=QParams(
+                output_dtype=torch.bfloat16,
+                scaling_dtype=torch.bfloat16,
+                quant_tile_shape=(1, 16),
+                with_2d_quantization=False,
+                with_rht=False,
+                stochastic_rounding=False,
+                param_type=ParamType.Y,
+            ),
+            quantize_op=Nvfp4PertokenBf16BackwardOp(),
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2:
@@ -639,6 +679,10 @@ def get_qlinear_params_from_env_qat_params() -> QLinearParams:
     if qat_params_idx == 15:
         return get_qlinear_params_from_predefined(
             QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN
+        )
+    if qat_params_idx == 16:
+        return get_qlinear_params_from_predefined(
+            QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD
         )
 
     raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")

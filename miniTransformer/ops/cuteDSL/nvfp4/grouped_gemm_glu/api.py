@@ -115,6 +115,7 @@ class GroupedGemmGluSm100(APIBase):
         sample_b: Optional[torch.Tensor] = None,
         sample_sfb: Optional[torch.Tensor] = None,
         sample_bias: Optional[torch.Tensor] = None,
+        sample_alpha_b: Optional[torch.Tensor] = None,
         # Discrete mode -- provide these instead:
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
@@ -153,6 +154,8 @@ class GroupedGemmGluSm100(APIBase):
         :param sample_sfb: (Dense) Sample scale factor B tensor
         :param sample_bias: Optional bias tensor with shape (n, l) or (n, expert_cnt), stride (1, n).
             Dense mode supports fp16/bfloat16/float32 bias; discrete mode supports fp16/bfloat16 bias.
+        :param sample_alpha_b: Optional per-N fp32 alpha with shape (n, l) / (n, E), stride (1, n).
+            When provided, epilogue applies ``ACC *= α_a[m] * α_b[n]``.
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
         :param b_dtype: (Discrete) Data type of B tensors
@@ -202,6 +205,7 @@ class GroupedGemmGluSm100(APIBase):
 
         self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
+        self.alpha_b_desc = self._make_tensor_desc(sample_alpha_b, name="sample_alpha_b")
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
         self.amax_desc = self._make_tensor_desc(sample_amax, name="sample_amax")
@@ -249,6 +253,7 @@ class GroupedGemmGluSm100(APIBase):
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_bias = self.bias_desc is not None
+        self._has_alpha_b = self.alpha_b_desc is not None
         self._kernel = BlockScaledMoEGroupedGemmGluBiasKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -310,6 +315,7 @@ class GroupedGemmGluSm100(APIBase):
         self._check_tensor_shape(self.d_desc, (tensor_m, n // 2, 1), "D")
         self._check_tensor_shape(self.d_col_desc, (tensor_m, n // 2, 1), "D_col")
         self._check_tensor_shape(self.bias_desc, (n, l), "bias")
+        self._check_tensor_shape(self.alpha_b_desc, (n, l), "alpha_b")
 
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
         self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
@@ -366,6 +372,10 @@ class GroupedGemmGluSm100(APIBase):
             self.bias_desc,
             stride=[(1, n)],
         )
+        _ = self._check_tensor_stride(
+            self.alpha_b_desc,
+            stride=[(1, n)],
+        )
 
         # ---- Data types ----
         self._logger.debug("Checking data types")
@@ -392,6 +402,12 @@ class GroupedGemmGluSm100(APIBase):
                 name="bias",
                 extra_error_msg="bias must be fp16, bfloat16, or float32",
             )
+            self._check_dtype(
+                self.alpha_b_desc,
+                dtype=[torch.float32],
+                name="alpha_b",
+                extra_error_msg="alpha_b must be float32",
+            )
         else:
             self._value_error_if(
                 self.b_dtype != self.ab_dtype,
@@ -402,6 +418,12 @@ class GroupedGemmGluSm100(APIBase):
                 dtype=[torch.bfloat16, torch.float16],
                 name="bias",
                 extra_error_msg="bias must be fp16 or bfloat16 in discrete mode",
+            )
+            self._check_dtype(
+                self.alpha_b_desc,
+                dtype=[torch.float32],
+                name="alpha_b",
+                extra_error_msg="alpha_b must be float32",
             )
 
         self.sf_dtype = self._check_dtype(
@@ -665,6 +687,7 @@ class GroupedGemmGluSm100(APIBase):
             weight_mode=self.weight_mode,
             act_func=self.act_func,
             enable_bias=self._has_bias,
+            enable_alpha_b=self._has_alpha_b,
             use_dynamic_sched=self.use_dynamic_sched,
             per_token_scale=self.per_token_scale,
         )
@@ -762,6 +785,7 @@ class GroupedGemmGluSm100(APIBase):
                     stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
                 )
             bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
+            alpha_b_cute_fake = self._make_fake_cute_tensor_from_desc(self.alpha_b_desc, assumed_align=16)
         else:
             valid_m = cute.sym_int(divisibility=256)
             n_sym = cute.sym_int()
@@ -866,6 +890,13 @@ class GroupedGemmGluSm100(APIBase):
                     shape=(n_sym, l_sym),
                     stride=(1, n_sym),
                 )
+            alpha_b_cute_fake = None
+            if self.alpha_b_desc is not None:
+                alpha_b_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.alpha_b_desc.dtype,
+                    shape=(n_sym, l_sym),
+                    stride=(1, n_sym),
+                )
 
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
         # linear_offset, geglu_alpha, glu_clamp_max, and glu_clamp_min are runtime
@@ -894,6 +925,7 @@ class GroupedGemmGluSm100(APIBase):
             alpha=self._make_alpha_amax_fake(self.alpha_desc, valid_m, assumed_align=16),
             prob=prob_cute_fake,
             bias=bias_cute_fake,
+            alpha_b=alpha_b_cute_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=lambda x: x,
@@ -923,6 +955,7 @@ class GroupedGemmGluSm100(APIBase):
             alpha_tensor: torch.Tensor,
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
+            alpha_b_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
             linear_offset: float = 0.0,
             geglu_alpha: float = 1.702,
@@ -950,6 +983,7 @@ class GroupedGemmGluSm100(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
+                alpha_b_tensor,
                 stream,
                 cutlass.Float32(linear_offset),
                 cutlass.Float32(geglu_alpha),
@@ -1045,6 +1079,7 @@ class GroupedGemmGluSm100(APIBase):
                 assumed_align=16,
             )
         bias_tensor = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
+        alpha_b_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_b_desc, assumed_align=16)
 
         # Compile-time pointer placeholders
         b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
@@ -1081,6 +1116,7 @@ class GroupedGemmGluSm100(APIBase):
             alpha_tensor,
             prob_tensor,
             bias_tensor,
+            alpha_b_tensor,
             max_active_clusters,
             fake_stream,
             lambda x: x,  # epilogue_op (Constexpr, baked in)
@@ -1117,6 +1153,7 @@ class GroupedGemmGluSm100(APIBase):
             alpha_tensor: torch.Tensor,
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
+            alpha_b_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
             linear_offset: float = 0.0,
             geglu_alpha: float = 1.702,
@@ -1147,6 +1184,7 @@ class GroupedGemmGluSm100(APIBase):
                 alpha_tensor,
                 prob_tensor,
                 bias_tensor,
+                alpha_b_tensor,
                 stream,
                 cutlass.Float32(linear_offset),
                 cutlass.Float32(geglu_alpha),
@@ -1172,6 +1210,7 @@ class GroupedGemmGluSm100(APIBase):
         b_tensor: Optional[torch.Tensor] = None,
         sfb_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
+        alpha_b_tensor: Optional[torch.Tensor] = None,
         # Discrete mode:
         b_ptrs: Optional[torch.Tensor] = None,
         sfb_ptrs: Optional[torch.Tensor] = None,
@@ -1206,6 +1245,9 @@ class GroupedGemmGluSm100(APIBase):
         :param bias_tensor: Optional bias tensor with shape (n, l) and stride (1, n).
             Bias fusion is specialized at compile time: if ``sample_bias`` was omitted
             at construction, ``bias_tensor`` must also be omitted at execute time.
+        :param alpha_b_tensor: Optional per-N fp32 alpha ``(n, l)`` stride ``(1, n)``.
+            Specialized at compile time like bias: must match whether ``sample_alpha_b``
+            was provided at construction.
         :param b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         :param sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         :param d_col_tensor: Optional column-quantized output
@@ -1263,6 +1305,11 @@ class GroupedGemmGluSm100(APIBase):
                 bias_tensor is None,
                 "bias_tensor must be provided at execute() when the API was compiled with sample_bias",
             )
+        if self._has_alpha_b:
+            self._value_error_if(
+                alpha_b_tensor is None,
+                "alpha_b_tensor must be provided at execute() when the API was compiled with sample_alpha_b",
+            )
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(
@@ -1280,6 +1327,7 @@ class GroupedGemmGluSm100(APIBase):
                 padded_offsets=padded_offsets,
                 alpha_tensor=alpha_tensor,
                 bias_tensor=bias_tensor,
+                alpha_b_tensor=alpha_b_tensor,
                 prob_tensor=prob_tensor,
                 stream=current_stream,
                 linear_offset=linear_offset,
@@ -1304,6 +1352,7 @@ class GroupedGemmGluSm100(APIBase):
                 alpha_tensor=alpha_tensor,
                 prob_tensor=prob_tensor,
                 bias_tensor=bias_tensor,
+                alpha_b_tensor=alpha_b_tensor,
                 stream=current_stream,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,
@@ -1331,6 +1380,7 @@ def grouped_gemm_glu_wrapper_sm100(
     b_tensor: Optional[torch.Tensor] = None,
     sfb_tensor: Optional[torch.Tensor] = None,
     bias_tensor: Optional[torch.Tensor] = None,
+    alpha_b_tensor: Optional[torch.Tensor] = None,
     # Discrete mode:
     b_ptrs: Optional[torch.Tensor] = None,
     sfb_ptrs: Optional[torch.Tensor] = None,
@@ -1377,6 +1427,8 @@ def grouped_gemm_glu_wrapper_sm100(
         b_tensor: (Dense) Weight B tensor (n, k, l)
         sfb_tensor: (Dense) Scale factor B
         bias_tensor: Optional bias tensor with shape (n, l) and stride (1, n)
+        alpha_b_tensor: Optional per-N fp32 alpha ``(n, l)`` stride ``(1, n)``;
+            enables ``ACC *= α_a[m] * α_b[n]`` in the epilogue
         b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         n: (Discrete) B weight N dimension (full N before GLU split)
@@ -1452,6 +1504,8 @@ def grouped_gemm_glu_wrapper_sm100(
         n_full, _, l = b_tensor.shape
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_full, l):
             raise ValueError(f"bias_tensor must have shape {(n_full, l)}, got {tuple(bias_tensor.shape)}")
+        if alpha_b_tensor is not None and tuple(alpha_b_tensor.shape) != (n_full, l):
+            raise ValueError(f"alpha_b_tensor must have shape {(n_full, l)}, got {tuple(alpha_b_tensor.shape)}")
     else:
         weight_mode = MoEWeightMode.DISCRETE
         _require_pointer_tensor(b_ptrs, "b_ptrs")
@@ -1465,6 +1519,10 @@ def grouped_gemm_glu_wrapper_sm100(
         l = num_experts
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_full, num_experts):
             raise ValueError(f"bias_tensor must have shape {(n_full, num_experts)}, got {tuple(bias_tensor.shape)}")
+        if alpha_b_tensor is not None and tuple(alpha_b_tensor.shape) != (n_full, num_experts):
+            raise ValueError(
+                f"alpha_b_tensor must have shape {(n_full, num_experts)}, got {tuple(alpha_b_tensor.shape)}"
+            )
 
     n_out = n_full // 2
 
@@ -1568,6 +1626,7 @@ def grouped_gemm_glu_wrapper_sm100(
                 else (dynamic_tensor_signature(alpha_tensor) if per_token_scale and use_full_dynamic else tensor_signature(alpha_tensor))
             ),
             *(dynamic_tensor_signature(bias_tensor) if use_full_dynamic else tensor_signature(bias_tensor)),
+            *(dynamic_tensor_signature(alpha_b_tensor) if use_full_dynamic else tensor_signature(alpha_b_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
             norm_const_tensor.dtype if norm_const_tensor is not None else None,
@@ -1603,6 +1662,7 @@ def grouped_gemm_glu_wrapper_sm100(
             *dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,)),
             *(dynamic_m_tensor_signature(alpha_tensor, (1, 1)) if per_token_scale else tensor_signature(alpha_tensor)),
             *tensor_signature(bias_tensor),
+            *tensor_signature(alpha_b_tensor),
             *tensor_signature(norm_const_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
             tuple(b_ptrs.shape),
@@ -1646,6 +1706,7 @@ def grouped_gemm_glu_wrapper_sm100(
                 sample_alpha=alpha_tensor,
                 sample_d_col=d_col_tensor,
                 sample_bias=bias_tensor,
+                sample_alpha_b=alpha_b_tensor,
                 sample_b=b_tensor,
                 sample_sfb=sfb_tensor,
                 sample_sfd_row=sfd_row_tensor,
@@ -1674,6 +1735,7 @@ def grouped_gemm_glu_wrapper_sm100(
                 sample_alpha=alpha_tensor,
                 sample_d_col=d_col_tensor,
                 sample_bias=bias_tensor,
+                sample_alpha_b=alpha_b_tensor,
                 num_experts=num_experts,
                 b_shape=b_shape,
                 b_dtype=b_dtype,
@@ -1707,6 +1769,7 @@ def grouped_gemm_glu_wrapper_sm100(
             c_tensor=c_tensor_out,
             d_tensor=d_tensor,
             bias_tensor=bias_tensor,
+            alpha_b_tensor=alpha_b_tensor,
             sfa_tensor=sfa_tensor,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
@@ -1735,6 +1798,7 @@ def grouped_gemm_glu_wrapper_sm100(
             b_ptrs=b_ptrs,
             sfb_ptrs=sfb_ptrs,
             bias_tensor=bias_tensor,
+            alpha_b_tensor=alpha_b_tensor,
             d_col_tensor=d_col_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,

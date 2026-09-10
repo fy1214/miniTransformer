@@ -53,7 +53,6 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects.nvvm import ReduxKind
 from cutlass.cute.typing import Float32, Int32, AddressSpace
 from .moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -71,6 +70,7 @@ from .moe_sched_extension import (
     ContiguousAndConsistentGroupedGemmSchedExtension,
 )
 from .moe_kernel_helpers import (
+    ReduxKind,
     fmin,
     fmax,
     warp_redux_sync,
@@ -292,6 +292,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
         enable_bias: bool = False,
+        enable_alpha_b: bool = False,
         per_token_scale: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
@@ -349,6 +350,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         self.enable_bias = enable_bias
+        # When True, epilogue applies ACC[m,n] *= α_a[m] * α_b[n] with
+        # α_b shaped (N, E) like bias. When False, only α_a is used.
+        self.enable_alpha_b = enable_alpha_b
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
@@ -413,6 +417,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         # indexed with the same ``mPosition`` as ``prob``. When False, they
         # stay per-expert: alpha (E,) and amax (E, 1).
         self.per_token_scale = per_token_scale
+        # ``alpha_b`` is independent of per_token_scale: always (N, E) fp32.
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -751,6 +756,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         alpha: cute.Tensor,
         prob: cute.Tensor,
         bias: Optional[cute.Tensor],
+        alpha_b: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -1101,6 +1107,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             padded_offsets,
             alpha,
             bias,
+            alpha_b,
             prob,
             workspace_ptr,  # Contains per-expert B/SFB TMA descriptors
             self.cluster_layout_vmnk,
@@ -1605,6 +1612,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         mBias_nl: Optional[cute.Tensor],
+        mAlphaB_nl: Optional[cute.Tensor],
         prob: cute.Tensor,
         workspace_ptr,  # Pointer to TMA descriptor workspace (from desc_init_kernel)
         cluster_layout_vmnk: cute.Layout,
@@ -2515,6 +2523,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 tTR_rBias_gate = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), self.bias_dtype)
                 tTR_rBias_up = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), self.bias_dtype)
 
+            if cutlass.const_expr(self.enable_alpha_b):
+                # α_b (N, L) tiled like bias; epi threads read gmem directly.
+                gAlphaB_nl = cute.local_tile(mAlphaB_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
+                tTR_rAlphaB_gate = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), cutlass.Float32)
+                tTR_rAlphaB_up = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), cutlass.Float32)
+
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 # sInfo format: (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
@@ -2541,6 +2555,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                     bias_pipeline.consumer_wait(bias_consumer_state)
                     sBias_stage = sBias[(None, bias_consumer_state.index)]
                     sBias_subtiles = cute.flat_divide(sBias_stage, cute.make_layout(2 * self.epi_tile[1]))
+
+                if cutlass.const_expr(self.enable_alpha_b):
+                    gAlphaB_tile = gAlphaB_nl[(None, epi_work_tile_info.tile_n_idx, expert_idx)]
+                    gAlphaB_subtiles = cute.flat_divide(gAlphaB_tile, cute.make_layout(2 * self.epi_tile[1]))
 
                 # Get per-expert C/D/D_col tensors via extension
                 real_c, _ = epi_ext.get_gmem_tensor("c", mC_mnl, padded_offsets, epi_work_tile_info)
@@ -2666,8 +2684,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             acc_consumer_state.advance()
 
                     #
-                    # Apply alpha (+ bias if enabled)
+                    # Apply alpha (+ α_b[n] if enabled) (+ bias if enabled)
+                    # Scale: ACC *= α_a[m] * α_b[n]  (α_b defaults to 1)
                     #
+                    if cutlass.const_expr(self.enable_alpha_b):
+                        gAlphaB_sub = gAlphaB_subtiles[(None, real_subtile_idx)]
+                        for i in cutlass.range_constexpr(self.epi_tile[1]):
+                            tTR_rAlphaB_gate[i] = gAlphaB_sub[i]
+                            tTR_rAlphaB_up[i] = gAlphaB_sub[self.epi_tile[1] + i]
+
                     if cutlass.const_expr(self.enable_bias):
                         sBias_sub = sBias_subtiles[(None, real_subtile_idx)]
                         for i in cutlass.range_constexpr(self.epi_tile[1]):
@@ -2678,28 +2703,44 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
+                                if cutlass.const_expr(self.enable_alpha_b):
+                                    scale_g0 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i])
+                                    scale_g1 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i + 1])
+                                    scale_u0 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i])
+                                    scale_u1 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i + 1])
+                                else:
+                                    scale_g0 = cutlass.Float32(alpha_val)
+                                    scale_g1 = cutlass.Float32(alpha_val)
+                                    scale_u0 = cutlass.Float32(alpha_val)
+                                    scale_u1 = cutlass.Float32(alpha_val)
                                 bias_gate_f32_0 = bias_vec_gate[i].to(cutlass.Float32)
                                 bias_gate_f32_1 = bias_vec_gate[i + 1].to(cutlass.Float32)
                                 bias_up_f32_0 = bias_vec_up[i].to(cutlass.Float32)
                                 bias_up_f32_1 = bias_vec_up[i + 1].to(cutlass.Float32)
                                 tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.fma_packed_f32x2(
                                     (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (scale_g0, scale_g1),
                                     (bias_gate_f32_0, bias_gate_f32_1),
                                     rnd="rn",
                                     ftz=False,
                                 )
                                 tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.fma_packed_f32x2(
                                     (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (scale_u0, scale_u1),
                                     (bias_up_f32_0, bias_up_f32_1),
                                     rnd="rn",
                                     ftz=False,
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
-                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val) + bias_vec_gate[i].to(cutlass.Float32)
-                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
+                                if cutlass.const_expr(self.enable_alpha_b):
+                                    scale_g = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i])
+                                    scale_u = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i])
+                                else:
+                                    scale_g = cutlass.Float32(alpha_val)
+                                    scale_u = cutlass.Float32(alpha_val)
+                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * scale_g + bias_vec_gate[i].to(cutlass.Float32)
+                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * scale_u + bias_vec_up[i].to(cutlass.Float32)
 
                         if subtile_idx == subtile_cnt - 2:
                             bias_pipeline.consumer_release(bias_consumer_state)
@@ -2707,22 +2748,38 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                     else:
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_gate), 2):
+                                if cutlass.const_expr(self.enable_alpha_b):
+                                    scale_g0 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i])
+                                    scale_g1 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i + 1])
+                                    scale_u0 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i])
+                                    scale_u1 = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i + 1])
+                                else:
+                                    scale_g0 = cutlass.Float32(alpha_val)
+                                    scale_g1 = cutlass.Float32(alpha_val)
+                                    scale_u0 = cutlass.Float32(alpha_val)
+                                    scale_u1 = cutlass.Float32(alpha_val)
                                 tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1] = cute.arch.mul_packed_f32x2(
                                     (tTR_rAcc_gate[i], tTR_rAcc_gate[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (scale_g0, scale_g1),
                                     rnd="rn",
                                     ftz=False,
                                 )
                                 tTR_rAcc_up[i], tTR_rAcc_up[i + 1] = cute.arch.mul_packed_f32x2(
                                     (tTR_rAcc_up[i], tTR_rAcc_up[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (scale_u0, scale_u1),
                                     rnd="rn",
                                     ftz=False,
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
-                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(alpha_val)
-                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val)
+                                if cutlass.const_expr(self.enable_alpha_b):
+                                    scale_g = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_gate[i])
+                                    scale_u = cutlass.Float32(alpha_val) * cutlass.Float32(tTR_rAlphaB_up[i])
+                                else:
+                                    scale_g = cutlass.Float32(alpha_val)
+                                    scale_u = cutlass.Float32(alpha_val)
+                                tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * scale_g
+                                tTR_rAcc_up[i] = tTR_rAcc_up[i] * scale_u
 
                     #
                     # Store to C tensor

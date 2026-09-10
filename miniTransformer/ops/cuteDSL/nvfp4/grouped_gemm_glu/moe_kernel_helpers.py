@@ -56,6 +56,12 @@ from cutlass.cute.typing import Float32, Int32, BFloat16, AddressSpace
 from cutlass._mlir.dialects import math, nvvm, llvm, vector, arith
 from .moe_persistent_scheduler import MoESchedulerParams
 
+# nvidia-cutlass-dsl 4.6+ renamed ReduxKind -> ReductionKind
+try:
+    from cutlass._mlir.dialects.nvvm import ReduxKind
+except ImportError:  # pragma: no cover
+    from cutlass._mlir.dialects.nvvm import ReductionKind as ReduxKind
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1046,8 +1052,6 @@ def quant_sfd_col(
     d_dtype,
     use_fp8_ptx_cvt,
 ):
-    from cutlass._mlir.dialects.nvvm import ReduxKind
-
     tTR_rAcc_frg = cute.logical_divide(src, cute.make_layout(sf_vec_size))
     acc_frg = tTR_rAcc_frg.load()
     abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())

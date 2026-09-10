@@ -175,8 +175,8 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("b", expert_idx))
             return (real, desc)
 
-        elif cutlass.const_expr(tensor_name == "bias"):
-            # Bias: (N, L) → domain_offset L by expert_idx, global desc
+        elif cutlass.const_expr(tensor_name in ("bias", "alpha_b")):
+            # Bias / α_b: (N, L) → domain_offset L by expert_idx, global desc
             real = cute.domain_offset((0, expert_idx), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
@@ -298,8 +298,8 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "bias"):
-            # Bias: (N, L) → domain_offset L by expert_idx, global desc
+        elif cutlass.const_expr(tensor_name in ("bias", "alpha_b")):
+            # Bias / α_b: (N, L) → domain_offset L by expert_idx, global desc
             real = cute.domain_offset((0, expert_idx), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)

@@ -1,8 +1,8 @@
 """NVFP4 per-token QuantizeOp (TE PR #3045).
 
 Forward:
-  - ``tex.nvfp4_per_token_group_quantize_bulk`` (rowwise act / weight)
-  - ``tex.nvfp4_cutlass_grouped_per_token_gemm`` (TN, plain tensor lists)
+  - TE ``nvfp4_per_token_group_quantize_bulk[_dense]`` (rowwise act / weight)
+  - TE ``nvfp4_cutlass_grouped_per_token_gemm[_dense]`` (TN)
 
 Backward:
   - MXFP8 ``split_quantize`` + TE ``general_grouped_gemm``
@@ -11,7 +11,8 @@ Backward:
 from __future__ import annotations
 
 import inspect
-from typing import List, Optional, Tuple, Union
+import os
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.profiler import record_function
@@ -25,25 +26,50 @@ import transformer_engine.pytorch.cpp_extensions as tex
 from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor, QuantizedTensorStorage
 
-_NVFP4_QUANTIZER_PARAMS = inspect.signature(NVFP4Quantizer.__init__).parameters
-if "per_token" not in _NVFP4_QUANTIZER_PARAMS:
+_NVFP4_QUANTIZER_INIT_PARAMS = inspect.signature(NVFP4Quantizer.__init__).parameters
+if "per_token" not in _NVFP4_QUANTIZER_INIT_PARAMS:
     raise RuntimeError(
         "Nvfp4TiledQuantizePertokenOp requires Transformer Engine PR #3045 "
         "(NVFP4Quantizer(per_token=True))."
     )
-_HAS_PER_TOKEN_WEIGHT_2D = "per_token_weight_2d" in _NVFP4_QUANTIZER_PARAMS
-_HAS_BULK = hasattr(tex, "nvfp4_per_token_group_quantize_bulk") and hasattr(
+
+_SUPPORTS_PER_TOKEN_WEIGHT_2D = "per_token_weight_2d" in _NVFP4_QUANTIZER_INIT_PARAMS
+_HAS_LIST_QUANT_AND_GEMM = hasattr(tex, "nvfp4_per_token_group_quantize_bulk") and hasattr(
     tex, "nvfp4_cutlass_grouped_per_token_gemm"
 )
+_HAS_DENSE_QUANT = hasattr(tex, "nvfp4_per_token_group_quantize_bulk_dense")
+_HAS_DENSE_GEMM = hasattr(tex, "nvfp4_cutlass_grouped_per_token_gemm_dense")
 
 
-def _make_per_token_quantizer(
+def is_dense_nvfp4_path_enabled() -> bool:
+    """Whether to use dense (concatenated) TE packaging APIs.
+
+    Controlled by ``MINITE_NVFP4_PATH``:
+      - ``auto`` (default): dense when TE exposes ``*_dense`` bindings
+      - ``dense``: require dense APIs (raises if missing)
+      - ``list`` / ``legacy``: force per-expert list packaging
+    """
+    mode = os.environ.get("MINITE_NVFP4_PATH", "auto").strip().lower()
+    if mode in ("list", "legacy", "0", "false", "off"):
+        return False
+    if mode in ("dense", "1", "true", "on"):
+        if not (_HAS_DENSE_QUANT and _HAS_DENSE_GEMM):
+            raise RuntimeError(
+                "MINITE_NVFP4_PATH=dense but TE dense APIs are missing "
+                "(nvfp4_per_token_group_quantize_bulk_dense / "
+                "nvfp4_cutlass_grouped_per_token_gemm_dense)."
+            )
+        return True
+    return bool(_HAS_DENSE_QUANT and _HAS_DENSE_GEMM)
+
+
+def make_nvfp4_per_token_quantizer(
     *,
     rowwise: bool,
     columnwise: bool,
     is_weight: bool = False,
 ) -> NVFP4Quantizer:
-    kwargs = dict(
+    kwargs: Dict[str, Any] = dict(
         rowwise=rowwise,
         columnwise=columnwise,
         with_amax_reduction=False,
@@ -54,99 +80,168 @@ def _make_per_token_quantizer(
         stochastic_rounding=False,
         per_token=True,
     )
-    if _HAS_PER_TOKEN_WEIGHT_2D:
+    if _SUPPORTS_PER_TOKEN_WEIGHT_2D:
         kwargs["per_token_weight_2d"] = bool(is_weight)
     elif is_weight:
         raise RuntimeError(
             "NVFP4Quantizer is missing per_token_weight_2d; need a newer TE #3045 build."
         )
-    q = NVFP4Quantizer(**kwargs)
-    q.optimize_for_gemm = True
-    return q
+    quantizer = NVFP4Quantizer(**kwargs)
+    quantizer.optimize_for_gemm = True
+    return quantizer
 
 
-def _bulk_rowwise(
+def quantize_nvfp4_rowwise_per_group_list(
     x: torch.Tensor,
     m_splits: List[int],
     *,
-    row_amax: Optional[torch.Tensor] = None,
+    precomputed_row_amax: Optional[torch.Tensor] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-    if not _HAS_BULK:
+    """Per-expert list packaging via ``nvfp4_per_token_group_quantize_bulk``."""
+    if not _HAS_LIST_QUANT_AND_GEMM:
         raise RuntimeError(
             "Nvfp4TiledQuantizePertokenOp forward requires "
             "tex.nvfp4_per_token_group_quantize_bulk and "
             "tex.nvfp4_cutlass_grouped_per_token_gemm."
         )
-    q_row, s_row, amax_row, _, _, _ = tex.nvfp4_per_token_group_quantize_bulk(
+    quantized_rows, scale_factors, row_amaxes, _, _, _ = tex.nvfp4_per_token_group_quantize_bulk(
         x.contiguous(),
         [int(m) for m in m_splits],
-        True,
-        False,
+        True,  # rowwise
+        False,  # columnwise
         with_swizzle=True,
-        do_amax=row_amax is None,
-        row_amax=row_amax,
+        do_amax=precomputed_row_amax is None,
+        row_amax=precomputed_row_amax,
     )
-    return q_row, s_row, amax_row
+    return quantized_rows, scale_factors, row_amaxes
 
 
-def _is_plain_tensor_list(tensors: List[torch.Tensor]) -> bool:
+def quantize_nvfp4_rowwise_per_group_dense(
+    x: torch.Tensor,
+    m_splits: List[int],
+    *,
+    precomputed_row_amax: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense concatenated packaging via ``nvfp4_per_token_group_quantize_bulk_dense``."""
+    if not _HAS_DENSE_QUANT:
+        raise RuntimeError("tex.nvfp4_per_token_group_quantize_bulk_dense is required")
+    quantized_rows, scale_factors, row_amaxes, _, _, _ = (
+        tex.nvfp4_per_token_group_quantize_bulk_dense(
+            x.contiguous(),
+            [int(m) for m in m_splits],
+            True,
+            False,
+            with_swizzle=True,
+            do_amax=precomputed_row_amax is None,
+            row_amax=precomputed_row_amax,
+        )
+    )
+    return quantized_rows, scale_factors, row_amaxes
+
+
+def pack_nvfp4_rowwise_group_result(
+    x: torch.Tensor,
+    m_splits: List[int],
+    *,
+    precomputed_row_amax: Optional[torch.Tensor] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], Optional[Dict[str, Any]]]:
+    """Shared dense/list packaging used by activation and weight group_quantize."""
+    if is_dense_nvfp4_path_enabled():
+        packed_data, packed_scale, packed_tensor_scale = quantize_nvfp4_rowwise_per_group_dense(
+            x, m_splits, precomputed_row_amax=precomputed_row_amax
+        )
+        data = [packed_data]
+        scale = [packed_scale]
+        tensor_scale = [packed_tensor_scale]
+        packed_extra: Dict[str, Any] = {"dense_rowwise": True, "m_splits": list(m_splits)}
+        if extra:
+            packed_extra.update(extra)
+        return data, scale, tensor_scale, packed_extra
+
+    data, scale, tensor_scale = quantize_nvfp4_rowwise_per_group_list(
+        x, m_splits, precomputed_row_amax=precomputed_row_amax
+    )
+    return data, scale, tensor_scale, extra
+
+
+def _is_plain_torch_tensor_list(tensors: List[torch.Tensor]) -> bool:
     if not tensors:
         return False
-    t0 = tensors[0]
-    return isinstance(t0, torch.Tensor) and not isinstance(
-        t0, (QuantizedTensor, QuantizedTensorStorage)
+    first = tensors[0]
+    return isinstance(first, torch.Tensor) and not isinstance(
+        first, (QuantizedTensor, QuantizedTensorStorage)
     )
 
 
-def _out_n_from_weight(wgt_data: List[torch.Tensor], m_splits: List[int]) -> int:
-    for g, m in enumerate(m_splits):
-        if m > 0:
-            return wgt_data[g].shape[0]
-    return wgt_data[0].shape[0]
+def _output_n_from_weight_list(
+    weight_data: List[torch.Tensor], m_splits: List[int]
+) -> int:
+    for expert_idx, num_tokens in enumerate(m_splits):
+        if num_tokens > 0:
+            return weight_data[expert_idx].shape[0]
+    return weight_data[0].shape[0]
 
 
-def _direct_grouped_gemm_tn(
-    act_data: List[torch.Tensor],
-    wgt_data: List[torch.Tensor],
-    act_sf: List[torch.Tensor],
-    wgt_sf: List[torch.Tensor],
-    act_alpha: List[torch.Tensor],
-    wgt_alpha: List[torch.Tensor],
+def _allocate_contiguous_output(
+    out: Union[torch.Tensor, List[torch.Tensor], None],
+    *,
+    total_tokens: int,
+    n_cols: int,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if out is None or (isinstance(out, list) and len(out) == 0):
+        return torch.empty([total_tokens, n_cols], dtype=out_dtype, device=device)
+    if isinstance(out, list):
+        return out[0]
+    return out
+
+
+def nvfp4_grouped_gemm_tn_list(
+    activation_data: List[torch.Tensor],
+    weight_data: List[torch.Tensor],
+    activation_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    activation_tensor_scale: List[torch.Tensor],
+    weight_tensor_scale: List[torch.Tensor],
     m_splits: List[int],
     out: torch.Tensor,
 ) -> torch.Tensor:
-    views: List[torch.Tensor] = []
-    start = 0
-    for size in m_splits:
-        views.append(out[start : start + size])
-        start += size
+    """TN grouped GEMM with per-expert list tensors."""
+    output_views: List[torch.Tensor] = []
+    row_offset = 0
+    for num_tokens in m_splits:
+        output_views.append(out[row_offset : row_offset + num_tokens])
+        row_offset += num_tokens
 
-    a_data, b_data, a_sf, b_sf = [], [], [], []
-    alpha_a, alpha_b, d = [], [], []
-    for g, m in enumerate(m_splits):
-        if m == 0:
-            if views[g].numel() > 0:
-                views[g].zero_()
+    a_data, b_data, a_scale, b_scale = [], [], [], []
+    a_tensor_scale, b_tensor_scale, d_views = [], [], []
+    for expert_idx, num_tokens in enumerate(m_splits):
+        if num_tokens == 0:
+            if output_views[expert_idx].numel() > 0:
+                output_views[expert_idx].zero_()
             continue
-        ka, kb = act_data[g], wgt_data[g]
-        m_rows, n_cols = ka.shape[0], kb.shape[0]
-        a_data.append(ka)
-        b_data.append(kb)
-        a_sf.append(act_sf[g])
-        b_sf.append(wgt_sf[g])
-        alpha_a.append(act_alpha[g])
-        alpha_b.append(wgt_alpha[g])
-        d.append(views[g].view(m_rows, n_cols))
+        act = activation_data[expert_idx]
+        wgt = weight_data[expert_idx]
+        m_rows, n_cols = act.shape[0], wgt.shape[0]
+        a_data.append(act)
+        b_data.append(wgt)
+        a_scale.append(activation_scale[expert_idx])
+        b_scale.append(weight_scale[expert_idx])
+        a_tensor_scale.append(activation_tensor_scale[expert_idx])
+        b_tensor_scale.append(weight_tensor_scale[expert_idx])
+        d_views.append(output_views[expert_idx].view(m_rows, n_cols))
 
     if a_data:
         tex.nvfp4_cutlass_grouped_per_token_gemm(
             a_data,
             b_data,
-            a_sf,
-            b_sf,
-            alpha_a,
-            alpha_b,
-            d,
+            a_scale,
+            b_scale,
+            a_tensor_scale,
+            b_tensor_scale,
+            d_views,
             True,
             True,
             False,
@@ -156,9 +251,55 @@ def _direct_grouped_gemm_tn(
     return out
 
 
-def _te_grouped_gemm(
-    A: List[torch.Tensor],
-    B: List[torch.Tensor],
+def nvfp4_grouped_gemm_tn_dense(
+    activation_data: torch.Tensor,
+    weight_data: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    activation_tensor_scale: torch.Tensor,
+    weight_tensor_scale: torch.Tensor,
+    m_splits: List[int],
+    n_cols: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """TN grouped GEMM with dense concatenated tensors.
+
+    Prefix offset tables are omitted so TE fills them on device from
+    ``m_splits`` (uniform N from packed B/D, ``k_sf=K/16``).
+    """
+    positive_splits = [int(m) for m in m_splits if int(m) > 0]
+    if not positive_splits:
+        out.zero_()
+        return out
+    if any(int(m) == 0 for m in m_splits):
+        raise RuntimeError("dense grouped GEMM path requires all m_splits > 0")
+    if int(out.size(1)) != int(n_cols):
+        raise RuntimeError(
+            f"dense grouped GEMM out N={out.size(1)} != n_cols={n_cols}"
+        )
+
+    tex.nvfp4_cutlass_grouped_per_token_gemm_dense(
+        activation_data,
+        weight_data,
+        activation_scale.reshape(-1) if activation_scale.dim() > 1 else activation_scale,
+        weight_scale.reshape(-1) if weight_scale.dim() > 1 else weight_scale,
+        activation_tensor_scale,
+        weight_tensor_scale,
+        out,
+        None,
+        None,
+        None,
+        None,
+        positive_splits,
+        False,
+        "default",
+    )
+    return out
+
+
+def te_general_grouped_gemm(
+    lhs: List[torch.Tensor],
+    rhs: List[torch.Tensor],
     out,
     *,
     layout: str,
@@ -169,10 +310,11 @@ def _te_grouped_gemm(
     bias,
     use_bias: bool,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    """Call TE ``general_grouped_gemm`` with miniTE (lhs,rhs) → TE (A=rhs, B=lhs) swap."""
     with record_function(f"gg_te_grouped_gemm_{layout}_grad{grad}"):
         general_grouped_gemm(
-            A=B,
-            B=A,
+            A=rhs,
+            B=lhs,
             out=out,
             out_dtype=out_dtype,
             layout=layout,
@@ -193,20 +335,33 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
     def __init__(self):
         super().__init__()
         self.should_update_quantize_weights = True
-        self._cached_num_gemms: int = 0
-        self._w_quantizers_fp8: List = []
-        self._x_quantizers_fp8: List = []
-        self._dy_quantizers: List = []
+        self._cached_num_experts: int = 0
+        self._weight_mxfp8_columnwise_quantizers: List[MXFP8Quantizer] = []
+        self._activation_mxfp8_columnwise_quantizers: List[MXFP8Quantizer] = []
+        self._grad_output_mxfp8_quantizers: List[MXFP8Quantizer] = []
 
-    def _refresh_cache(self, num_gemms: int) -> None:
-        if self._cached_num_gemms == num_gemms and len(self._dy_quantizers) == num_gemms:
+    def _ensure_mxfp8_backward_quantizers(self, num_experts: int) -> None:
+        if (
+            self._cached_num_experts == num_experts
+            and len(self._grad_output_mxfp8_quantizers) == num_experts
+        ):
             return
-        self._cached_num_gemms = num_gemms
-        fp8_col = dict(rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
-        fp8_both = dict(rowwise=True, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3)
-        self._w_quantizers_fp8 = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
-        self._x_quantizers_fp8 = [MXFP8Quantizer(**fp8_col) for _ in range(num_gemms)]
-        self._dy_quantizers = [MXFP8Quantizer(**fp8_both) for _ in range(num_gemms)]
+        self._cached_num_experts = num_experts
+        columnwise_only = dict(
+            rowwise=False, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3
+        )
+        rowwise_and_columnwise = dict(
+            rowwise=True, columnwise=True, fp8_dtype=tex.DType.kFloat8E4M3
+        )
+        self._weight_mxfp8_columnwise_quantizers = [
+            MXFP8Quantizer(**columnwise_only) for _ in range(num_experts)
+        ]
+        self._activation_mxfp8_columnwise_quantizers = [
+            MXFP8Quantizer(**columnwise_only) for _ in range(num_experts)
+        ]
+        self._grad_output_mxfp8_quantizers = [
+            MXFP8Quantizer(**rowwise_and_columnwise) for _ in range(num_experts)
+        ]
 
     @property
     def supports_allgather(self) -> bool:
@@ -224,14 +379,18 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
         del reduce_amax, tp_group, input_meta
         assert x.dtype in utils.HIGH_PRECISION_FLOAT_DTYPES
         is_weight = qparams.param_type == qparams.param_type.WEIGHT
-        q = _make_per_token_quantizer(
+        quantizer = make_nvfp4_per_token_quantizer(
             rowwise=True,
             columnwise=True if is_weight else return_transpose,
             is_weight=is_weight,
         )
-        t = q.make_empty(x.shape, dtype=x.dtype, device=x.device, requires_grad=False)
-        t = q.update_quantized(x, t)
-        return quantization.QuantizeResult(data=t, scale=t, data_t=t, scale_t=t)
+        quantized = quantizer.make_empty(
+            x.shape, dtype=x.dtype, device=x.device, requires_grad=False
+        )
+        quantized = quantizer.update_quantized(x, quantized)
+        return quantization.QuantizeResult(
+            data=quantized, scale=quantized, data_t=quantized, scale_t=quantized
+        )
 
     def qgemm(
         self,
@@ -252,7 +411,16 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
         qparams_w: Optional[quantization.QParams] = None,
         custom_gemm_backend: str = "cutlass",
     ) -> torch.Tensor:
-        del m_params, sx, sw, global_amax_qx, global_amax_qw, qparams_x, qparams_w, custom_gemm_backend
+        del (
+            m_params,
+            sx,
+            sw,
+            global_amax_qx,
+            global_amax_qw,
+            qparams_x,
+            qparams_w,
+            custom_gemm_backend,
+        )
         return general_gemm(
             A=qw,
             B=qx,
@@ -286,28 +454,44 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
         row_amax: Optional[torch.Tensor] = None,
     ) -> GroupQuantizeResult:
         del reduce_amax, tp_group, input_meta
-        num_gemms = len(m_splits)
-        self._refresh_cache(num_gemms)
+        assert m_splits is not None
+        num_experts = len(m_splits)
+        self._ensure_mxfp8_backward_quantizers(num_experts)
 
+        # Grad output (dy): MXFP8 for dgrad/wgrad.
         if qparams.param_type == qparams.param_type.Y:
             with record_function("sq_dy_split_quantize_fp8"):
-                mx = tex.split_quantize(x, m_splits, self._dy_quantizers)
+                mxfp8_dy = tex.split_quantize(x, m_splits, self._grad_output_mxfp8_quantizers)
             return GroupQuantizeResult(
-                data=mx, scale=mx, data_t=mx, scale_t=mx,
-                tensor_scale=mx, tensor_scale_t=mx,
+                data=mxfp8_dy,
+                scale=mxfp8_dy,
+                data_t=mxfp8_dy,
+                scale_t=mxfp8_dy,
+                tensor_scale=mxfp8_dy,
+                tensor_scale_t=mxfp8_dy,
             )
 
+        # Weight: NVFP4 rowwise for forward; MXFP8 columnwise for backward.
         if qparams.param_type == qparams.param_type.WEIGHT:
-            n, k = x.shape[1], x.shape[2]
-            w_splits = [n] * num_gemms
-            with record_function("sq_w_nvfp4_bulk"):
-                data, scale, tensor_scale = _bulk_rowwise(
-                    x.reshape(-1, k), w_splits,
+            out_features, in_features = x.shape[1], x.shape[2]
+            weight_row_splits = [out_features] * num_experts
+            weight_2d = x.reshape(-1, in_features)
+            with record_function(
+                "sq_w_nvfp4_bulk_dense"
+                if is_dense_nvfp4_path_enabled()
+                else "sq_w_nvfp4_bulk"
+            ):
+                data, scale, tensor_scale, extra = pack_nvfp4_rowwise_group_result(
+                    weight_2d,
+                    weight_row_splits,
+                    extra={"n": out_features, "k": in_features},
                 )
             if return_transpose:
                 with record_function("sq_w_split_quantize_fp8"):
                     data_t = tex.split_quantize(
-                        x.reshape(-1, k), w_splits, self._w_quantizers_fp8,
+                        weight_2d,
+                        weight_row_splits,
+                        self._weight_mxfp8_columnwise_quantizers,
                     )
             else:
                 data_t = []
@@ -318,15 +502,22 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
                 data_t=data_t,
                 scale_t=data_t,
                 tensor_scale_t=data_t,
-                extra_info={"n": n, "k": k},
+                extra_info=extra,
             )
 
-        skip_k1 = row_amax if row_amax is not None else None
-        with record_function("sq_x_nvfp4_bulk"):
-            data, scale, tensor_scale = _bulk_rowwise(x, m_splits, row_amax=skip_k1)
+        # Activation X: NVFP4 rowwise for forward; MXFP8 columnwise for backward.
+        # ``row_amax`` skips the K1 amax pass when upstream already fused it.
+        with record_function(
+            "sq_x_nvfp4_bulk_dense" if is_dense_nvfp4_path_enabled() else "sq_x_nvfp4_bulk"
+        ):
+            data, scale, tensor_scale, extra = pack_nvfp4_rowwise_group_result(
+                x, m_splits, precomputed_row_amax=row_amax
+            )
         if return_transpose:
             with record_function("sq_x_split_quantize_fp8"):
-                data_t = tex.split_quantize(x, m_splits, self._x_quantizers_fp8)
+                data_t = tex.split_quantize(
+                    x, m_splits, self._activation_mxfp8_columnwise_quantizers
+                )
         else:
             data_t = []
         return GroupQuantizeResult(
@@ -336,6 +527,54 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
             data_t=data_t,
             scale_t=data_t,
             tensor_scale_t=data_t,
+            extra_info=extra,
+        )
+
+    def _can_use_dense_nvfp4_forward_gemm(
+        self,
+        *,
+        grad: bool,
+        layout: str,
+        gelu: bool,
+        accumulate: bool,
+        use_bias: bool,
+        extra_info_A: Optional[dict],
+        extra_info_B: Optional[dict],
+    ) -> bool:
+        return (
+            not grad
+            and layout == "TN"
+            and not gelu
+            and not accumulate
+            and not use_bias
+            and _HAS_DENSE_GEMM
+            and isinstance(extra_info_A, dict)
+            and isinstance(extra_info_B, dict)
+            and bool(extra_info_A.get("dense_rowwise"))
+            and bool(extra_info_B.get("dense_rowwise"))
+        )
+
+    def _can_use_list_nvfp4_forward_gemm(
+        self,
+        *,
+        grad: bool,
+        layout: str,
+        gelu: bool,
+        accumulate: bool,
+        use_bias: bool,
+        activation_data: List[torch.Tensor],
+        weight_data: List[torch.Tensor],
+        extra_info_A: Optional[dict],
+    ) -> bool:
+        return (
+            not grad
+            and layout == "TN"
+            and not gelu
+            and not accumulate
+            and not use_bias
+            and _is_plain_torch_tensor_list(activation_data)
+            and _is_plain_torch_tensor_list(weight_data)
+            and not (isinstance(extra_info_A, dict) and extra_info_A.get("dense_rowwise"))
         )
 
     def grouped_gemm(
@@ -360,34 +599,70 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
         extra_info_A: Optional[dict] = None,
         extra_info_B: Optional[dict] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        del extra_info_A, extra_info_B, qparams_x, qparams_w
+        del qparams_x, qparams_w
+        assert m_splits is not None
 
-        if (
-            not grad
-            and layout == "TN"
-            and not gelu
-            and not accumulate
-            and not use_bias
-            and _is_plain_tensor_list(A)
-            and _is_plain_tensor_list(B)
+        # Forward TN: dense concatenated NVFP4 path.
+        if self._can_use_dense_nvfp4_forward_gemm(
+            grad=grad,
+            layout=layout,
+            gelu=gelu,
+            accumulate=accumulate,
+            use_bias=use_bias,
+            extra_info_A=extra_info_A,
+            extra_info_B=extra_info_B,
         ):
-            if out is None or (isinstance(out, list) and len(out) == 0):
-                n_cols = _out_n_from_weight(B, m_splits)
-                out_t = torch.empty(
-                    [sum(m_splits), n_cols], dtype=out_dtype, device=B[0].device,
+            n_cols = int(
+                extra_info_B.get("n", B[0].shape[0] // max(len(m_splits), 1))
+            )
+            out_tensor = _allocate_contiguous_output(
+                out,
+                total_tokens=sum(m_splits),
+                n_cols=n_cols,
+                out_dtype=out_dtype,
+                device=B[0].device,
+            )
+            with record_function("grouped_gemm_nvfp4_direct_tn_dense"):
+                return nvfp4_grouped_gemm_tn_dense(
+                    A[0],
+                    B[0],
+                    sA[0],
+                    sB[0],
+                    global_amax_A[0],
+                    global_amax_B[0],
+                    m_splits,
+                    n_cols,
+                    out_tensor,
                 )
-            elif isinstance(out, list):
-                out_t = out[0]
-            else:
-                out_t = out
+
+        # Forward TN: per-expert list NVFP4 path.
+        if self._can_use_list_nvfp4_forward_gemm(
+            grad=grad,
+            layout=layout,
+            gelu=gelu,
+            accumulate=accumulate,
+            use_bias=use_bias,
+            activation_data=A,
+            weight_data=B,
+            extra_info_A=extra_info_A,
+        ):
+            n_cols = _output_n_from_weight_list(B, m_splits)
+            out_tensor = _allocate_contiguous_output(
+                out,
+                total_tokens=sum(m_splits),
+                n_cols=n_cols,
+                out_dtype=out_dtype,
+                device=B[0].device,
+            )
             with record_function("grouped_gemm_nvfp4_direct_tn"):
-                return _direct_grouped_gemm_tn(
-                    A, B, sA, sB, global_amax_A, global_amax_B, m_splits, out_t,
+                return nvfp4_grouped_gemm_tn_list(
+                    A, B, sA, sB, global_amax_A, global_amax_B, m_splits, out_tensor
                 )
 
-        a0 = A[0]
-        is_quantized = isinstance(a0, (QuantizedTensor, QuantizedTensorStorage))
+        first_lhs = A[0]
+        is_quantized = isinstance(first_lhs, (QuantizedTensor, QuantizedTensorStorage))
 
+        # Forward fallback: TE general_grouped_gemm on QuantizedTensor / plain tensors.
         if not grad:
             if is_quantized:
                 n_cols = B[0]._rowwise_data.size(0)
@@ -395,13 +670,25 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
             else:
                 n_cols = B[0].size(0)
                 device = B[0].device
-            out = [torch.empty([sum(m_splits), n_cols], dtype=out_dtype, device=device)]
-            return _te_grouped_gemm(
-                A, B, out,
-                layout=layout, m_splits=m_splits, out_dtype=out_dtype,
-                grad=False, accumulate=accumulate, bias=bias, use_bias=use_bias,
+            out = [
+                torch.empty(
+                    [sum(m_splits), n_cols], dtype=out_dtype, device=device
+                )
+            ]
+            return te_general_grouped_gemm(
+                A,
+                B,
+                out,
+                layout=layout,
+                m_splits=m_splits,
+                out_dtype=out_dtype,
+                grad=False,
+                accumulate=accumulate,
+                bias=bias,
+                use_bias=use_bias,
             )
 
+        # Backward: MXFP8 / BF16 tensors via TE general_grouped_gemm (NN dgrad, NT wgrad).
         del sA, sB, global_amax_A, global_amax_B
         if layout == "NN":
             if is_quantized:
@@ -410,7 +697,11 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
             else:
                 n_cols = B[0].size(1)
                 device = B[0].device
-            out = [torch.empty([sum(m_splits), n_cols], dtype=out_dtype, device=device)]
+            out = [
+                torch.empty(
+                    [sum(m_splits), n_cols], dtype=out_dtype, device=device
+                )
+            ]
         elif layout == "NT" and (out is None or (isinstance(out, list) and out[0] is None)):
             if is_quantized:
                 n_out = A[0]._columnwise_data.size(-1)
@@ -425,8 +716,15 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
                 for _ in range(len(m_splits))
             ]
 
-        return _te_grouped_gemm(
-            A, B, out,
-            layout=layout, m_splits=m_splits, out_dtype=out_dtype,
-            grad=True, accumulate=accumulate, bias=bias, use_bias=use_bias,
+        return te_general_grouped_gemm(
+            A,
+            B,
+            out,
+            layout=layout,
+            m_splits=m_splits,
+            out_dtype=out_dtype,
+            grad=True,
+            accumulate=accumulate,
+            bias=bias,
+            use_bias=use_bias,
         )

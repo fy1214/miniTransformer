@@ -1,0 +1,476 @@
+# miniTE image based on radixark/miles Dockerfile, with local patched repos:
+#   slime           -> https://github.com/fy1214/slime            branch b300-minite-patched
+#   Megatron        -> https://github.com/fy1214/Megatron-LM      branch b300-minite-patched
+#   sglang          -> https://github.com/fy1214/sglang           branch b300-minite-patched
+#   miniTransformer -> https://github.com/fy1214/miniTransformer  branch infix_main_op_pr#3045
+#                     (must include cutlass-dsl 4.6 ReduxKind compat for CuTeDSL)
+#   TransformerEngine -> fy1214/TransformerEngine @ feature/grouped-per-token-sf-swizzle
+#
+# Image hardening checklist:
+#   1) Pin sglang BASE by digest (default v0.5.12-cu130 below)
+#   2) Build flash_attn FA2 from source against that torch (not miles wheel)
+#   3) Pin nvidia-cutlass-dsl==4.6.2 (+ quack-kernels==0.6.4 for FA4 cute)
+#   4) Editable TE from your fork branch; NVTE_WITH_NCCL_EP=0; NVTE_CUDA_ARCHS=100
+#
+# ---------------------------------------------------------------------------
+# Pin the sglang BASE (torch comes from here; this Dockerfile does not reinstall
+# torch). Prefer a formal release + digest — never floating tags like `dev-cu13`
+# (Hub retargets them and torch/ABI drift silently).
+#
+# Prefer digest form (immutable):
+#   --build-arg SGLANG_IMAGE=lmsysorg/sglang@sha256:<digest>
+#
+# Default base (formal release):
+#   lmsysorg/sglang:v0.5.12-cu130
+#     @sha256:42194170546745092e74cd5f81ad32a7c6e944c7111fe7bf13588152277ff356
+#     torch 2.11.0+cu130  (flash_attn is built from source against this torch)
+#
+# Historical refs (override SGLANG_IMAGE only if you still need them):
+#   B200 1.0.9 nightly (torch 2.13.0+cu130):
+#     lmsysorg/sglang@sha256:51e576f02368480c055c7aadb67590d82b172e2392123ce4cf4cc8251b2d8caf
+#     (== nightly-dev-20260818-c0b6474b)
+#   B300 1.0.9 era (torch 2.10.0+cu128):
+#     was nightly-dev-20260511-aa7a9af1 — tag gone from Hub (404); need a mirror.
+#
+# Self-contained: this file has ZERO local COPY deps. Context can be empty.
+# Private miniTE clone still needs BuildKit secret (optional if repo is public):
+#   --secret id=gh_token,src=$HOME/.github_token
+#
+# Example builds:
+#   # B300 (sm_103)
+#   docker build -f patch/B300/dockerfile \
+#     --build-arg FLASHINFER_CUDA_ARCH_LIST=10.3 \
+#     --build-arg FLASH_ATTN_CUDA_ARCH_LIST=10.3 \
+#     --build-arg NVTE_CUDA_ARCHS=103 \
+#     -t fy121415/dev-cu13-minite-b300-1.0.x:latest .
+#
+#   # B200 (sm_100)
+#   docker build -f patch/B300/dockerfile \
+#     --secret id=gh_token,src=$HOME/.github_token \
+#     --build-arg FLASHINFER_CUDA_ARCH_LIST=10.0 \
+#     --build-arg FLASH_ATTN_CUDA_ARCH_LIST=10.0 \
+#     --build-arg NVTE_CUDA_ARCHS=100 \
+#     -t fy121415/dev-cu13-minite-b200-1.0.x:latest .
+#
+# arm64 example:
+#   --build-arg SGLANG_IMAGE=lmsysorg/sglang:v0.5.10-cu130 \
+#   --build-arg WHEELS_TAG=cu130-aarch64
+# ---------------------------------------------------------------------------
+
+# Full image ref: `repo:tag` OR `repo@sha256:…`. Digest form is required for
+# reproducible builds. Default = formal v0.5.12-cu130 (torch 2.11.0+cu130).
+ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:42194170546745092e74cd5f81ad32a7c6e944c7111fe7bf13588152277ff356
+FROM ${SGLANG_IMAGE} AS sglang
+
+# Repo ARGs are declared next to the RUN that uses them, so changing
+# miniTransformer / sglang / slime does not bust earlier wheel/TE layers.
+ARG ENABLE_CUDA_13=1
+
+# ======================================== Setup =============================================
+
+WORKDIR /root/
+
+# ======================================== Apt dependencies =============================================
+
+RUN apt update
+# ethtool for network diagnostics
+RUN apt install -y nvtop rsync dnsutils ethtool ccache
+
+# nccl-tests for diagnostics
+RUN git clone https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests && \
+    cd /tmp/nccl-tests && \
+    git checkout ae98985f5599617be94042f4aa3637d10014ce89 && \
+    make -j$(nproc) CUDA_HOME=/usr/local/cuda && \
+    cp /tmp/nccl-tests/build/*_perf /usr/local/bin/ && \
+    rm -rf /tmp/nccl-tests
+
+# ====================================== Download pre-built wheels ============================================
+
+ARG WHEELS_REPO=yueming-yuan/miles-wheels
+ARG WHEELS_TAG=cu130-x86_64
+
+# Only fetch wheels the later RUNs actually install. Downloading the full
+# release (~1.7GB) would stay in this layer even after `rm -rf /tmp/wheels`.
+RUN mkdir -p /tmp/wheels && \
+    curl -sL "https://api.github.com/repos/${WHEELS_REPO}/releases/tags/${WHEELS_TAG}" \
+    | python3 -c "import sys, json, subprocess, os; \
+keep = ('flash_attn_3-', 'apex-', 'fake_int4_quant_cuda-', 'sglang_router-', 'sgl-model-gateway-linux-', 'causal_conv1d-', 'mamba_ssm-'); \
+assets = [a for a in json.load(sys.stdin)['assets'] if a['name'].endswith(('.whl', '.tar.gz')) and a['name'].startswith(keep)]; \
+[subprocess.run(['curl', '--retry', '20', '--retry-delay', '5', '--retry-all-errors', '-fSL', '-o', '/tmp/wheels/' + a['name'], a['browser_download_url']], check=True) for a in assets]; \
+print('downloaded', [a['name'] for a in assets])" && \
+    ls -lh /tmp/wheels/
+
+# ====================================== Python dependencies ============================================
+
+# flash-attn: build from source against the base-image torch (ABI-safe).
+# Do NOT install the miles prebuilt flash_attn wheel — it is often compiled
+# against a different torch and breaks with undefined COW symbols.
+# Override tag / arches:
+#   --build-arg FLASH_ATTN_REF=v2.7.4.post1
+#   --build-arg FLASH_ATTN_CUDA_ARCH_LIST=10.0          # B200 only
+#   --build-arg FLASH_ATTN_CUDA_ARCH_LIST=10.3          # B300 only
+ARG FLASH_ATTN_REF=v2.7.4.post1
+ARG FLASH_ATTN_CUDA_ARCH_LIST=10.0;10.3
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.ccache \
+    set -eu; \
+    pip uninstall -y flash-attn flash_attn 2>/dev/null || true; \
+    rm -rf /tmp/flash-attention; \
+    git clone --depth 1 --branch "${FLASH_ATTN_REF}" \
+      https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention; \
+    cd /tmp/flash-attention; \
+    git submodule update --init csrc/cutlass; \
+    mkdir -p csrc/composable_kernel; \
+    printf '%s\n' \
+      'from pathlib import Path' \
+      'p = Path("setup.py")' \
+      'lines = []' \
+      'for line in p.read_text().splitlines(True):' \
+      '    if "composable_kernel" in line and ("submodule" in line or "subprocess" in line):' \
+      '        lines.append("# patched-out: " + line)' \
+      '    else:' \
+      '        lines.append(line)' \
+      'p.write_text("".join(lines))' \
+      'print("patched setup.py to skip composable_kernel submodule")' \
+      > /tmp/patch_flash_attn_setup.py && \
+    python3 /tmp/patch_flash_attn_setup.py && \
+    rm -f /tmp/patch_flash_attn_setup.py; \
+    export FLASH_ATTENTION_FORCE_BUILD=TRUE; \
+    export FLASH_ATTENTION_SKIP_CUDA_BUILD=FALSE; \
+    export MAX_JOBS="$(nproc)"; \
+    export TORCH_CUDA_ARCH_LIST="${FLASH_ATTN_CUDA_ARCH_LIST}"; \
+    pip install --no-build-isolation --no-deps -v .; \
+    cd / && rm -rf /tmp/flash-attention; \
+    python3 -c "import flash_attn, flash_attn_2_cuda; print('flash_attn', flash_attn.__version__)"
+
+# flash-attn hopper (still from miles wheels; separate package from FA2)
+RUN pip install --no-deps /tmp/wheels/flash_attn_3-*.whl && \
+    python_path=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    mkdir -p $python_path/flash_attn_3 && \
+    curl -fSL https://raw.githubusercontent.com/Dao-AILab/flash-attention/fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89/hopper/flash_attn_interface.py \
+      -o $python_path/flash_attn_3/flash_attn_interface.py
+
+RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
+
+RUN pip install flash-linear-attention==0.4.2
+RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+
+# Mamba kernels: use prebuilt wheels (do not compile causal-conv1d from source).
+RUN pip install --no-deps /tmp/wheels/causal_conv1d-*.whl && \
+    pip install --no-deps /tmp/wheels/mamba_ssm-*.whl
+
+# TE: editable install from fy1214 fork (NVFP4 per-token / #3045 work).
+# Default branch = feature/grouped-per-token-sf-swizzle (container minite_repack).
+#
+# Env flags proven required for CUDA 13 image builds:
+#   NVTE_WITH_NCCL_EP=0   — else missing nccl_device.h
+#   NVTE_CUDA_ARCHS=100   — B200; use 103 (or 100;103) for B300 / dual
+#   NVTE_FRAMEWORK=pytorch
+#
+# Note on "cherry-pick 930c8e45": that was only needed when building a clean
+# NVIDIA PR-3045 baseline on mingfa-minify (nvcc 13.0 group_quantize_fp8.cuh
+# parse failure). Your fork branch already builds without it; leave
+# TE_CHERRY_PICK empty unless you intentionally rebuild from TE_BASE_COMMIT.
+ARG CUTLASS_DSL_VERSION=4.6.2
+# FA4 cute must be new enough for cutlass-dsl 4.6+ (ThrMma moved off cute.core).
+# Base/sglang often leaves flash-attn-4==4.0.0b13 which still imports cute.core.ThrMma.
+ARG FLASH_ATTN_4_VERSION=4.0.0b29
+ARG TE_REPO=fy1214/TransformerEngine
+ARG TE_BRANCH=feature/grouped-per-token-sf-swizzle
+ARG TE_COMMIT=""
+ARG TE_CHERRY_PICK=""
+ARG NVTE_CUDA_ARCHS=100
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.ccache \
+    set -eu; \
+    pip install "nvidia-cublas==13.3.0.5"; \
+    if [ "${ENABLE_CUDA_13}" = "1" ]; then \
+      pip install nvidia-mathdx==25.6.0; \
+    fi; \
+    pip install --force-reinstall \
+      "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"; \
+    # cutlass-dsl 4.6.x cute.compile needs map_dataclass_to_tuple; FA4>=b26 wants tvm-ffi>=0.1.12.
+    pip install --force-reinstall "apache-tvm-ffi>=0.1.12,<0.2"; \
+    pip install --no-deps "quack-kernels==0.6.4" || \
+      pip install "quack-kernels==0.6.4"; \
+    # Overwrite base/sglang flash_attn/cute with a 4.6.2-compatible FA4.
+    pip install --force-reinstall --no-deps "flash-attn-4==${FLASH_ATTN_4_VERSION}"; \
+    python3 -c "from flash_attn.cute.interface import flash_attn_func; print('FA4 cute OK', flash_attn_func)"; \
+    pip uninstall -y transformer-engine transformer_engine transformer_engine_torch \
+      transformer_engine_cu12 transformer_engine_cu13 2>/dev/null || true; \
+    rm -rf /root/TransformerEngine; \
+    git clone --recursive "https://github.com/${TE_REPO}.git" /root/TransformerEngine; \
+    cd /root/TransformerEngine; \
+    if [ -n "${TE_COMMIT}" ]; then \
+      git checkout "${TE_COMMIT}"; \
+    else \
+      git checkout "${TE_BRANCH}"; \
+    fi; \
+    git submodule update --init --recursive; \
+    if [ -n "${TE_CHERRY_PICK}" ]; then \
+      git config user.email "builder@local"; \
+      git config user.name "TE Builder"; \
+      if ! git cat-file -t "${TE_CHERRY_PICK}" >/dev/null 2>&1; then \
+        git fetch https://github.com/NVIDIA/TransformerEngine.git "${TE_CHERRY_PICK}"; \
+      fi; \
+      git cherry-pick --allow-empty "${TE_CHERRY_PICK}"; \
+    fi; \
+    rm -rf build; \
+    export NVTE_FRAMEWORK=pytorch; \
+    export NVTE_WITH_NCCL_EP=0; \
+    export NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}"; \
+    export MAX_JOBS="$(nproc)"; \
+    if [ "${ENABLE_CUDA_13}" = "1" ]; then \
+      export CPLUS_INCLUDE_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include; \
+      export LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib; \
+    fi; \
+    # --no-deps below skips TE pyproject build/runtime deps; install them explicitly.
+    pip install pybind11 ninja onnxscript onnx; \
+    pip -v install --no-build-isolation --no-deps --force-reinstall -e .; \
+    echo "TE editable install OK (smoke import after FA4 patch)"
+
+# TE smoke: FA4 cute must import cleanly with pinned cutlass-dsl / flash-attn-4.
+# Fail the build on drift (no soft-fail patch file).
+RUN python3 -c "import transformer_engine as te; import transformer_engine.pytorch as tep; from transformer_engine.pytorch.attention.dot_product_attention import backends as _b; assert _b.flash_attn_func_v4 is not None, 'FA4 cute missing'; print('TE', te.__version__, 'FA4', _b.flash_attn_func_v4)"
+
+# apex
+RUN pip install --no-deps /tmp/wheels/apex-*.whl
+
+ARG MEGATRON_REPO=fy1214/Megatron-LM
+ARG MEGATRON_BRANCH=b300-minite-patched
+RUN git clone https://github.com/${MEGATRON_REPO}.git --recursive -b ${MEGATRON_BRANCH} Megatron-LM && \
+    cd Megatron-LM && \
+    pip install -e . --no-deps
+
+RUN pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a639 --no-cache-dir --force-reinstall
+# RUN pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build-isolation
+RUN pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation
+RUN pip install git+https://github.com/radixark/Megatron-Bridge.git@bridge --no-deps --no-build-isolation
+RUN pip install megatron-energon --no-deps
+RUN pip install multi-storage-client --no-deps
+
+# Miles/slime runtime deps (inlined; no external requirements.txt).
+RUN rm -rf /usr/lib/python3/dist-packages/jwt /usr/lib/python3/dist-packages/PyJWT* && \
+    pip install \
+      accelerate \
+      blobfile \
+      datasets \
+      "httpx[http2]" \
+      "mcp[cli]" \
+      memray \
+      numba \
+      omegaconf \
+      pillow \
+      pylatexenc \
+      pyyaml \
+      qwen_vl_utils \
+      "ray[default]" \
+      ring_flash_attn \
+      "sglang-router>=0.2.3" \
+      tensorboard \
+      transformers \
+      wandb
+
+# https://github.com/pytorch/pytorch/issues/168167
+RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
+    pip install nvidia-cudnn-cu13==9.16.0.29; \
+  else \
+    pip install nvidia-cudnn-cu12==9.16.0.29; \
+  fi
+
+# reinstall numpy 1.x for megatron
+RUN pip install "numpy<2"
+
+RUN rm -rf /root/.cache/pip /root/flash-attention
+
+# ====================================== Install sglang (fy1214/sglang) ============================================
+
+ARG SGLANG_REPO=fy1214/sglang
+ARG SGLANG_BRANCH=b300-minite-patched
+ARG SGLANG_COMMIT=""
+
+# Replace the base-image sglang tree with the saved patched branch.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    rm -rf /sgl-workspace/sglang && \
+    git clone --recursive https://github.com/${SGLANG_REPO}.git /sgl-workspace/sglang && \
+    cd /sgl-workspace/sglang && \
+    if [ -n "${SGLANG_COMMIT}" ]; then \
+      git checkout ${SGLANG_COMMIT}; \
+    else \
+      git checkout ${SGLANG_BRANCH}; \
+    fi && \
+    pip install -e "python[all]" --no-deps
+
+# ====================================== Install main package (fy1214/slime) ============================================
+
+ARG SLIME_REPO=fy1214/slime
+ARG SLIME_COMMIT=b300-minite-patched
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone https://github.com/${SLIME_REPO}.git /root/slime && \
+    cd /root/slime && \
+    git checkout ${SLIME_COMMIT} && \
+    pip install -e . --no-deps
+
+# ====================================== Install miniTransformer ============================================
+
+ARG MINITRANSFORMER_REPO=fy1214/miniTransformer
+# Branch must ship cutlass-dsl 4.6 ReduxKind->ReductionKind compat for CuTeDSL.
+ARG MINITRANSFORMER_BRANCH=infix_main_op_pr#3045
+
+# Compile fp4_gemm (sm_100a / sm_103a). Docker build usually has no GPU, so force
+# Blackwell ops instead of probing torch.cuda.get_device_capability().
+# --no-deps: pyproject pulls torch + nvidia-*-cu12, which duplicates the CUDA13 stack (~11GB).
+# Cutlass must stay on CUTLASS_DSL_VERSION (4.6.2): matches quack/FA4 and TE cute path.
+# miniTE sources must include ReduxKind->ReductionKind compat for cutlass-dsl 4.6+.
+ARG CUTLASS_DSL_VERSION=4.6.2
+# Private repo: pass --secret id=gh_token,src=... (BuildKit). Falls back to
+# public HTTPS clone when the secret is absent (local public mirrors only).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.ccache \
+    --mount=type=secret,id=gh_token \
+    set -eu; \
+    if [ -f /run/secrets/gh_token ]; then \
+      TOKEN="$(cat /run/secrets/gh_token)"; \
+      MT_URL="https://x-access-token:${TOKEN}@github.com/${MINITRANSFORMER_REPO}.git"; \
+    else \
+      MT_URL="https://github.com/${MINITRANSFORMER_REPO}.git"; \
+    fi; \
+    git clone --depth 1 --branch "${MINITRANSFORMER_BRANCH}" \
+      --recurse-submodules --shallow-submodules \
+      "${MT_URL}" /root/miniTransformer; \
+    cd /root/miniTransformer; \
+    git remote set-url origin "https://github.com/${MINITRANSFORMER_REPO}.git"; \
+    pip install --no-deps nvtx scipy "cuda-core==0.7.0" \
+      "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"; \
+    CUDA_HOME=/usr/local/cuda \
+    MINI_TE_FORCE_BLACKWELL_OPS=1 \
+    HYBRID_CUDA_ARCHS="100a;103a" \
+    MAX_JOBS=$(nproc) \
+    pip install -e . --no-build-isolation --no-deps; \
+    rm -rf /root/miniTransformer/third-party/cutlass/.git /root/miniTransformer/.git/modules
+
+# int4_qat
+RUN pip install /tmp/wheels/fake_int4_quant_cuda-*.whl
+
+# ====================================== Install sgl-model-gateway ============================================
+#   SGL_ROUTER_USE_WHEELS=0:
+#     Build from source  https://github.com/radixark/sgl-router-for-miles
+#   SGL_ROUTER_USE_WHEELS=1 (default):
+#     Install the pre-built sgl-model-gateway wheel
+
+ARG SGL_ROUTER_USE_WHEELS=1
+ARG SGL_ROUTER_REPO=https://github.com/radixark/sgl-router-for-miles.git
+ARG SGL_ROUTER_BRANCH=main
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ "${SGL_ROUTER_USE_WHEELS}" = "1" ]; then \
+      pip install --force-reinstall /tmp/wheels/sglang_router-*.whl && \
+      tar xzf /tmp/wheels/sgl-model-gateway-linux-*.tar.gz -C /usr/local/bin/ && \
+      chmod +x /usr/local/bin/sgl-model-gateway; \
+    elif [ "${SGL_ROUTER_USE_WHEELS}" = "0" ]; then \
+      git clone --branch "${SGL_ROUTER_BRANCH}" --depth 1 "${SGL_ROUTER_REPO}" /build/sgl-model-gateway && \
+      curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+      export PATH="/root/.cargo/bin:${PATH}" && \
+      python3 -m pip install maturin && \
+      cd /build/sgl-model-gateway/bindings/python && \
+      ulimit -n 65536 && \
+      maturin build --release --features vendored-openssl --out /build/gateway_wheels && \
+      cd /build/sgl-model-gateway && \
+      cargo build --release --bin sgl-model-gateway --features vendored-openssl && \
+      cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway && \
+      chmod +x /usr/local/bin/sgl-model-gateway && \
+      pip install --force-reinstall /build/gateway_wheels/sglang_router-*.whl && \
+      rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway /build/gateway_wheels; \
+    fi
+
+RUN rm -rf /tmp/wheels
+
+# Align with mingfa-docker (1.0.3): sglang flashinfer_trtllm NVFP4 path
+# calls nvfp4_quantize(..., per_token_activation=True), which exists in 0.6.12
+# but not in the base-image 0.6.8.post1.
+# --no-deps: avoid pulling a second torch / cutlass stack.
+# Uninstall base-image jit-cache; 0.6.8 cache fails flashinfer's version check.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall -y flashinfer-jit-cache || true && \
+    pip install --no-deps flashinfer-python==0.6.12 flashinfer-cubin==0.6.12
+
+# Align with mingfa-docker: unreplaced TE Linear layers must not stay on FP8.
+# Editable TE lives under /root/TransformerEngine; fall back to site-packages.
+RUN printf '%s\n' \
+    'from pathlib import Path' \
+    'candidates = [' \
+    '    Path("/root/TransformerEngine/transformer_engine/pytorch/module"),' \
+    '    Path("/usr/local/lib/python3.12/dist-packages/transformer_engine/pytorch/module"),' \
+    ']' \
+    'te_dir = next((p for p in candidates if p.is_dir()), None)' \
+    'if te_dir is None:' \
+    '    raise SystemExit("TE pytorch/module not found for FP8 disable patch")' \
+    'anchor = ") = non_tensor_args\n"' \
+    'insert = anchor + "\n        # miniTE-b300: disable FP8 fallback for unreplaced Linear layers\n        fp8 = False\n\n"' \
+    'for name in ("linear.py", "layernorm_linear.py"):' \
+    '    path = te_dir / name' \
+    '    text = path.read_text()' \
+    '    if "fp8 = False" in text:' \
+    '        print("already patched", path)' \
+    '        continue' \
+    '    if anchor not in text:' \
+    '        raise SystemExit("anchor not found in %s" % path)' \
+    '    path.write_text(text.replace(anchor, insert, 1))' \
+    '    print("patched", path)' \
+    > /tmp/patch_te_disable_fp8.py && python3 /tmp/patch_te_disable_fp8.py && rm -f /tmp/patch_te_disable_fp8.py
+
+# Precompile FlashInfer NVFP4 + fused MoE kernels for this machine's GPU.
+# B200 -> 10.0 (sm_100a), B300 -> 10.3 (sm_103a). Override with
+# --build-arg FLASHINFER_CUDA_ARCH_LIST=10.0 (or 10.3). Docker build usually
+# has no GPU: then both arches are compiled so the image runs on either box.
+ARG FLASHINFER_CUDA_ARCH_LIST=""
+RUN printf '%s\n' \
+    'import os, shutil, subprocess, sys' \
+    'from pathlib import Path' \
+    '' \
+    'def detect_archs():' \
+    '    override = os.environ.get("FLASHINFER_CUDA_ARCH_LIST", "").strip()' \
+    '    if override:' \
+    '        return override.split()' \
+    '    try:' \
+    '        import torch' \
+    '        if torch.cuda.is_available() and torch.cuda.device_count() > 0:' \
+    '            major, minor = torch.cuda.get_device_capability(0)' \
+    '            return ["%d.%d" % (major, minor)]' \
+    '    except Exception as e:' \
+    '        print("gpu probe skipped:", e)' \
+    '    return ["10.0", "10.3"]' \
+    '' \
+    'warmup_one = r"""' \
+    'import os' \
+    'arch = os.environ["FLASHINFER_CUDA_ARCH_LIST"]' \
+    'print("==> warmup FLASHINFER_CUDA_ARCH_LIST=%s" % arch)' \
+    'from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module' \
+    'from flashinfer.jit.fp4_quantization import (' \
+    '    gen_fp4_quantization_sm100_module,' \
+    '    gen_fp4_quantization_sm103_module,' \
+    ')' \
+    'if arch.startswith("10.3"):' \
+    '    gen_fp4_quantization_sm103_module().build(False)' \
+    'else:' \
+    '    gen_fp4_quantization_sm100_module().build(False)' \
+    'gen_trtllm_gen_fused_moe_sm100_module().build(False)' \
+    '"""' \
+    '' \
+    'cache_root = Path("/root/.cache/flashinfer")' \
+    'if cache_root.exists():' \
+    '    for stale in cache_root.glob("0.6.8*"):' \
+    '        print("remove stale cache:", stale)' \
+    '        shutil.rmtree(stale, ignore_errors=True)' \
+    'for arch in detect_archs():' \
+    '    env = dict(os.environ)' \
+    '    env["FLASHINFER_CUDA_ARCH_LIST"] = arch' \
+    '    subprocess.check_call([sys.executable, "-c", warmup_one], env=env)' \
+    'so_files = sorted(Path("/root/.cache/flashinfer").rglob("*.so"))' \
+    'print("warmup done: %d shared objects" % len(so_files))' \
+    'for so in so_files:' \
+    '    print("  %s (%d MiB)" % (so, so.stat().st_size // (1024 * 1024)))' \
+    > /tmp/warmup_flashinfer.py && FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" python3 /tmp/warmup_flashinfer.py && rm -f /tmp/warmup_flashinfer.py

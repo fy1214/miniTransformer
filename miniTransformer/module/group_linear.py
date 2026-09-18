@@ -53,6 +53,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         fuse_wgrad_accumulation: bool,
         disable_backward_quant: bool,
         input_row_amax: Optional[torch.Tensor],
+        gemm_kind: str,
         *weights,
     ) -> torch.Tensor:
         num_gemms = len(m_splits)
@@ -158,7 +159,13 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
         assert qw is not None, "quantized weight cache must not be None"
 
         # Forward grouped GEMM (TN): op consumes per-group qx/qw lists plus scales.
-        # extra_info_* carries layout metadata (offsets, swizzle, etc.) when the op needs it.
+        # Attach gemm_kind only onto an existing extra_info dict (shallow copy).
+        # Do NOT invent a dict from None — cursor2/other ops treat None as "no
+        # packed metadata" and would KeyError on missing data/scale keys.
+        extra_info_A = qresult_x_list.extra_info
+        if isinstance(extra_info_A, dict):
+            extra_info_A = dict(extra_info_A)
+            extra_info_A["gemm_kind"] = gemm_kind
         with record_function("grouped_gemm"):
             y = quantize_op.grouped_gemm(
                 A=qx,
@@ -172,7 +179,7 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
                 m_splits=m_splits,
                 qparams_x=qlinear_params.x_params,
                 qparams_w=qlinear_params.w_params,
-                extra_info_A=qresult_x_list.extra_info,
+                extra_info_A=extra_info_A,
                 extra_info_B=qresult_w_list.extra_info,
             )
 
@@ -382,18 +389,19 @@ class _QuantizedGroupedLinear(torch.autograd.Function):
 
         return (
             dgrad.view(ctx.x_shape),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # m_splits
+            None,  # weight_qresult_cache
+            None,  # tp_group
+            None,  # tp_size
+            None,  # parallel_mode
+            None,  # qlinear_params
+            None,  # activation_dtype
+            None,  # is_grad_enabled
+            None,  # is_first_microbatch
+            None,  # fuse_wgrad_accumulation
+            None,  # disable_backward_quant
+            None,  # input_row_amax
+            None,  # gemm_kind
             *wgrad_list,
         )
 
@@ -467,6 +475,7 @@ class GroupedLinear(LayerLinearBaseModule):
         ub_name: Optional[str] = None,
         layer_number: Optional[int] = None,
         qlinear_params: Optional[config.QLinearParams] = None,
+        gemm_kind: Optional[str] = None,
     ) -> None:
         super().__init__(tp_group, tp_size, sequence_parallel)
 
@@ -486,11 +495,16 @@ class GroupedLinear(LayerLinearBaseModule):
         self.rng_tracker_name = rng_tracker_name
         self.layer_name = ub_name
         self.layer_number = layer_number
+        # TE NVFP4 grouped tile family ("default"|"fc1"|"fc2"). Explicit gemm_kind
+        # wins; otherwise use Megatron tp_comm_buffer_name → ub_name ("fc1"/"fc2").
+        kind = str(gemm_kind if gemm_kind is not None else (ub_name or "default")).lower()
+        self.gemm_kind = kind if kind in ("default", "fc1", "fc2") else "default"
 
         _log_rank_0(
             f"GroupedLinear init: num_gemms={num_gemms}, "
             f"in_features={in_features}, out_features={out_features}, "
-            f"fuse_wgrad_accumulation={fuse_wgrad_accumulation}, use_bias={bias}"
+            f"fuse_wgrad_accumulation={fuse_wgrad_accumulation}, use_bias={bias}, "
+            f"ub_name={ub_name}, gemm_kind={self.gemm_kind}"
         )
 
         # Resolve quant recipe (env QAT_PARAMS or caller override) and pick quantize_op.
@@ -501,7 +515,7 @@ class GroupedLinear(LayerLinearBaseModule):
         )
         _log_rank_0(
             f"GroupedLinear layer={layer_number} name={self.layer_name} "
-            f"qlinear_params={self.qlinear_params}"
+            f"gemm_kind={self.gemm_kind} qlinear_params={self.qlinear_params}"
         )
 
         self.parallel_mode = parallel_mode
@@ -666,6 +680,7 @@ class GroupedLinear(LayerLinearBaseModule):
             self.fuse_wgrad_accumulation,
             self.disable_backward_quant,
             input_row_amax,
+            self.gemm_kind,
             *weight_tensors,
         )
 

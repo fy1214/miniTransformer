@@ -1,27 +1,73 @@
-"""Dump expert fc1+fc2 activations and token logprobs from Megatron model.
+"""Megatron collector for logpdiff: capture one MoE layer's expert fc1/fc2
+kernel-boundary tensors plus router/dispatch/swiglu boundary tensors, and
+write them as schema TensorRecords into a logpdiff run directory.
 
-Captures at Layer 0 expert fc1:
-  - fc1_input: padded dispatched tokens entering linear_fc1 (raw, before QDQ)
-  - fc1_gemm_input: activation after NVFP4 pertoken QDQ (what enters GEMM)
-  - fc1_output: fc1 GEMM result
-  - tokens_per_expert: padded and unpadded token counts
+Two capture paths are combined:
 
-Captures at Layer 0 expert fc2:
-  - fc2_input: post-SwiGLU, post-probs input to linear_fc2 (raw, before QDQ)
-  - fc2_gemm_input: activation after NVFP4 pertoken QDQ
-  - fc2_output: fc2 GEMM result
+1. MiniTE logpdiff sink (provenance=actual_kernel). The target layer's minite
+   GroupedLinear modules (experts.linear_fc1 / experts.linear_fc2) are wrapped
+   in ``logpdiff_scope`` via pre/post forward hooks, so the sink records real
+   quantize/GEMM kernel-boundary tensors under
+   ``<run_dir>/megatron/<module_name>/*.pt``. After the run, the sink's raw
+   index is translated into TensorRecords appended to ``megatron/index.jsonl``;
+   payload files are referenced in place (never copied). The raw sink index is
+   preserved as ``megatron/sink_index.jsonl``.
 
-Also captures token_logprobs from the model's final output logits
-(merged from dump_megatron_logprob.py).
+   sink phase -> tensor_point (role taken from linear_role; fc1 shown):
+     input / tensor "x"        -> fc1_raw_input
+     input / tensor "m_splits" -> (not a tensor_point; kept in the raw sink
+                                  index only, counted as skipped-metadata)
+     x_qdata, w_qdata          -> fc1_qdata   (payload tensors)
+                                  fc1_scales  (names containing scale/offset,
+                                               e.g. scale_flat, global_scale,
+                                               row_offsets, scale_offsets)
+     dequant_view              -> fc1_qdata / fc1_scales (same name rule)
+     gemm_output               -> fc1_output
+
+2. Module hooks (provenance=hook_boundary): layer_input, dispatch_input,
+   router_topk_ids, router_topk_weights, swiglu_output, expert_combined_output.
+   token_logprobs is computed from the actual output logits
+   (provenance=derived_metric). router_logits is NOT emitted: Megatron's
+   TopKRouter never exposes pre-softmax logits outside the module, and
+   fabricating internal quantities is disallowed (mark replayed, or skip).
+
+P0 scope: TP=EP=PP=1, single process. Launch with
+``torchrun --nproc_per_node=1`` (WORLD_SIZE must be 1).
 
 Usage:
     SHOULD_REPLACE_TE_GROUPLINEAR=1 QAT_PARAMS=8 \
-    NVTE_NVFP4_DISABLE_RHT=0 NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=0 NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1 \
-    CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 dump_expert_fc1_and_fc2_megatron.py \
+    NVTE_NVFP4_DISABLE_RHT=0 NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=0 \
+    NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1 \
+    CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 \
+        dump_expert_fc1_and_fc2_megatron.py \
+        --model-path /path/to/hf/Qwen3-30B-A3B \
+        --ref-load /path/to/Qwen3-30B-A3B_torch_dist/ \
         --input-file test_inputs_long.jsonl \
-        --output-dir dump_expert_fc1_megatron/ \
-        --ep-size 1 \
-        --layer-idx 0
+        --output-dir runs/ --layer-idx 0
+
+    # join an existing run (writes <run>/megatron/; inputs.jsonl must match
+    # byte-for-byte; the run's config/manifest are merged, not overwritten):
+    torchrun --nproc_per_node=1 dump_expert_fc1_and_fc2_megatron.py \
+        --run-dir runs/<run-id> --model-path ... --ref-load ... --input-file ...
+
+    # equivalent via config file (CLI flags override config values):
+    torchrun --nproc_per_node=1 dump_expert_fc1_and_fc2_megatron.py \
+        --config capture.megatron.json [--layer-idx 3]
+
+Config JSON keys: model_path, ref_load, layer_idx, input_file, output_dir,
+run_dir, run_id, ep_size, force_routing.
+
+Old CLI flags (--input-file/--output-dir/--ep-size/--model-path/--layer-idx/
+--force-routing) are unchanged; --ref-load-path remains as a deprecated alias
+of --ref-load. The previously hardcoded MODEL_PATH/REF_LOAD are gone:
+--model-path and --ref-load are now required (CLI or --config).
+--output-dir is now the BASE directory under which ``<run-id>/`` is created
+(old default wrote a bare .pt into the output dir; that format is gone);
+--run-dir joins an existing run instead of creating one.
+
+Heavy dependencies (torch, torch.distributed, megatron, minite) are imported
+inside functions, so ``--help`` and the sink-index translation work without
+them installed.
 """
 
 import argparse
@@ -29,32 +75,403 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from logpdiff import schema
+from logpdiff.writer import RunWriter, assert_internal_payload, create_run_dir
+
+FRAMEWORK = "megatron"
+SINK_RAW_INDEX_NAME = "sink_index.jsonl"
+
+# Megatron/slime source checkouts on the capture machine (old behaviour).
+MEGATRON_SRC = "/root/Megatron-LM"
+MINITE_SRC = "/root/minite"
+
+_CONFIG_KEYS = (
+    "model_path",
+    "ref_load",
+    "layer_idx",
+    "input_file",
+    "output_dir",
+    "run_dir",
+    "run_id",
+    "ep_size",
+    "force_routing",
+)
+
+_DEFAULTS = {
+    "model_path": None,
+    "ref_load": None,
+    "layer_idx": 0,
+    "input_file": None,
+    "output_dir": "runs",
+    "run_dir": None,
+    "run_id": None,
+    "ep_size": 1,
+    "force_routing": None,
+}
+
+# Hook captures saved per sample, in this fixed order.
+# provenance defaults to hook_boundary; token_logprobs is computed from the
+# actual logits payload and is therefore a derived metric.
+_HOOK_CAPTURE_ORDER = (
+    ("layer_input", schema.LAYER_INPUT),
+    ("dispatch_input", schema.DISPATCH_INPUT),
+    ("router_topk_ids", schema.ROUTER_TOPK_IDS),
+    ("router_topk_weights", schema.ROUTER_TOPK_WEIGHTS),
+    ("swiglu_output", schema.SWIGLU_OUTPUT),
+    ("expert_combined_output", schema.EXPERT_COMBINED_OUTPUT),
+    ("token_logprobs", schema.TOKEN_LOGPROBS),
+)
+_HOOK_DERIVED = frozenset({"token_logprobs"})
 
 
-MODEL_PATH = "/home/admin/mingfa/model/hf/Qwen3-30B-A3B/Qwen3-30B-A3B"
-REF_LOAD = "/home/admin/mingfa/model/torch_dist/Qwen3-30B-A3B_torch_dist/"
+# ---------------------------------------------------------------------------
+# CLI / config resolution (stdlib only)
+# ---------------------------------------------------------------------------
 
 
-def parse_our_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--input-file", default="/root/compare_logprob/test_inputs_long.jsonl")
-    parser.add_argument("--output-dir", default="/root/compare_logprob/dump_expert_fc1_megatron/")
-    parser.add_argument("--ep-size", type=int, default=1)
-    parser.add_argument("--model-path", default=MODEL_PATH)
-    parser.add_argument("--ref-load-path", default=REF_LOAD)
-    parser.add_argument("--layer-idx", type=int, default=0)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--config", default=None,
+                        help="JSON config file; CLI flags override its values")
+    parser.add_argument("--model-path", default=None,
+                        help="HF model path (required; was hardcoded before)")
+    parser.add_argument("--ref-load", default=None,
+                        help="Megatron torch_dist checkpoint dir (required; "
+                             "was hardcoded as REF_LOAD before)")
+    parser.add_argument("--ref-load-path", dest="ref_load", default=None,
+                        help="deprecated alias of --ref-load")
+    parser.add_argument("--layer-idx", type=int, default=None,
+                        help="transformer layer index to capture (default 0)")
+    parser.add_argument("--input-file", default=None,
+                        help="input JSONL with {\"name\", \"input_ids\"} records (required)")
+    parser.add_argument("--output-dir", default=None,
+                        help="base directory; the run is created at <output-dir>/<run-id>/ "
+                             "(default: runs)")
+    parser.add_argument("--run-dir", default=None,
+                        help="join an existing run directory instead of creating one "
+                             "(writes its megatron/ subdir; mutually exclusive with --run-id)")
+    parser.add_argument("--run-id", default=None,
+                        help="run id (default: UTC timestamp + short uuid)")
+    parser.add_argument("--ep-size", type=int, default=None,
+                        help="expert parallel size; P0 supports only 1")
     parser.add_argument("--force-routing", default=None,
-                        help="Path to sglang dump .pt to force router output (topk_ids/topk_weights)")
-    our_args, _ = parser.parse_known_args()
-    return our_args
+                        help="Path to sglang dump .pt to force router output "
+                             "(topk_ids/topk_weights)")
+    return parser
 
 
-def setup_megatron_argv(our_args):
-    ep = our_args.ep_size
+def resolve_config(args, parser) -> dict:
+    """Merge --config JSON with CLI overrides; validate required values."""
+    cfg = dict(_DEFAULTS)
+    if args.config:
+        try:
+            with open(args.config, encoding="utf-8") as f:
+                file_cfg = json.load(f)
+        except OSError as e:
+            parser.error(f"cannot read --config {args.config}: {e}")
+        if not isinstance(file_cfg, dict):
+            parser.error(f"--config {args.config} must contain a JSON object")
+        unknown = sorted(set(file_cfg) - set(_CONFIG_KEYS))
+        if unknown:
+            parser.error(
+                f"--config {args.config} has unknown keys {unknown}; "
+                f"supported keys: {sorted(_CONFIG_KEYS)}"
+            )
+        cfg.update(file_cfg)
+    for key in _CONFIG_KEYS:
+        cli_value = getattr(args, key, None)
+        if cli_value is not None:
+            cfg[key] = cli_value
+
+    for required in ("model_path", "ref_load", "input_file"):
+        if not cfg.get(required):
+            parser.error(
+                f"--{required.replace('_', '-')} is required "
+                f"(no hardcoded default anymore; pass it via CLI or --config)"
+            )
+    if cfg["run_dir"] and cfg["run_id"]:
+        parser.error("--run-id only applies when creating a run (with --output-dir), "
+                     "not when joining one via --run-dir")
+    try:
+        cfg["ep_size"] = int(cfg["ep_size"])
+        cfg["layer_idx"] = int(cfg["layer_idx"])
+    except (TypeError, ValueError):
+        parser.error("ep_size and layer_idx must be integers")
+    try:
+        schema.check_single_device_parallel(tp=1, ep=cfg["ep_size"], pp=1)
+    except ValueError as e:
+        parser.error(str(e))
+    return cfg
+
+
+def load_inputs(path):
+    """Load input JSONL records; every record needs ``name`` and ``input_ids``."""
+    inputs = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if "name" not in rec or "input_ids" not in rec:
+                raise ValueError(
+                    f"{path}:{lineno}: input record must have 'name' and 'input_ids', "
+                    f"got keys {sorted(rec)}"
+                )
+            inputs.append(rec)
+    if not inputs:
+        raise ValueError(f"{path}: no input records found")
+    return inputs
+
+
+def _get_global_rank() -> int:
+    """Rank from torch.distributed when initialized, else 0."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run directory setup / top-level files (torch-free)
+# ---------------------------------------------------------------------------
+
+
+def _setup_run(cfg):
+    """Create a new run under --output-dir, or join an existing --run-dir.
+
+    Joining reuses the run directory (this side writes its megatron/ subdir);
+    an existing megatron index means a megatron capture is already present
+    and is never mixed into. Returns (RunWriter, joined_existing).
+    """
+    common = dict(
+        model_path=cfg["model_path"],
+        seed=1234,  # megatron default; no --seed flag is passed in setup_megatron_argv
+        backend="megatron",
+        tp=1,
+        ep=cfg["ep_size"],
+        pp=1,
+        force_routing=bool(cfg["force_routing"]),
+    )
+    if cfg["run_dir"]:
+        run_dir = Path(cfg["run_dir"]).resolve()
+        if not run_dir.is_dir():
+            raise SystemExit(
+                f"--run-dir {run_dir} does not exist; "
+                "to create a new run use --output-dir instead"
+            )
+        (run_dir / FRAMEWORK / "tensors").mkdir(parents=True, exist_ok=True)
+        for stale in ("index.jsonl", SINK_RAW_INDEX_NAME):
+            if (run_dir / FRAMEWORK / stale).exists():
+                raise SystemExit(
+                    f"{run_dir / FRAMEWORK / stale} already exists; refusing to "
+                    "mix a second megatron capture into the same run"
+                )
+        return RunWriter(run_dir=run_dir, run_id=run_dir.name, **common), True
+    return create_run_dir(cfg["output_dir"], run_id=cfg["run_id"], **common), False
+
+
+def _write_or_verify_inputs(run_writer, test_inputs):
+    """Write inputs.jsonl in the canonical record schema (same shape the
+    sglang collector writes). When joining a run that already has one, the
+    existing content must be byte-identical (no silent input mismatch)."""
+    records = [
+        {
+            "sample_id": str(inp["name"]),
+            "input_ids": list(inp["input_ids"]),
+            "num_tokens": len(inp["input_ids"]),
+        }
+        for inp in test_inputs
+    ]
+    path = run_writer.run_dir / "inputs.jsonl"
+    if path.exists():
+        existing = path.read_bytes()
+        canonical = "".join(
+            json.dumps(rec, ensure_ascii=False) + "\n" for rec in records
+        ).encode("utf-8")
+        if existing != canonical:
+            raise SystemExit(
+                f"{path} already exists and does not match --input-file; "
+                "refusing to mix different inputs into one run"
+            )
+        print(f"inputs.jsonl already present and identical ({len(records)} samples)")
+        return records
+    run_writer.write_inputs(records)
+    print(f"Wrote {len(records)} input samples to {path}")
+    return records
+
+
+def _merge_write_config(run_writer, megatron_section):
+    """Write config.resolved.json under the "megatron" section, preserving
+    other frameworks' sections when joining an existing run."""
+    path = run_writer.run_dir / "config.resolved.json"
+    merged = {}
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            merged = json.load(f)
+        if not isinstance(merged, dict):
+            raise SystemExit(f"{path} exists but is not a JSON object; refusing to merge")
+    merged.setdefault("run_id", run_writer.run_id)
+    merged[FRAMEWORK] = megatron_section
+    run_writer.write_config_resolved(merged)
+    print(f"Wrote {path}")
+
+
+def _finalize_manifest(run_writer):
+    path = run_writer.run_dir / "manifest.json"
+    if path.exists():
+        print(f"{path} already exists (joined run); leaving it untouched")
+        return
+    run_writer.finalize_manifest()
+    print(f"Wrote {path}")
+
+
+# ---------------------------------------------------------------------------
+# sink raw index -> TensorRecord translation (torch-free, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+def _quant_component_point(prefix: str, tensor_name: str) -> str:
+    """Classify a quantized-payload component tensor into qdata vs scales.
+
+    The CUTLASS NVFP4 path emits extra_info tensors named data / scale_flat /
+    global_scale / row_offsets / scale_offsets; scale-side metadata (anything
+    containing "scale" or "offset") goes to <prefix>_scales, the packed data
+    itself to <prefix>_qdata. The same rule covers dequant_view tensors
+    (x_*/w_* names).
+    """
+    name = tensor_name.lower()
+    if "scale" in name or "offset" in name:
+        return f"{prefix}_scales"
+    return f"{prefix}_qdata"
+
+
+def sink_record_to_tensor_record(
+    sink_rec: dict,
+    *,
+    run_id: str,
+    sample_id,
+    global_rank: int,
+    expected_layer_id=None,
+) -> "schema.TensorRecord | None":
+    """Translate one raw sink index record into a schema TensorRecord.
+
+    Returns None for records that carry no tensor_point payload (currently
+    only the "m_splits" grouping metadata of the input phase); those stay
+    available in the preserved raw sink index. Raises ValueError on malformed
+    or unexpected records -- nothing is silently dropped or truncated.
+    """
+    required = (
+        "module_name", "layer_id", "linear_role", "phase", "seq",
+        "tensor_name", "shape", "dtype", "path", "provenance",
+    )
+    missing = [k for k in required if k not in sink_rec]
+    if missing:
+        raise ValueError(f"sink record missing fields {missing}: {sink_rec!r}")
+
+    role = sink_rec["linear_role"]
+    if role not in ("fc1", "fc2"):
+        raise ValueError(f"unknown linear_role {role!r} in sink record: {sink_rec!r}")
+    layer_id = int(sink_rec["layer_id"])
+    if expected_layer_id is not None and layer_id != expected_layer_id:
+        raise ValueError(
+            f"sink record layer_id {layer_id} != captured layer {expected_layer_id}: "
+            f"{sink_rec!r}"
+        )
+
+    phase = sink_rec["phase"]
+    tensor_name = sink_rec["tensor_name"]
+    if phase == "input":
+        if tensor_name == "x":
+            tensor_point = f"{role}_raw_input"
+        elif tensor_name == "m_splits":
+            return None  # per-expert row grouping metadata; raw index keeps it
+        else:
+            raise ValueError(
+                f"unknown input-phase tensor {tensor_name!r}: {sink_rec!r}"
+            )
+    elif phase in ("x_qdata", "w_qdata", "dequant_view"):
+        tensor_point = _quant_component_point(role, tensor_name)
+    elif phase == "gemm_output":
+        tensor_point = f"{role}_output"
+    else:
+        raise ValueError(f"unknown sink phase {phase!r}: {sink_rec!r}")
+
+    provenance = schema.validate_provenance(sink_rec["provenance"])
+    rel = str(sink_rec["path"]).replace(os.sep, "/")
+    return schema.TensorRecord(
+        run_id=run_id,
+        framework=FRAMEWORK,
+        sample_id=sample_id,
+        layer_id=layer_id,
+        tensor_point=tensor_point,
+        shape=tuple(int(d) for d in sink_rec["shape"]),
+        dtype=str(sink_rec["dtype"]),
+        provenance=provenance,
+        payload_path=f"{FRAMEWORK}/{rel}",
+        global_rank=global_rank,
+    )
+
+
+def translate_and_append_sink_records(
+    run_writer, sink_records, *, sample_id, global_rank: int, expected_layer_id
+):
+    """Translate raw sink records and append them to megatron/index.jsonl.
+
+    Payload files are referenced in place; every referenced file must exist
+    inside the run directory (FileNotFoundError otherwise -- no silent drops).
+
+    Returns (written, skipped_metadata) counts.
+    """
+    written = 0
+    skipped = 0
+    for rec in sink_records:
+        tensor_record = sink_record_to_tensor_record(
+            rec,
+            run_id=run_writer.run_id,
+            sample_id=sample_id,
+            global_rank=global_rank,
+            expected_layer_id=expected_layer_id,
+        )
+        if tensor_record is None:
+            skipped += 1
+            continue
+        payload = assert_internal_payload(tensor_record.payload_path, run_writer.run_dir)
+        if not payload.is_file():
+            raise FileNotFoundError(
+                f"sink payload {payload} referenced by record {rec!r} does not exist"
+            )
+        run_writer.append_record(FRAMEWORK, tensor_record)
+        written += 1
+    return written, skipped
+
+
+def _count_lines(path: Path) -> int:
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+    except FileNotFoundError:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Megatron bootstrap (heavy imports inside)
+# ---------------------------------------------------------------------------
+
+
+def setup_megatron_argv(cfg):
+    ep = cfg["ep_size"]
     sys.argv = [
         "dump_expert_fc1_and_fc2_megatron.py",
         "--disable-bias-linear",
@@ -112,52 +529,36 @@ def setup_megatron_argv(our_args):
         "--recompute-method", "uniform",
         "--recompute-num-layers", "1",
         "--tokenizer-type", "NullTokenizer",
-        "--hf-checkpoint", our_args.model_path,
-        "--ref-load", our_args.ref_load_path,
-        "--load", our_args.ref_load_path,
+        "--hf-checkpoint", cfg["model_path"],
+        "--ref-load", cfg["ref_load"],
+        "--load", cfg["ref_load"],
         "--lr-warmup-iters", "0",
         "--lr-decay-iters", "10",
         "--train-iters", "10",
     ]
 
 
-def load_inputs(path):
-    inputs = []
-    with open(path) as f:
-        for line in f:
-            inputs.append(json.loads(line))
-    return inputs
+def _init_megatron(cfg, rank, local_rank):
+    """Parse megatron args, init slime, load the model. Returns (raw_model, args)."""
+    import torch  # noqa: F401
+    import torch.distributed as dist
 
+    setup_megatron_argv(cfg)
 
-def main():
-    our_args = parse_our_args()
-    rank = int(os.environ.get("RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    if rank == 0:
-        os.makedirs(our_args.output_dir, exist_ok=True)
-        print(f"World size: {world_size}, EP: {our_args.ep_size}, rank: {rank}")
-        print(f"SHOULD_REPLACE_TE_GROUPLINEAR={os.environ.get('SHOULD_REPLACE_TE_GROUPLINEAR', '')}")
-        print(f"QAT_PARAMS={os.environ.get('QAT_PARAMS', '')}")
-
-    torch.cuda.set_device(f"cuda:{local_rank}")
-    dist.init_process_group(backend="nccl")
-
-    setup_megatron_argv(our_args)
-
-    sys.path.insert(0, '/root/Megatron-LM')
-    sys.path.insert(0, '/root/miniTransformer')
+    sys.path.insert(0, MEGATRON_SRC)
+    sys.path.insert(0, MINITE_SRC)
 
     from megatron.training.arguments import parse_args as megatron_parse_args
     from megatron.training.arguments import validate_args as megatron_validate_args
+
     args = megatron_parse_args(extra_args_provider=None, ignore_unknown_args=True)
 
-    args.hf_checkpoint = our_args.model_path
-    args.ref_load = our_args.ref_load_path
-    args.load = our_args.ref_load_path
+    args.hf_checkpoint = cfg["model_path"]
+    args.ref_load = cfg["ref_load"]
+    args.load = cfg["ref_load"]
 
     from slime.backends.megatron_utils.arguments import set_default_megatron_args
+
     args = set_default_megatron_args(args)
 
     missing_defaults = {
@@ -209,6 +610,7 @@ def main():
               f"EP={args.expert_model_parallel_size}, PP={args.pipeline_model_parallel_size}")
 
     from slime.backends.megatron_utils.initialize import init
+
     init(args)
 
     if rank == 0:
@@ -228,18 +630,49 @@ def main():
     raw_model = model
     while hasattr(raw_model, 'module'):
         raw_model = raw_model.module
+    return raw_model, args
 
-    layer_idx = our_args.layer_idx
+
+# ---------------------------------------------------------------------------
+# capture driver (heavy imports inside)
+# ---------------------------------------------------------------------------
+
+
+def run_capture(cfg, run_writer, test_inputs):
+    """Run the capture. On rank 0 returns a summary dict; other ranks return None."""
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if world_size != 1:
+        raise RuntimeError(
+            f"P0 supports single-process capture only (WORLD_SIZE={world_size}); "
+            "launch with `torchrun --nproc_per_node=1`. "
+            "Multi-rank capture is planned for P1."
+        )
+
+    if rank == 0:
+        print(f"World size: {world_size}, EP: {cfg['ep_size']}, rank: {rank}")
+        print(f"SHOULD_REPLACE_TE_GROUPLINEAR={os.environ.get('SHOULD_REPLACE_TE_GROUPLINEAR', '')}")
+        print(f"QAT_PARAMS={os.environ.get('QAT_PARAMS', '')}")
+
+    torch.cuda.set_device(f"cuda:{local_rank}")
+    dist.init_process_group(backend="nccl")
+
+    raw_model, megatron_args = _init_megatron(cfg, rank, local_rank)
+
+    layer_idx = cfg["layer_idx"]
     target_layer = raw_model.decoder.layers[layer_idx]
     moe_layer = target_layer.mlp
     experts_module = moe_layer.experts if hasattr(moe_layer, 'experts') else None
 
     if experts_module is None:
-        if rank == 0:
-            print(f"ERROR: Cannot find experts in layer {layer_idx}!")
-        dist.barrier()
         dist.destroy_process_group()
-        return
+        raise RuntimeError(f"Cannot find experts in layer {layer_idx}!")
 
     linear_fc1 = experts_module.linear_fc1
     linear_fc2 = experts_module.linear_fc2
@@ -248,67 +681,72 @@ def main():
         print(f"\nLayer {layer_idx} structure:")
         for name, child in target_layer.named_children():
             print(f"  {name}: {type(child).__name__}")
-        print(f"\nExperts module: {type(experts_module).__name__}")
+        print(f"Experts module: {type(experts_module).__name__}")
         print(f"linear_fc1: {type(linear_fc1).__name__}")
         if hasattr(linear_fc1, 'num_gemms'):
             print(f"  num_gemms={linear_fc1.num_gemms}")
-        if hasattr(linear_fc1, 'weight0'):
-            print(f"  weight0 shape={linear_fc1.weight0.shape}")
         print(f"linear_fc2: {type(linear_fc2).__name__}")
-        if hasattr(linear_fc2, 'weight0'):
-            print(f"  weight0 shape={linear_fc2.weight0.shape}")
 
-    # Setup hooks
+    # -- minite logpdiff sink scopes ----------------------------------------
+    # The sink reads MINITE_LOGPDIFF_ENABLE / MINITE_LOGPDIFF_OUTPUT_DIR at
+    # import time; main() sets both before this function imports minite.
+    from minite.module._logpdiff_sink import logpdiff_scope
+
+    fc1_module_name = f"decoder.layers.{layer_idx}.mlp.experts.linear_fc1"
+    fc2_module_name = f"decoder.layers.{layer_idx}.mlp.experts.linear_fc2"
+
     captured = {}
 
-    def fc1_pre_hook(module, args_tuple):
-        inp = args_tuple[0]
-        m_splits = args_tuple[1]
-        captured["fc1_input"] = inp.detach().cpu().clone()
-        if isinstance(m_splits, torch.Tensor):
-            captured["tokens_per_expert_padded"] = m_splits.detach().cpu().clone()
-        else:
-            captured["tokens_per_expert_padded"] = list(m_splits)
+    def _enter_scope(module, module_name, role):
+        ctx = logpdiff_scope(module_name=module_name, layer_id=layer_idx, linear_role=role)
+        ctx.__enter__()
+        module._logpdiff_scope_ctx = ctx
 
-    def fc1_hook(module, args_tuple, output):
-        if isinstance(output, tuple):
-            out = output[0]
-        else:
-            out = output
-        captured["fc1_output"] = out.detach().cpu().clone()
+    def _exit_scope(module):
+        ctx = getattr(module, "_logpdiff_scope_ctx", None)
+        if ctx is not None:
+            module._logpdiff_scope_ctx = None
+            ctx.__exit__(None, None, None)
+
+    def fc1_pre_hook(module, args_tuple):
+        _enter_scope(module, fc1_module_name, "fc1")
+
+    def fc1_post_hook(module, args_tuple, output):
+        _exit_scope(module)
 
     def fc2_pre_hook(module, args_tuple):
+        _enter_scope(module, fc2_module_name, "fc2")
         inp = args_tuple[0]
-        captured["fc2_input"] = inp.detach().cpu().clone()
+        if isinstance(inp, torch.Tensor):
+            # post-SwiGLU (probs-weighted) input to linear_fc2, before QDQ
+            captured["swiglu_output"] = inp.detach().clone()
 
-    def fc2_hook(module, args_tuple, output):
-        if isinstance(output, tuple):
-            out = output[0]
-        else:
-            out = output
-        captured["fc2_output"] = out.detach().cpu().clone()
-
-    def experts_pre_hook(module, args_tuple):
-        inp = args_tuple[0]
-        tokens_per_expert = args_tuple[1]
-        captured["experts_input_raw"] = inp.detach().cpu().clone()
-        if isinstance(tokens_per_expert, torch.Tensor):
-            captured["tokens_per_expert_unpadded"] = tokens_per_expert.detach().cpu().clone()
-        else:
-            captured["tokens_per_expert_unpadded"] = list(tokens_per_expert)
+    def fc2_post_hook(module, args_tuple, output):
+        _exit_scope(module)
 
     def moe_pre_hook(module, args_tuple):
         x = args_tuple[0]
         if isinstance(x, (list, tuple)):
             x = x[0]
-        captured["mlp_input_original"] = x.detach().cpu().clone()
+        if isinstance(x, torch.Tensor):
+            captured["layer_input"] = x.detach().clone()
+
+    def moe_hook(module, args_tuple, output):
+        out = output[0] if isinstance(output, tuple) else output
+        if isinstance(out, torch.Tensor):
+            captured["expert_combined_output"] = out.detach().clone()
+
+    def dispatcher_pre_hook(module, args_tuple):
+        x = args_tuple[0]
+        if isinstance(x, torch.Tensor):
+            captured["dispatch_input"] = x.detach().clone()
 
     # Load forced routing from sglang dump if specified
     forced_routing = {}
-    if our_args.force_routing:
+    if cfg["force_routing"]:
         if rank == 0:
-            print(f"\nLoading forced routing from: {our_args.force_routing}")
-        fr_data = torch.load(our_args.force_routing, map_location="cpu", weights_only=False)
+            print(f"\nLoading forced routing from: {cfg['force_routing']}")
+        fr_data = torch.load(cfg["force_routing"], map_location="cpu", weights_only=False)
         for sample_name, sample_data in fr_data.items():
             fr_topk_ids = sample_data.get("topk_ids")
             fr_topk_weights = sample_data.get("topk_weights")
@@ -318,22 +756,25 @@ def main():
                     "topk_weights": fr_topk_weights,
                 }
         if rank == 0:
-            print(f"  Loaded routing for {len(forced_routing)} samples: {list(forced_routing.keys())}")
+            print(f"  Loaded routing for {len(forced_routing)} samples: "
+                  f"{list(forced_routing.keys())}")
 
     current_sample_name = [None]
 
     def router_hook(module, args_tuple, output):
-        # Megatron router returns (probs [T,E] dense float, routing_map [T,E] bool)
+        # Megatron router returns (probs [T,E] dense float, routing_map [T,E] bool).
+        # Pre-softmax router logits never leave the TopKRouter module, so
+        # router_logits is intentionally not captured (no fabricated data).
         if isinstance(output, tuple) and len(output) >= 2:
             probs_dense, routing_map = output[0], output[1]
             if routing_map.dtype == torch.bool:
                 k = routing_map.sum(dim=-1).max().item()
                 topk_w, topk_i = torch.topk(probs_dense, k=int(k), dim=-1)
-                captured["router_scores"] = topk_w.detach().cpu().clone()
-                captured["router_indices"] = topk_i.detach().cpu().clone()
+                captured["router_topk_weights"] = topk_w.detach().cpu().clone()
+                captured["router_topk_ids"] = topk_i.detach().cpu().clone()
             else:
-                captured["router_scores"] = probs_dense.detach().cpu().clone()
-                captured["router_indices"] = routing_map.detach().cpu().clone()
+                captured["router_topk_weights"] = probs_dense.detach().cpu().clone()
+                captured["router_topk_ids"] = routing_map.detach().cpu().clone()
 
         sample_key = current_sample_name[0]
         if sample_key and sample_key in forced_routing:
@@ -351,8 +792,8 @@ def main():
             forced_routing_map = torch.zeros(num_tokens, num_experts, device=device, dtype=torch.bool)
             forced_routing_map.scatter_(1, topk_ids, True)
 
-            captured["router_scores"] = topk_weights.detach().cpu().clone()
-            captured["router_indices"] = topk_ids.detach().cpu().clone()
+            captured["router_topk_weights"] = topk_weights.detach().cpu().clone()
+            captured["router_topk_ids"] = topk_ids.detach().cpu().clone()
             captured["routing_forced"] = True
 
             if isinstance(output, tuple):
@@ -372,31 +813,77 @@ def main():
     if router_module is None and rank == 0:
         print(f"  WARNING: No router found. moe_layer children: "
               f"{[n for n, _ in moe_layer.named_children()]}")
-        print(f"  moe_layer attrs: {[a for a in dir(moe_layer) if not a.startswith('_')]}")
+
+    dispatcher_module = None
+    for attr_name in ['token_dispatcher', 'dispatcher']:
+        if hasattr(moe_layer, attr_name):
+            dispatcher_module = getattr(moe_layer, attr_name)
+            if rank == 0:
+                print(f"  Found dispatcher as moe_layer.{attr_name}: "
+                      f"{type(dispatcher_module).__name__}")
+            break
+    if dispatcher_module is None and rank == 0:
+        print("  WARNING: No token dispatcher found; dispatch_input will not be captured.")
 
     handles = [
         linear_fc1.register_forward_pre_hook(fc1_pre_hook),
-        linear_fc1.register_forward_hook(fc1_hook),
+        linear_fc1.register_forward_hook(fc1_post_hook),
         linear_fc2.register_forward_pre_hook(fc2_pre_hook),
-        linear_fc2.register_forward_hook(fc2_hook),
-        experts_module.register_forward_pre_hook(experts_pre_hook),
+        linear_fc2.register_forward_hook(fc2_post_hook),
         moe_layer.register_forward_pre_hook(moe_pre_hook),
+        moe_layer.register_forward_hook(moe_hook),
     ]
     if router_module is not None:
         handles.append(router_module.register_forward_hook(router_hook))
+    if dispatcher_module is not None:
+        handles.append(dispatcher_module.register_forward_pre_hook(dispatcher_pre_hook))
 
     if rank == 0:
-        print(f"\nHooks registered: experts pre_hook + linear_fc1 (pre/post) + linear_fc2 (pre/post)"
-              f" + router={'YES' if router_module else 'NO'}")
+        print(f"\nHooks registered: fc1/fc2 logpdiff scopes + swiglu capture, "
+              f"moe layer pre/post, router={'YES' if router_module else 'NO'}, "
+              f"dispatcher={'YES' if dispatcher_module else 'NO'}")
 
-    # Run inference
-    test_inputs = load_inputs(our_args.input_file)
-    results = {}
+    # -- per-sample forward loop ---------------------------------------------
+    sink_index_path = run_writer.run_dir / FRAMEWORK / "index.jsonl"
+    hook_records = []   # list of (sample_name, [TensorRecord, ...]); payloads already saved
+    sink_spans = []     # list of (sample_name, sink_index_line_before, after)
+    sample_names = set()
+
+    def _save_hook_records(sample_name):
+        records = []
+        for key, tensor_point in _HOOK_CAPTURE_ORDER:
+            if key not in captured:
+                print(f"  WARNING: {key} not captured for sample {sample_name}!")
+                continue
+            tensor = captured[key]
+            provenance = (
+                schema.DERIVED_METRIC if key in _HOOK_DERIVED else schema.HOOK_BOUNDARY
+            )
+            record = schema.TensorRecord(
+                run_id=run_writer.run_id,
+                framework=FRAMEWORK,
+                sample_id=sample_name,
+                layer_id=layer_idx,
+                tensor_point=tensor_point,
+                shape=tuple(tensor.shape),
+                dtype=str(tensor.dtype),
+                provenance=provenance,
+                payload_path="",  # backfilled by _save_tensor_file below
+                global_rank=_get_global_rank(),
+            )
+            # payloads are written immediately (records stay in memory; the
+            # index file is the sink's raw index until finalization)
+            record.payload_path = run_writer._save_tensor_file(FRAMEWORK, tensor)
+            records.append(record)
+        return records
 
     for inp in test_inputs:
         name = inp["name"]
         input_ids_list = inp["input_ids"]
         seq_len = len(input_ids_list)
+        if name in sample_names and rank == 0:
+            print(f"  WARNING: duplicate sample name {name!r}; both captures are kept")
+        sample_names.add(name)
         input_ids = torch.tensor(input_ids_list, dtype=torch.long, device=f"cuda:{local_rank}")
 
         current_sample_name[0] = name
@@ -406,195 +893,212 @@ def main():
                 print(f"  [FORCED ROUTING from sglang]")
 
         captured.clear()
+        sink_before = _count_lines(sink_index_path)
 
-        with torch.no_grad():
-            tokens = input_ids.unsqueeze(0)
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=tokens.device).unsqueeze(0)
-            output = raw_model(tokens, position_ids, attention_mask=None)
+        try:
+            with torch.no_grad():
+                tokens = input_ids.unsqueeze(0)
+                position_ids = torch.arange(seq_len, dtype=torch.long, device=tokens.device).unsqueeze(0)
+                output = raw_model(tokens, position_ids, attention_mask=None)
+        finally:
+            # if a forward raised between pre/post hooks, unwind dangling scopes
+            _exit_scope(linear_fc1)
+            _exit_scope(linear_fc2)
 
-            logits = None
-            if isinstance(output, torch.Tensor):
-                logits = output
-            elif isinstance(output, tuple):
-                logits = output[0]
-            elif hasattr(output, 'logits'):
-                logits = output.logits
-            elif hasattr(output, 'contiguous'):
-                logits = output
+        logits = None
+        if isinstance(output, torch.Tensor):
+            logits = output
+        elif isinstance(output, tuple):
+            logits = output[0]
+        elif hasattr(output, 'logits'):
+            logits = output.logits
+        elif hasattr(output, 'contiguous'):
+            logits = output
 
+        if logits is not None and isinstance(logits, torch.Tensor):
+            logits_f = logits.squeeze(0).float()
+            log_probs = F.log_softmax(logits_f[:-1], dim=-1)
+            target = input_ids[1:]
+            token_logprobs = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+            captured['token_logprobs'] = token_logprobs
             if rank == 0:
-                print(f"  output type: {type(output).__name__}, logits type: "
-                      f"{type(logits).__name__ if logits is not None else 'None'}")
-                if logits is not None and isinstance(logits, torch.Tensor):
-                    print(f"  logits shape: {logits.shape}")
+                print(f"  token_logprobs: {len(token_logprobs)} values, "
+                      f"range=[{token_logprobs.min():.4f}, {token_logprobs.max():.4f}], "
+                      f"mean={token_logprobs.mean():.4f}")
+        elif rank == 0:
+            print(f"  WARNING: logits not available (output type {type(output).__name__})")
 
-            if logits is not None and isinstance(logits, torch.Tensor):
-                logits_f = logits.squeeze(0).float()
-                log_probs = F.log_softmax(logits_f[:-1], dim=-1)
-                target = input_ids[1:]
-                token_logprobs = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
-                captured['token_logprobs'] = token_logprobs.cpu()
-                if rank == 0:
-                    print(f"  token_logprobs: {len(token_logprobs)} values, "
-                          f"range=[{token_logprobs.min():.4f}, {token_logprobs.max():.4f}], "
-                          f"mean={token_logprobs.mean():.4f}")
-            else:
-                if rank == 0:
-                    print(f"  WARNING: logits is None or not tensor")
-                    if output is not None:
-                        print(f"  output attrs: {[a for a in dir(output) if not a.startswith('_')][:20]}")
-
-            captured['final_output'] = output
+        sink_after = _count_lines(sink_index_path)
+        sink_spans.append((name, sink_before, sink_after))
+        if sink_after == sink_before and rank == 0:
+            print(f"  WARNING: minite logpdiff sink produced no records for {name} "
+                  f"(is SHOULD_REPLACE_TE_GROUPLINEAR=1 set and GroupedLinear patched?)")
 
         if rank == 0:
-            result = {
-                "input_ids": input_ids_list,
-                "layer_idx": layer_idx,
-            }
-
-            if "token_logprobs" in captured:
-                result["token_logprobs"] = captured["token_logprobs"]
-
-            if "router_scores" in captured:
-                result["topk_weights"] = captured["router_scores"]
-                result["topk_ids"] = captured["router_indices"]
-                print(f"  topk_ids: shape={captured['router_indices'].shape}, "
-                      f"topk_weights: shape={captured['router_scores'].shape}")
-                n_active = captured["router_indices"].unique().numel()
-                print(f"  active experts: {n_active}/128")
-            else:
-                print(f"  WARNING: router_scores not captured! router_module={router_module}")
-
-            for key in ["fc1_input", "fc1_output", "fc2_input", "fc2_output",
-                         "experts_input_raw",
-                         "tokens_per_expert_padded", "tokens_per_expert_unpadded"]:
-                if key in captured:
-                    val = captured[key]
-                    result[key] = val
-                    if isinstance(val, torch.Tensor):
-                        print(f"  {key}: shape={val.shape}, dtype={val.dtype}")
-                        if val.ndim >= 2:
-                            print(f"    [0,:5] = {val[0, :5].float().tolist()}")
-                    else:
-                        print(f"  {key}: {val}")
-                else:
-                    print(f"  WARNING: {key} not captured!")
-
-            # Compute fc1_gemm_input via dequantize of the activation QDQ
-            if "fc1_input" in captured:
-                fc1_input_gpu = captured["fc1_input"].to(f"cuda:{local_rank}")
-                tpe = captured.get("tokens_per_expert_padded")
-                if isinstance(tpe, torch.Tensor):
-                    m_splits = tpe.tolist()
-                else:
-                    m_splits = list(tpe)
-                m_splits_int = [int(x) for x in m_splits]
-
-                from miniTransformer.ops.nvfp4_quantize import (
-                    group_quantize_nvfp4_pertoken_swizzled,
-                    dequantize_group_nvfp4_pertoken_swizzled,
-                )
-
-                gq = group_quantize_nvfp4_pertoken_swizzled(fc1_input_gpu, m_splits_int)
-                fc1_gemm_input = dequantize_group_nvfp4_pertoken_swizzled(gq)
-                result["fc1_gemm_input"] = fc1_gemm_input.detach().cpu().clone()
-                print(f"  fc1_gemm_input (after QDQ): shape={fc1_gemm_input.shape}")
-
-                orig = captured["fc1_input"].float()
-                qdq_rel2 = (fc1_gemm_input.float().cpu() - orig).norm(dim=-1) / orig.norm(dim=-1).clamp(min=1e-8)
-                print(f"  activation QDQ rel2: mean={qdq_rel2.mean():.6f}, max={qdq_rel2.max():.6f}")
-
-            # Compute fc2_gemm_input via dequantize of the activation QDQ
-            if "fc2_input" in captured:
-                fc2_input_gpu = captured["fc2_input"].to(f"cuda:{local_rank}")
-                tpe = captured.get("tokens_per_expert_padded")
-                if isinstance(tpe, torch.Tensor):
-                    m_splits2 = tpe.tolist()
-                else:
-                    m_splits2 = list(tpe)
-                m_splits2_int = [int(x) for x in m_splits2]
-
-                from miniTransformer.ops.nvfp4_quantize import (
-                    group_quantize_nvfp4_pertoken_swizzled,
-                    dequantize_group_nvfp4_pertoken_swizzled,
-                )
-
-                gq2 = group_quantize_nvfp4_pertoken_swizzled(fc2_input_gpu, m_splits2_int)
-                fc2_gemm_input = dequantize_group_nvfp4_pertoken_swizzled(gq2)
-                result["fc2_gemm_input"] = fc2_gemm_input.detach().cpu().clone()
-                print(f"  fc2_gemm_input (after QDQ): shape={fc2_gemm_input.shape}")
-
-                orig2 = captured["fc2_input"].float()
-                qdq_rel2_fc2 = (fc2_gemm_input.float().cpu() - orig2).norm(dim=-1) / orig2.norm(dim=-1).clamp(min=1e-8)
-                print(f"  fc2 activation QDQ rel2: mean={qdq_rel2_fc2.mean():.6f}, max={qdq_rel2_fc2.max():.6f}")
-
-            # Compute per-expert original token indices via value matching
-            if "mlp_input_original" in captured and "experts_input_raw" in captured:
-                print("  [DEBUG] Starting value matching...", flush=True)
-                device = f"cuda:{local_rank}"
-                torch.cuda.synchronize(device)
-                print(f"  [DEBUG] CUDA synced. mlp_input_original type={type(captured['mlp_input_original'])}, "
-                      f"shape={captured['mlp_input_original'].shape}, device={captured['mlp_input_original'].device}", flush=True)
-
-                mlp_orig_cpu = captured["mlp_input_original"].float()
-                print(f"  [DEBUG] mlp_orig_cpu .float() done, shape={mlp_orig_cpu.shape}", flush=True)
-                while mlp_orig_cpu.ndim > 2:
-                    mlp_orig_cpu = mlp_orig_cpu.squeeze()
-                print(f"  [DEBUG] mlp_orig_cpu squeezed: shape={mlp_orig_cpu.shape}", flush=True)
-
-                experts_raw_cpu = captured["experts_input_raw"].float()
-                print(f"  [DEBUG] experts_raw_cpu .float() done, shape={experts_raw_cpu.shape}", flush=True)
-                while experts_raw_cpu.ndim > 2:
-                    experts_raw_cpu = experts_raw_cpu.squeeze()
-
-                tpe_u_list = captured.get("tokens_per_expert_unpadded")
-                if isinstance(tpe_u_list, torch.Tensor):
-                    tpe_u_list = tpe_u_list.tolist()
-                else:
-                    tpe_u_list = list(tpe_u_list)
-
-                mlp_norm = mlp_orig_cpu / mlp_orig_cpu.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                print(f"  [DEBUG] mlp_norm ready (CPU), starting expert loop ({len(tpe_u_list)} experts)...", flush=True)
-
-                per_expert_original_indices = {}
-                offset = 0
-                n_poor_match = 0
-                for eid in range(len(tpe_u_list)):
-                    n = int(tpe_u_list[eid])
-                    if n == 0:
-                        continue
-                    expert_tokens = experts_raw_cpu[offset:offset + n]
-                    expert_norm = expert_tokens / expert_tokens.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                    cos_matrix = expert_norm @ mlp_norm.T
-                    original_indices = cos_matrix.argmax(dim=-1)
-                    max_cos = cos_matrix.max(dim=-1).values
-                    if max_cos.min() < 0.999:
-                        n_poor_match += 1
-                    per_expert_original_indices[eid] = original_indices.int()
-                    offset += n
-                    if eid % 16 == 0:
-                        print(f"  [DEBUG] expert loop: eid={eid}, offset={offset}, n={n}", flush=True)
-
-                print(f"  [DEBUG] Expert loop done.", flush=True)
-                result["per_expert_original_indices"] = per_expert_original_indices
-                result["mlp_input_original"] = captured["mlp_input_original"]
-                print(f"  per_expert_original_indices: {len(per_expert_original_indices)} experts"
-                      f" ({n_poor_match} with poor match)")
-            else:
-                print(f"  [DEBUG] Value matching SKIPPED: mlp_input_original={'mlp_input_original' in captured}, experts_input_raw={'experts_input_raw' in captured}")
-
-            results[name] = result
+            records = _save_hook_records(name)
+            hook_records.append((name, records))
+            for key, _ in _HOOK_CAPTURE_ORDER:
+                if key in captured and isinstance(captured[key], torch.Tensor):
+                    print(f"  {key}: shape={tuple(captured[key].shape)}, "
+                          f"dtype={captured[key].dtype}")
 
     for h in handles:
         h.remove()
 
-    if rank == 0:
-        output_path = os.path.join(our_args.output_dir, "megatron_expert_fc1.pt")
-        torch.save(results, output_path)
-        print(f"\nSaved to {output_path}")
-
     dist.barrier()
+
+    if rank != 0:
+        dist.destroy_process_group()
+        return None
+
+    num_experts = getattr(megatron_args, "num_experts", None)
+    if num_experts is None and hasattr(linear_fc1, "num_gemms"):
+        num_experts = linear_fc1.num_gemms
+    summary = {
+        "hook_records": hook_records,
+        "sink_spans": sink_spans,
+        "sink_record_total": _count_lines(sink_index_path),
+        "num_experts": num_experts,
+        "router_topk": getattr(megatron_args, "moe_router_topk", None),
+        "routing_forced_samples": sorted(
+            n for n in sample_names if n in forced_routing
+        ),
+    }
     dist.destroy_process_group()
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# finalization (torch-free)
+# ---------------------------------------------------------------------------
+
+
+def finalize_run(cfg, run_writer, test_inputs, capture) -> int:
+    """Translate the sink raw index, write all run files. Returns exit code."""
+    sink_index_path = run_writer.run_dir / FRAMEWORK / "index.jsonl"
+    raw_sink_records = []
+    if sink_index_path.is_file():
+        with open(sink_index_path, encoding="utf-8") as f:
+            raw_sink_records = [json.loads(line) for line in f if line.strip()]
+
+    # integrity: per-sample spans must tile the raw sink index exactly --
+    # no unattributed records, no overlap, no gaps.
+    expected = 0
+    for name, before, after in capture["sink_spans"]:
+        if before != expected:
+            raise RuntimeError(
+                f"sink index attribution gap before sample {name!r}: expected line "
+                f"{expected}, got {before}; refusing to guess sample attribution"
+            )
+        expected = after
+    if expected != len(raw_sink_records):
+        raise RuntimeError(
+            f"sink index has {len(raw_sink_records)} records but per-sample spans "
+            f"cover {expected}; refusing to guess sample attribution"
+        )
+
+    # preserve the raw sink index next to the translated TensorRecord index
+    if sink_index_path.is_file():
+        os.replace(sink_index_path, sink_index_path.with_name(SINK_RAW_INDEX_NAME))
+
+    hook_records = dict()
+    for name, records in capture["hook_records"]:
+        hook_records.setdefault(name, []).extend(records)
+
+    n_hook = 0
+    n_sink_written = 0
+    n_sink_skipped = 0
+    for name, before, after in capture["sink_spans"]:
+        for record in hook_records.get(name, []):
+            run_writer.append_record(FRAMEWORK, record)
+            n_hook += 1
+        written, skipped = translate_and_append_sink_records(
+            run_writer,
+            raw_sink_records[before:after],
+            sample_id=name,
+            global_rank=_get_global_rank(),
+            expected_layer_id=cfg["layer_idx"],
+        )
+        n_sink_written += written
+        n_sink_skipped += skipped
+
+    samples_summary = [
+        {
+            "name": inp["name"],
+            "num_tokens": len(inp["input_ids"]),
+            "input_ids": inp["input_ids"],
+        }
+        for inp in test_inputs
+    ]
+    megatron_section = {
+        "framework": FRAMEWORK,
+        "layer_idx": cfg["layer_idx"],
+        "model_path": cfg["model_path"],
+        "ref_load": cfg["ref_load"],
+        "input_file": cfg["input_file"],
+        "parallel": {"tp": 1, "ep": cfg["ep_size"], "pp": 1},
+        "force_routing": cfg["force_routing"],
+        "num_samples": len(samples_summary),
+        "total_tokens": sum(s["num_tokens"] for s in samples_summary),
+        "samples": samples_summary,
+        "num_experts": capture["num_experts"],
+        "router_topk": capture["router_topk"],
+        "routing_forced_samples": capture["routing_forced_samples"],
+        "capture": {
+            "hook_records": n_hook,
+            "sink_records_translated": n_sink_written,
+            "sink_records_metadata_skipped": n_sink_skipped,
+            "sink_raw_index": f"{FRAMEWORK}/{SINK_RAW_INDEX_NAME}",
+            "router_logits": "not captured (Megatron TopKRouter does not expose "
+                             "pre-softmax logits; not fabricated)",
+        },
+    }
+    _merge_write_config(run_writer, megatron_section)
+    _finalize_manifest(run_writer)
+
+    print(f"\nRun directory: {run_writer.run_dir}")
+    print(f"  hook-boundary records written: {n_hook}")
+    print(f"  sink records translated:       {n_sink_written} "
+          f"(+{n_sink_skipped} metadata-only, kept in {FRAMEWORK}/{SINK_RAW_INDEX_NAME})")
+    print(f"  config: {run_writer.run_dir / 'config.resolved.json'}")
+    print(f"  index:  {run_writer.run_dir / FRAMEWORK / 'index.jsonl'}")
+
+    if not raw_sink_records:
+        print(
+            "\nERROR: the minite logpdiff sink produced no records -- the actual "
+            "kernel payloads (fc1/fc2 qdata/scales/output) are missing. Check that "
+            "SHOULD_REPLACE_TE_GROUPLINEAR=1 is set and the Megatron TEGroupedLinear "
+            "patch is applied. Hook-boundary records were still written.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def main():
+    parser = build_parser()
+    our_args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"WARNING: ignoring unrecognized args: {unknown}", file=sys.stderr)
+    cfg = resolve_config(our_args, parser)
+
+    run_writer, reused = _setup_run(cfg)
+    print(f"Run directory: {run_writer.run_dir} "
+          f"(run_id={run_writer.run_id}, joined_existing={reused})")
+
+    test_inputs = load_inputs(cfg["input_file"])
+    _write_or_verify_inputs(run_writer, test_inputs)
+
+    # enable the minite sink BEFORE minite is imported anywhere (the sink
+    # reads these at import time); payloads land in <run_dir>/megatron/
+    # (the reused run's megatron/ when joining via --run-dir)
+    os.environ["MINITE_LOGPDIFF_ENABLE"] = "1"
+    os.environ["MINITE_LOGPDIFF_OUTPUT_DIR"] = str(run_writer.run_dir / FRAMEWORK)
+
+    capture = run_capture(cfg, run_writer, test_inputs)
+    if capture is None:  # non-zero rank
+        return
+    sys.exit(finalize_run(cfg, run_writer, test_inputs, capture))
 
 
 if __name__ == "__main__":

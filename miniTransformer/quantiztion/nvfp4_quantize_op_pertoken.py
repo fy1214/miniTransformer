@@ -198,6 +198,23 @@ def _allocate_contiguous_output(
     return out
 
 
+def resolve_nvfp4_grouped_gemm_kind(name: Optional[str]) -> str:
+    """Map MoE layer name / ub_name to TE NVFP4 grouped tile family.
+
+    TE selects fc1 (2SM N256) vs fc2 (2SM N128) tiles only when
+    ``gemm_kind`` is explicitly ``fc1`` / ``fc2``; it is not inferred from K.
+    """
+    kind = str(name or "default").strip().lower()
+    if kind in ("fc1", "fc2", "default"):
+        return kind
+    # Megatron often passes tp_comm_buffer_name / ub_name like "fc1".
+    if kind.endswith("fc1") or kind == "linear_fc1":
+        return "fc1"
+    if kind.endswith("fc2") or kind == "linear_fc2":
+        return "fc2"
+    return "default"
+
+
 def nvfp4_grouped_gemm_tn_list(
     activation_data: List[torch.Tensor],
     weight_data: List[torch.Tensor],
@@ -207,8 +224,10 @@ def nvfp4_grouped_gemm_tn_list(
     weight_tensor_scale: List[torch.Tensor],
     m_splits: List[int],
     out: torch.Tensor,
+    gemm_kind: str = "default",
 ) -> torch.Tensor:
     """TN grouped GEMM with per-expert list tensors."""
+    gemm_kind = resolve_nvfp4_grouped_gemm_kind(gemm_kind)
     output_views: List[torch.Tensor] = []
     row_offset = 0
     for num_tokens in m_splits:
@@ -246,7 +265,7 @@ def nvfp4_grouped_gemm_tn_list(
             True,
             False,
             [],
-            "default",
+            gemm_kind,
         )
     return out
 
@@ -261,18 +280,19 @@ def nvfp4_grouped_gemm_tn_dense(
     m_splits: List[int],
     n_cols: int,
     out: torch.Tensor,
+    gemm_kind: str = "default",
 ) -> torch.Tensor:
     """TN grouped GEMM with dense concatenated tensors.
 
     Prefix offset tables are omitted so TE fills them on device from
-    ``m_splits`` (uniform N from packed B/D, ``k_sf=K/16``).
+    ``m_splits`` (uniform N from packed B/D, ``k_sf=K/16``). Empty experts
+    (``m_splits[i] == 0``) are allowed; TE skips those groups while keeping
+    the ``G*N`` weight pack intact.
     """
-    positive_splits = [int(m) for m in m_splits if int(m) > 0]
-    if not positive_splits:
+    gemm_kind = resolve_nvfp4_grouped_gemm_kind(gemm_kind)
+    if sum(int(m) for m in m_splits) == 0:
         out.zero_()
         return out
-    if any(int(m) == 0 for m in m_splits):
-        raise RuntimeError("dense grouped GEMM path requires all m_splits > 0")
     if int(out.size(1)) != int(n_cols):
         raise RuntimeError(
             f"dense grouped GEMM out N={out.size(1)} != n_cols={n_cols}"
@@ -290,9 +310,9 @@ def nvfp4_grouped_gemm_tn_dense(
         None,
         None,
         None,
-        positive_splits,
+        [int(m) for m in m_splits],
         False,
-        "default",
+        gemm_kind,
     )
     return out
 
@@ -601,6 +621,10 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         del qparams_x, qparams_w
         assert m_splits is not None
+        # Module passes TE tile family via extra_info_A["gemm_kind"] (fc1/fc2/default).
+        gemm_kind = "default"
+        if isinstance(extra_info_A, dict) and extra_info_A.get("gemm_kind") is not None:
+            gemm_kind = resolve_nvfp4_grouped_gemm_kind(extra_info_A.get("gemm_kind"))
 
         # Forward TN: dense concatenated NVFP4 path.
         if self._can_use_dense_nvfp4_forward_gemm(
@@ -633,6 +657,7 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
                     m_splits,
                     n_cols,
                     out_tensor,
+                    gemm_kind=gemm_kind,
                 )
 
         # Forward TN: per-expert list NVFP4 path.
@@ -656,7 +681,15 @@ class Nvfp4TiledQuantizePertokenOp(quantization.QuantizeOpBase):
             )
             with record_function("grouped_gemm_nvfp4_direct_tn"):
                 return nvfp4_grouped_gemm_tn_list(
-                    A, B, sA, sB, global_amax_A, global_amax_B, m_splits, out_tensor
+                    A,
+                    B,
+                    sA,
+                    sB,
+                    global_amax_A,
+                    global_amax_B,
+                    m_splits,
+                    out_tensor,
+                    gemm_kind=gemm_kind,
                 )
 
         first_lhs = A[0]

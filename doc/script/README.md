@@ -4,7 +4,8 @@
 
 | 文件 | 作用 |
 |------|------|
-| `moe_training.sh` | 单 backend 启动 `pretrain_gpt.py`（Qwen3-30B-A3B MoE 形状） |
+| `moe_training.sh` | **原始** TE NVFP4 训练启动脚本（不改） |
+| `moe_training_e2e.sh` | 多 backend e2e 性能启动（TE / QAT14–17，支持 `--backend`） |
 | `moe_training_bf16.sh` | **只跑 TE BF16** 的便捷入口（默认 `PROFILE=off` + mock） |
 | `moe_training_c3_dapo.sh` | **C3 对齐**：DAPO packed + HF tokenizer + `--load` torch_dist BF16，seed `20260913` |
 | `moe_training_sweep.sh` | 扫 backend，汇总 `perf_summary.json` → `compare.json` |
@@ -20,7 +21,8 @@
 | `qat14` | miniTE `SHOULD_REPLACE` + `QAT_PARAMS=14` |
 | `qat15` | QAT15 + 默认 `MINITE_NVFP4_PATH=dense` |
 | `qat15_disable_bwd` | QAT15 + `DISABLE_BACKWARD_QUANT=1` |
-| `qat16` | QAT16（NVFP4 fwd + BF16 bwd op） |
+| `qat16` | QAT15 act per-token + weight per-expert tensor amax（`W_PERTENSOR`） |
+| `qat17` | 原 QAT16：NVFP4 per-token fwd + BF16 bwd op |
 
 ## 用法
 
@@ -29,11 +31,11 @@
 bash doc/script/moe_training_bf16.sh
 TRAIN_ITERS=10 bash doc/script/moe_training_bf16.sh
 
-# 单跑其它 backend
+# 单跑其它 backend（用 e2e 脚本，不要改 moe_training.sh）
 BACKEND=qat15 PROFILE=nsys TRAIN_ITERS=30 \
-  bash doc/script/moe_training.sh
+  bash doc/script/moe_training_e2e.sh
 
-bash doc/script/moe_training.sh --backend te_nvfp4_pertoken --profile off
+bash doc/script/moe_training_e2e.sh --backend te_nvfp4_pertoken --profile off
 
 # C3 对齐：DAPO packed + HF tokenizer + 同一 torch_dist BF16 ckpt
 # 资产目录默认 /root/c3_assets（见 moe_training_c3_dapo.sh）
@@ -41,7 +43,7 @@ bash doc/script/moe_training_c3_dapo.sh
 BACKEND=qat15_disable_bwd TRAIN_ITERS=20 bash doc/script/moe_training_c3_dapo.sh
 
 # 扫全表（默认 mock data；有真实数据时设 DATA_PATH / TOKENIZER_PATH）
-BACKENDS="te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16" \
+BACKENDS="te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16 qat17" \
   PROFILE=nsys TRAIN_ITERS=30 \
   bash doc/script/moe_training_sweep.sh
 ```

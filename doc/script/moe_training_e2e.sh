@@ -303,11 +303,14 @@ MODEL_PARALLEL_ARGS=(
   --expert-model-parallel-size "${EP}"
   --micro-batch-size "${MICRO_BATCH_SIZE}"
   --global-batch-size "${GLOBAL_BATCH_SIZE}"
-  --overlap-grad-reduce
-  --overlap-param-gather
+  # NOTE: --untie-embeddings-and-output-weights makes the output layer a separate parameter that
+  # must be DDP-bucketed; mcore asserts with the overlap flags enabled. Short
+  # term workaround (see report section 6): drop both overlap flags, cost ~0.6%
+  # throughput. Re-enable once mcore handles untied embeddings with overlap.
 )
 
 GPT_ARGS=(
+  --untie-embeddings-and-output-weights
   --qk-layernorm
   --max-position-embeddings "${SEQ_LENGTH}"
   --num-layers "${NUM_LAYERS}"

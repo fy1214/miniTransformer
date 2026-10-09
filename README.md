@@ -76,4 +76,4 @@ class TEGroupedLinear(GroupedLinear):
 
 Qwen3-4B in nvfp4_quantize_op_ref metric
 
-![Qwen3-4B在nvfp4_quantize_op_ref下loss曲线](doc/images/image.png)
+![Qwen3-4B在nvfp4_quantize_op_ref下loss曲线](develop/docs/img/image.png)

@@ -28,24 +28,24 @@
 
 ```bash
 # 只跑 TE BF16（推荐冒烟 / 基线）
-bash doc/script/moe_training_bf16.sh
-TRAIN_ITERS=10 bash doc/script/moe_training_bf16.sh
+bash develop/script/moe_training_bf16.sh
+TRAIN_ITERS=10 bash develop/script/moe_training_bf16.sh
 
 # 单跑其它 backend（用 e2e 脚本，不要改 moe_training.sh）
 BACKEND=qat15 PROFILE=nsys TRAIN_ITERS=30 \
-  bash doc/script/moe_training_e2e.sh
+  bash develop/script/moe_training_e2e.sh
 
-bash doc/script/moe_training_e2e.sh --backend te_nvfp4_pertoken --profile off
+bash develop/script/moe_training_e2e.sh --backend te_nvfp4_pertoken --profile off
 
 # C3 对齐：DAPO packed + HF tokenizer + 同一 torch_dist BF16 ckpt
 # 资产目录默认 /root/c3_assets（见 moe_training_c3_dapo.sh）
-bash doc/script/moe_training_c3_dapo.sh
-BACKEND=qat15_disable_bwd TRAIN_ITERS=20 bash doc/script/moe_training_c3_dapo.sh
+bash develop/script/moe_training_c3_dapo.sh
+BACKEND=qat15_disable_bwd TRAIN_ITERS=20 bash develop/script/moe_training_c3_dapo.sh
 
 # 扫全表（默认 mock data；有真实数据时设 DATA_PATH / TOKENIZER_PATH）
 BACKENDS="te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16 qat17" \
   PROFILE=nsys TRAIN_ITERS=30 \
-  bash doc/script/moe_training_sweep.sh
+  bash develop/script/moe_training_sweep.sh
 ```
 
 常用覆盖：`MEGATRON_ROOT` `CUDA_VISIBLE_DEVICES` `TP/PP/CP/EP` `SEQ_LENGTH` `NUM_LAYERS` `LOG_ROOT` `MINITE_NVFP4_PATH`。

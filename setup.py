@@ -148,7 +148,7 @@ def get_cmdclass() -> dict:
 
 
 setup(
-    packages=setuptools.find_packages(exclude=["tests*", "doc*"]),
+    packages=setuptools.find_packages(exclude=["tests*", "develop*"]),
     ext_modules=build_extensions(),
     cmdclass=get_cmdclass(),
 )

@@ -12,11 +12,11 @@
 #   qat17 | mini_qat17   # former QAT16: per-token fwd + BF16 bwd
 #
 # Examples:
-#   BACKEND=te_bf16 bash doc/script/moe_training_e2e.sh
-#   bash doc/script/moe_training_e2e.sh --backend qat15 --profile nsys
-#   BACKENDS="te_bf16 te_nvfp4 qat15" bash doc/script/moe_training_sweep.sh
+#   BACKEND=te_bf16 bash develop/script/moe_training_e2e.sh
+#   bash develop/script/moe_training_e2e.sh --backend qat15 --profile nsys
+#   BACKENDS="te_bf16 te_nvfp4 qat15" bash develop/script/moe_training_sweep.sh
 #
-# Note: leaves doc/script/moe_training.sh (original TE-only launcher) untouched.
+# Note: leaves develop/script/moe_training.sh (original TE-only launcher) untouched.
 #
 # Env overrides (common):
 #   MEGATRON_ROOT / MINITRANSFORMER_ROOT / CUDA_VISIBLE_DEVICES

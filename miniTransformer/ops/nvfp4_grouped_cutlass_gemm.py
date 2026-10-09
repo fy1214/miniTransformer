@@ -262,7 +262,7 @@ def grouped_cutlass_gemm_v2(inputs: V2GemmInputs, out_dtype: torch.dtype) -> tor
 
 
 # ---------------------------------------------------------------------------
-# v2_evt: EVT-fused per-token scale (Phase 1 of doc/fp4_quant_gemm_fuse_phase2.md)
+# v2_evt: EVT-fused per-token scale (Phase 1 of develop/fp4_quant_gemm_fuse_phase2.md)
 #
 # Identical to v2 above, but the post-GEMM per_token_scale multiply is folded
 # into the CUTLASS epilogue via Sm90ColBroadcast (PtrArray flavor).  The math

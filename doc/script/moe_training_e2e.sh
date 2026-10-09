@@ -303,11 +303,16 @@ MODEL_PARALLEL_ARGS=(
   --expert-model-parallel-size "${EP}"
   --micro-batch-size "${MICRO_BATCH_SIZE}"
   --global-batch-size "${GLOBAL_BATCH_SIZE}"
-  --overlap-grad-reduce
-  --overlap-param-gather
+  # No --overlap-grad-reduce / --overlap-param-gather: matches slime Qwen3
+  # training, and avoids mcore DDP assert when output_layer is untied
+  # (single-param bucket > default 40M elements).
 )
 
 GPT_ARGS=(
+  # Qwen3-30B-A3B stores embedding and output_layer as two tensors (same as
+  # slime scripts/models/qwen3-30B-A3B.sh). Without this flag a tied graph
+  # silently drops output_layer.weight under assume_ok_unexpected.
+  --untie-embeddings-and-output-weights
   --qk-layernorm
   --max-position-embeddings "${SEQ_LENGTH}"
   --num-layers "${NUM_LAYERS}"

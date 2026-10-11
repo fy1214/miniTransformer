@@ -84,7 +84,7 @@ PRECISE_ARGS=(
     "NVTE_NVFP4_DISABLE_RHT": "0",
     "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING": "0",
     "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",  // 1D scale — 对齐 sglang modelopt_fp4 推理
-    "QAT_PARAM": "8"
+    "MINITE_RECIPE": "fp4_subchannel_scaling_cursor2_cutlass"
 }
 ```
 
@@ -93,7 +93,7 @@ PRECISE_ARGS=(
 - `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=0` — 量化时开随机舍入
 - `NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1` — 权重保持 1D 量化；当前 sglang modelopt_fp4
   推理用的就是 1D 内核，开 2D block-scale 推理会有问题
-- `QAT_PARAM=8` — QAT 参数粒度（对应 V2 transpose-quantize 的 QAT8 配方）
+- `MINITE_RECIPE=fp4_subchannel_scaling_cursor2_cutlass` — Cursor2 CUTLASS 配方；其他数值路径见[配置手册](../../develop/docs/zh/recipes.md)
 
 ## 模型权重准备
 

@@ -1,5 +1,7 @@
 # Developer Guide
 
+See the [recipe guide](recipes.md) for named selection, the complete mapping, and compatibility rules.
+
 This guide covers how to install, integrate, and extend miniTransformer on **NVIDIA Blackwell (B200, sm_100+)**. Quantized operator paths are currently validated on Blackwell only.
 
 | Language | Document |
@@ -110,7 +112,7 @@ miniTransformer/
 │   ├── utils/env.py      # Env parsing (QAT, NVTE, DISABLE_BACKWARD_QUANT, …)
 │   └── profiler/         # Linear-level profiling hooks
 ├── patch/b200/           # One-shot B200 patches
-├── doc/script/           # MoE e2e, nsys, and sweep launchers
+├── develop/script/           # MoE e2e, nsys, and sweep launchers
 ├── tests/python/         # Unit tests and fair benchmarks
 └── tools/                # Diagnostics (e.g. logpdiff)
 ```
@@ -120,7 +122,7 @@ Call chain for MoE experts:
 ```
 Megatron TEGroupedLinear
   → miniTransformer.GroupedLinear
-    → QLinearParams (from QAT_PARAMS → QuantizeRecipe)
+    → QLinearParams (from MINITE_RECIPE / QAT_PARAMS → QuantizeRecipe)
       → QuantizeOp.group_quantize / grouped_gemm
         → kernels under ops/ and csrc/
 ```
@@ -142,22 +144,24 @@ NVFP4 end-to-end `PRECISE_ARGS` and Ray `env_vars` are documented in [patch/b200
 
 ### 3.2 Megatron MoE e2e
 
-Use `doc/script/moe_training_e2e.sh` for multi-backend comparison. Keep `moe_training.sh` as the original TE-only launcher; do not layer miniTransformer logic onto it.
+Use `develop/script/moe_training_e2e.sh` for multi-backend comparison. Keep `moe_training.sh` as the original TE-only launcher; do not layer miniTransformer logic onto it.
 
 ```bash
-# BF16 smoke
-bash develop/script/moe_training_bf16.sh
+# BF16 baseline
+bash develop/script/moe_training_e2e.sh --backend te_bf16 --profile off
 
-# Single backend
-BACKEND=qat15 PROFILE=off TRAIN_ITERS=30 \
+# Named miniTransformer entry and a preview before training
+bash develop/script/moe_training_e2e.sh --backend mini_nvfp4_per_token --profile off --dry-run
+BACKEND=mini_nvfp4_per_token PROFILE=off TRAIN_ITERS=30 \
   bash develop/script/moe_training_e2e.sh
 
-# Sweep
-BACKENDS="te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16 qat17" \
-  bash develop/script/moe_training_sweep.sh
+# Repeat the launcher to compare backends
+for backend in te_bf16 te_nvfp4 mini_nvfp4_per_token mini_nvfp4_per_token_bf16_bwd; do
+  BACKEND="$backend" PROFILE=off TRAIN_ITERS=30 bash develop/script/moe_training_e2e.sh
+done
 ```
 
-`moe_training_e2e.sh` matches the slime Qwen3 settings (including omitting both DDP overlap flags). See [doc/script/README.md](../../script/README.md) for more detail.
+`moe_training_e2e.sh` matches the slime Qwen3 settings (including omitting both DDP overlap flags). See [develop/script/README.md](../../script/README.md) for more detail.
 
 ### 3.3 Integration modes
 
@@ -174,28 +178,31 @@ For dense models, Megatron `TELinear` / `TELayerNormColumnParallelLinear` can su
 
 ## 4. Environment Variables
 
-### 4.1 `QAT_PARAMS`
+### 4.1 `MINITE_RECIPE` / `QAT_PARAMS`
 
-`Linear` and `GroupedLinear` resolve this variable through `get_qlinear_params_from_env_qat_params()` in `miniTransformer.module.config`. If unset, a warning is logged and index **6** (Cursor2 reference) is used.
+Prefer names, such as `MINITE_RECIPE=nvfp4_per_token`. Existing `QAT_PARAMS=1…17`
+values remain accepted. Both selectors must agree when set together. Explicit
+layer `qlinear_params` take priority. Neither set preserves the QAT6 reference
+fallback with a warning.
 
-Primary indices and e2e backends:
+Python callers can use `get_qlinear_params("nvfp4_per_token")`; existing factory
+APIs remain supported. See the [recipe guide](recipes.md) for the complete
+mapping, tuning flags, and the distinction between the two BF16 backward paths.
 
-| `QAT_PARAMS` | Recipe | e2e backend | Notes |
-|--------------|--------|-------------|-------|
-| 14 | `FP4_SUB_CHANNEL_CURSOR2_CUTLASS_V2` | `qat14` | Cursor2 CUTLASS V2 |
-| 15 | `FP4_SUB_CHANNEL_PERTOKEN` | `qat15` | Per-token activations; default `MINITE_NVFP4_PATH=dense` |
-| 16 | `FP4_SUB_CHANNEL_PERTOKEN_W_PERTENSOR` | `qat16` | QAT15 activations + per-expert tensor weight amax |
-| 17 | `FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD` | `qat17` | Per-token forward; BF16 backward |
+| Name | Legacy ID | e2e backend |
+|---|---:|---|
+| `nvfp4_cursor2_cutlass_v2` | 14 | `mini_nvfp4_cursor2_cutlass_v2` / `qat14` |
+| `nvfp4_per_token` | 15 | `mini_nvfp4_per_token` / `qat15` |
+| `nvfp4_per_token_w_per_tensor` | 16 | `mini_nvfp4_per_token_w_per_tensor` / `qat16` |
+| `nvfp4_per_token_bf16_bwd` | 17 | `mini_nvfp4_per_token_bf16_bwd` / `qat17` |
 
-Indices 1–13 (INT4, quartet, legacy Cursor2, QDQ, and others) are defined in `get_qlinear_params_from_env_qat_params` in `config.py`.
-
-> **Note:** Some older docs or scripts use `QAT_PARAM` (no trailing `S`). The runtime only reads `QAT_PARAMS`.
+The older spelling `QAT_PARAM` (without S) is ignored; use `MINITE_RECIPE` or `QAT_PARAMS`.
 
 ### 4.2 `SHOULD_REPLACE_TE_GROUPLINEAR`
 
 | Value | Behavior |
 |-------|----------|
-| `1` | Use miniTransformer `GroupedLinear`; recipe selected by `QAT_PARAMS` |
+| `1` | Use miniTransformer `GroupedLinear`; recipe selected by `MINITE_RECIPE` / `QAT_PARAMS` |
 | unset / other | Use native TE `GroupedLinear` (optionally with `--fp4-*` for TE NVFP4) |
 
 ### 4.3 Other common variables
@@ -203,7 +210,7 @@ Indices 1–13 (INT4, quartet, legacy Cursor2, QDQ, and others) are defined in `
 | Variable | Meaning |
 |----------|---------|
 | `DISABLE_BACKWARD_QUANT=1` | Skip backward quantization (BF16 path); e2e backend `qat15_disable_bwd` |
-| `MINITE_NVFP4_PATH` | Weight layout; default `dense` for QAT15/16 |
+| `MINITE_NVFP4_PATH` | TE packaging; runtime defaults to `auto`, e2e QAT15–17 to `dense` |
 | `NVTE_NVFP4_DISABLE_RHT` | `0` enable RHT; `1` disable |
 | `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING` | `0` enable SR; `1` disable |
 | `NVTE_NVFP4_DISABLE_2D_QUANTIZATION` | `1` use 1D weight scales (aligns with SGLang `modelopt_fp4`) |
@@ -216,7 +223,7 @@ Parsing lives in `miniTransformer/utils/env.py`.
 
 ## 5. Adding a QuantizeOp
 
-Goal: register a new recipe selectable via `QAT_PARAMS=N` and invoked by `GroupedLinear` / `Linear`.
+Goal: register a named recipe selectable via `MINITE_RECIPE=your_recipe` and invoked by `GroupedLinear` / `Linear`.
 
 ### 5.1 Implement the operator
 
@@ -243,20 +250,20 @@ Edit `miniTransformer/module/config.py`:
 
 1. Add a `QuantizeRecipe` enum value.
 2. Return a `QLinearParams` with `quantize_op=YourOp()` from `get_qlinear_params_from_predefined(...)`.
-3. Add a `qat_params_idx == N` branch in `get_qlinear_params_from_env_qat_params()`.
+3. Add a `RecipeSpec` entry to `miniTransformer/recipes.py`, including the enum value, public name, purpose, and dependencies. Keep existing QAT IDs fixed; a new recipe can have no legacy ID. Import its operator only inside the selected factory branch.
 
-Optionally add an e2e backend in `doc/script/moe_training_e2e.sh` that sets `SHOULD_REPLACE_TE_GROUPLINEAR=1` and `QAT_PARAMS=N`.
+Optionally add an e2e backend in `develop/script/moe_training_e2e.sh` that sets `SHOULD_REPLACE_TE_GROUPLINEAR=1` and `QAT_PARAMS=N`.
 
 ### 5.3 Smoke test
 
 ```bash
 cd tests/python/module
-python test_group_linear_exact.py --qparam 15 --tests 1 2
+python test_group_linear_exact.py --recipe nvfp4_per_token --tests 1 2
 
-QAT_PARAMS=N python test_group_linear_exact.py --tests 1 2
+python test_group_linear_exact.py --recipe your_recipe --tests 1 2
 ```
 
-Add precision coverage under `tests/python/nvfp4/` and e2e wiring under `doc/script/` as needed.
+Add precision coverage under `tests/python/nvfp4/` and e2e wiring under `develop/script/` as needed.
 
 ---
 
@@ -278,7 +285,7 @@ Marker definitions (`production` / `legacy` / `eval` / `bench` / `slow`): [tests
 
 ```bash
 python tests/python/module/test_group_linear_exact.py
-python tests/python/module/test_group_linear_exact.py --qparam 14 --tests 1 2 3
+python tests/python/module/test_group_linear_exact.py --recipe nvfp4_cursor2_cutlass_v2 --tests 1 2 3
 
 python tests/python/module/test_group_linear_te_vs_mini.py
 ```
@@ -286,15 +293,11 @@ python tests/python/module/test_group_linear_te_vs_mini.py
 ### 6.3 Megatron fair / low-bit
 
 ```bash
-torchrun --nproc_per_node=4 \
-  tests/python/megatron/bench_moe_pertoken_fair.py \
-  --backend mini_qat15 --bench-mode fwb --preset qwen3-30b-a3b \
-  --tp-size 4 --moe --moe-grouped-gemm --seq-length 4096 --num-layers 1
-
-bash tests/python/megatron/run_fair_bench_te_vs_mini.sh
+python tests/python/megatron/test_lowbit_param.py --help
+bash develop/script/moe_training_e2e.sh --backend mini_nvfp4_per_token --profile off --dry-run
 ```
 
-Heavier e2e and nsys flows live under `doc/script/`.
+Heavier e2e and nsys flows live under `develop/script/`.
 
 ### 6.4 Distributed
 
@@ -308,6 +311,6 @@ See [tests/python/distributed/README.md](../../../tests/python/distributed/READM
 2. For local code changes, run `pip install -e . --no-build-isolation --no-deps` under `/root/miniTransformer`.
 3. Run `bash patch/b200/setup.sh` only when not using the Dockerfile-based image.
 4. Run `pytest tests/python/nvfp4 -m "production and not bench" -q`.
-5. Run `BACKEND=te_bf16 PROFILE=off TRAIN_ITERS=5 bash doc/script/moe_training_bf16.sh`.
-6. Optionally run `BACKEND=qat15 ... bash doc/script/moe_training_e2e.sh`.
+5. Run `BACKEND=te_bf16 PROFILE=off TRAIN_ITERS=5 bash develop/script/moe_training_e2e.sh`.
+6. Optionally run `BACKEND=mini_nvfp4_per_token PROFILE=off TRAIN_ITERS=5 bash develop/script/moe_training_e2e.sh`.
 7. For slime / e2e, confirm DDP overlap is not enabled (`--overlap-grad-reduce` / `--overlap-param-gather`).

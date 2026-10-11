@@ -8,7 +8,8 @@ Backward aligns with Transformer Engine BF16 ``GroupedLinear``:
   - ``data_t`` holds BF16 row splits (transpose is via GEMM layout ``NN``/``NT``)
   - ``grouped_gemm(grad=True)`` uses TE ``general_grouped_gemm`` on plain BF16
 
-Enable with ``QAT_PARAMS=16`` (recipe ``FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD``).
+Enable with ``MINITE_RECIPE=nvfp4_per_token_bf16_bwd`` or ``QAT_PARAMS=17``
+(recipe ``FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD``).
 Does not require ``DISABLE_BACKWARD_QUANT``.
 """
 

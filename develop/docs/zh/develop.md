@@ -1,5 +1,7 @@
 # 开发指南
 
+具名配方、完整编号对照与兼容规则见[配置手册](recipes.md)。
+
 本文说明如何在 **NVIDIA Blackwell（B200，sm_100+）** 上安装、集成并扩展 miniTransformer。当前量化算子路径仅保证在 Blackwell 上可用。
 
 | 语言 | 文档 |
@@ -110,7 +112,7 @@ miniTransformer/
 │   ├── utils/env.py      # 环境变量解析（QAT、NVTE、DISABLE_BACKWARD_QUANT 等）
 │   └── profiler/         # Linear 级 profiling hook
 ├── patch/b200/           # B200 一键补丁
-├── doc/script/           # MoE e2e、nsys、sweep 启动脚本
+├── develop/script/           # MoE e2e、nsys、sweep 启动脚本
 ├── tests/python/         # 单元测试与 fair benchmark
 └── tools/                # 诊断工具（如 logpdiff）
 ```
@@ -142,22 +144,24 @@ Megatron TEGroupedLinear
 
 ### 3.2 Megatron MoE e2e
 
-请使用 `doc/script/moe_training_e2e.sh` 进行多 backend 对比；保留 `moe_training.sh` 作为原始 TE-only 启动脚本，勿在其上叠加 miniTransformer 逻辑。
+请使用 `develop/script/moe_training_e2e.sh` 进行多 backend 对比；保留 `moe_training.sh` 作为原始 TE-only 启动脚本，勿在其上叠加 miniTransformer 逻辑。
 
 ```bash
-# BF16 冒烟
-bash develop/script/moe_training_bf16.sh
+# BF16 baseline
+bash develop/script/moe_training_e2e.sh --backend te_bf16 --profile off
 
-# 单 backend
-BACKEND=qat15 PROFILE=off TRAIN_ITERS=30 \
+# Named miniTransformer entry and a preview before training
+bash develop/script/moe_training_e2e.sh --backend mini_nvfp4_per_token --profile off --dry-run
+BACKEND=mini_nvfp4_per_token PROFILE=off TRAIN_ITERS=30 \
   bash develop/script/moe_training_e2e.sh
 
-# 多 backend 扫描
-BACKENDS="te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16 qat17" \
-  bash develop/script/moe_training_sweep.sh
+# Repeat the launcher to compare backends
+for backend in te_bf16 te_nvfp4 mini_nvfp4_per_token mini_nvfp4_per_token_bf16_bwd; do
+  BACKEND="$backend" PROFILE=off TRAIN_ITERS=30 bash develop/script/moe_training_e2e.sh
+done
 ```
 
-`moe_training_e2e.sh` 已与 slime Qwen3 配置对齐（含关闭上述两个 DDP overlap 选项）。更多说明见 [doc/script/README.md](../../script/README.md)。
+`moe_training_e2e.sh` 已与 slime Qwen3 配置对齐（含关闭上述两个 DDP overlap 选项）。更多说明见 [develop/script/README.md](../../script/README.md)。
 
 ### 3.3 接入方式
 
@@ -174,28 +178,29 @@ Dense 模型可将 Megatron 的 `TELinear` / `TELayerNormColumnParallelLinear` �
 
 ## 4. 环境变量
 
-### 4.1 `QAT_PARAMS`
+### 4.1 `MINITE_RECIPE` / `QAT_PARAMS`
 
-`Linear` 与 `GroupedLinear` 在初始化时通过 `get_qlinear_params_from_env_qat_params()`（`miniTransformer.module.config`）解析该变量。未设置时记录 warning，并默认使用索引 **6**（Cursor2 reference）。
+优先使用具名入口，例如 `MINITE_RECIPE=nvfp4_per_token`。原有 `QAT_PARAMS=1…17`
+继续可用；两者同时设置必须指向同一配方，否则报错。显式传给层的 `qlinear_params`
+优先于这两个选择变量。都未设置时保留 QAT6 reference 回退，并记录 warning。
 
-当前主线索引与 e2e backend 对应关系：
+Python 可使用 `get_qlinear_params("nvfp4_per_token")`；原有工厂接口继续可用。
+完整对照、其他环境变量和两种 BF16 backward 的区别见[配置手册](recipes.md)。
 
-| `QAT_PARAMS` | Recipe | e2e backend | 说明 |
-|--------------|--------|-------------|------|
-| 14 | `FP4_SUB_CHANNEL_CURSOR2_CUTLASS_V2` | `qat14` | Cursor2 CUTLASS V2 |
-| 15 | `FP4_SUB_CHANNEL_PERTOKEN` | `qat15` | 激活 per-token；默认 `MINITE_NVFP4_PATH=dense` |
-| 16 | `FP4_SUB_CHANNEL_PERTOKEN_W_PERTENSOR` | `qat16` | QAT15 激活路径 + 权重 per-expert tensor amax |
-| 17 | `FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD` | `qat17` | 前向 per-token；反向 BF16 |
+| 名称 | 旧编号 | e2e backend |
+|---|---:|---|
+| `nvfp4_cursor2_cutlass_v2` | 14 | `mini_nvfp4_cursor2_cutlass_v2` / `qat14` |
+| `nvfp4_per_token` | 15 | `mini_nvfp4_per_token` / `qat15` |
+| `nvfp4_per_token_w_per_tensor` | 16 | `mini_nvfp4_per_token_w_per_tensor` / `qat16` |
+| `nvfp4_per_token_bf16_bwd` | 17 | `mini_nvfp4_per_token_bf16_bwd` / `qat17` |
 
-索引 1–13（INT4、quartet、历史 Cursor2、QDQ 等）见 `config.py` 中的 `get_qlinear_params_from_env_qat_params`。
-
-> **注意：** 部分旧文档或脚本使用 `QAT_PARAM`（无 `S`）。运行时仅识别 `QAT_PARAMS`。
+旧变量名 `QAT_PARAM`（没有 S）不生效；应使用 `MINITE_RECIPE` 或 `QAT_PARAMS`。
 
 ### 4.2 `SHOULD_REPLACE_TE_GROUPLINEAR`
 
 | 取值 | 行为 |
 |------|------|
-| `1` | 使用 miniTransformer `GroupedLinear`，并由 `QAT_PARAMS` 选择 recipe |
+| `1` | 使用 miniTransformer `GroupedLinear`，并由 `MINITE_RECIPE` / `QAT_PARAMS` 选择 recipe |
 | 未设置或其他 | 使用 TE 原生 `GroupedLinear`（可配合 `--fp4-*` 启用 TE NVFP4） |
 
 ### 4.3 其他常用变量
@@ -203,7 +208,7 @@ Dense 模型可将 Megatron 的 `TELinear` / `TELayerNormColumnParallelLinear` �
 | 变量 | 含义 |
 |------|------|
 | `DISABLE_BACKWARD_QUANT=1` | 反向跳过量化，BF16 直通（e2e：`qat15_disable_bwd`） |
-| `MINITE_NVFP4_PATH` | 权重量化布局；QAT15/16 默认 `dense` |
+| `MINITE_NVFP4_PATH` | TE 数据包装；普通调用默认 `auto`，e2e QAT15–17 默认 `dense` |
 | `NVTE_NVFP4_DISABLE_RHT` | `0` 启用 RHT；`1` 关闭 |
 | `NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING` | `0` 启用随机舍入；`1` 关闭 |
 | `NVTE_NVFP4_DISABLE_2D_QUANTIZATION` | `1` 使用 1D weight scale（对齐 SGLang `modelopt_fp4`） |
@@ -216,7 +221,7 @@ Dense 模型可将 Megatron 的 `TELinear` / `TELayerNormColumnParallelLinear` �
 
 ## 5. 添加 QuantizeOp
 
-目标是使新 recipe 可通过 `QAT_PARAMS=N` 被选中，并由 `GroupedLinear` / `Linear` 调用。
+目标是使新 recipe 可通过 `MINITE_RECIPE=your_recipe` 被选中，并由 `GroupedLinear` / `Linear` 调用。
 
 ### 5.1 实现算子
 
@@ -243,20 +248,20 @@ Dense 模型可将 Megatron 的 `TELinear` / `TELayerNormColumnParallelLinear` �
 
 1. 在 `QuantizeRecipe` 中新增枚举值；
 2. 在 `get_qlinear_params_from_predefined(...)` 中返回包含 `quantize_op=YourOp()` 的 `QLinearParams`；
-3. 在 `get_qlinear_params_from_env_qat_params()` 中增加 `qat_params_idx == N` 分支。
+3. 在 `miniTransformer/recipes.py` 中新增 `RecipeSpec`，填写枚举值、具名入口、用途与依赖。已有 QAT 编号不变；新配方可不分配旧编号。算子只在对应工厂分支内导入。
 
-如需纳入 e2e，可在 `doc/script/moe_training_e2e.sh` 中增加对应 backend，并设置 `SHOULD_REPLACE_TE_GROUPLINEAR=1` 与 `QAT_PARAMS=N`。
+如需纳入 e2e，可在 `develop/script/moe_training_e2e.sh` 中增加对应 backend，并设置 `SHOULD_REPLACE_TE_GROUPLINEAR=1` 与 `QAT_PARAMS=N`。
 
 ### 5.3 冒烟验证
 
 ```bash
 cd tests/python/module
-python test_group_linear_exact.py --qparam 15 --tests 1 2
+python test_group_linear_exact.py --recipe nvfp4_per_token --tests 1 2
 
-QAT_PARAMS=N python test_group_linear_exact.py --tests 1 2
+python test_group_linear_exact.py --recipe your_recipe --tests 1 2
 ```
 
-随后可按需补充 `tests/python/nvfp4/` 下的精度测试，以及 `doc/script` 中的 e2e 配置。
+随后可按需补充 `tests/python/nvfp4/` 下的精度测试，以及 `develop/script` 中的 e2e 配置。
 
 ---
 
@@ -278,7 +283,7 @@ pytest marker（`production` / `legacy` / `eval` / `bench` / `slow`）说明见 
 
 ```bash
 python tests/python/module/test_group_linear_exact.py
-python tests/python/module/test_group_linear_exact.py --qparam 14 --tests 1 2 3
+python tests/python/module/test_group_linear_exact.py --recipe nvfp4_cursor2_cutlass_v2 --tests 1 2 3
 
 python tests/python/module/test_group_linear_te_vs_mini.py
 ```
@@ -286,15 +291,11 @@ python tests/python/module/test_group_linear_te_vs_mini.py
 ### 6.3 Megatron fair / 低比特
 
 ```bash
-torchrun --nproc_per_node=4 \
-  tests/python/megatron/bench_moe_pertoken_fair.py \
-  --backend mini_qat15 --bench-mode fwb --preset qwen3-30b-a3b \
-  --tp-size 4 --moe --moe-grouped-gemm --seq-length 4096 --num-layers 1
-
-bash tests/python/megatron/run_fair_bench_te_vs_mini.sh
+python tests/python/megatron/test_lowbit_param.py --help
+bash develop/script/moe_training_e2e.sh --backend mini_nvfp4_per_token --profile off --dry-run
 ```
 
-更完整的 e2e 与 nsys 流程见 `doc/script/`。
+更完整的 e2e 与 nsys 流程见 `develop/script/`。
 
 ### 6.4 分布式
 
@@ -308,6 +309,6 @@ bash tests/python/megatron/run_fair_bench_te_vs_mini.sh
 2. 如需本地改代码，在 `/root/miniTransformer` 执行 `pip install -e . --no-build-isolation --no-deps`。
 3. 仅在非 Dockerfile 基础镜像上，才执行 `bash patch/b200/setup.sh`。
 4. 运行 `pytest tests/python/nvfp4 -m "production and not bench" -q`。
-5. 运行 `BACKEND=te_bf16 PROFILE=off TRAIN_ITERS=5 bash doc/script/moe_training_bf16.sh`。
-6. （可选）运行 `BACKEND=qat15 ... bash doc/script/moe_training_e2e.sh`。
+5. 运行 `BACKEND=te_bf16 PROFILE=off TRAIN_ITERS=5 bash develop/script/moe_training_e2e.sh`。
+6. （可选）运行 `BACKEND=mini_nvfp4_per_token PROFILE=off TRAIN_ITERS=5 bash develop/script/moe_training_e2e.sh`。
 7. 使用 slime / e2e 时确认未误开 DDP overlap（`--overlap-grad-reduce` / `--overlap-param-gather`）。

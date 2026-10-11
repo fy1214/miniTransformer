@@ -3,30 +3,12 @@ import enum
 import logging
 import os
 import torch
-from typing import Dict, Optional, Mapping, Sequence, Type
+from typing import Dict, Optional, Mapping, Sequence, Type, Union
 
-from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
-from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp, Int4TiledQuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_v2 import Nvfp4Cursor2CutlassV2QuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op_ref import Nvfp4Cursor2QuantizeOpRef
-from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
-from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken import Nvfp4TiledQuantizePertokenOp
-from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken_w_pertensor import (
-    Nvfp4PertokenWeightPertensorOp,
-)
-from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken_bf16_bwd import (
-    Nvfp4PertokenBf16BackwardOp,
-)
-from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
-from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2CutlassQuantizeOp
-from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_backward import Nvfp4Cursor2CutlassBackwardQuantizeOp
-from miniTransformer.quantiztion.nvfp4_w4a16_op import Nvfp4W4A16QuantizeOp
-from miniTransformer.quantiztion.nvfp4_qdq_op import Nvfp4QdqOp
 from miniTransformer.quantiztion.quantization import QParams, MMParams, ParamType
 from miniTransformer.quantiztion import quantization
 import miniTransformer.utils.env as env
+from miniTransformer.recipes import describe_recipe, get_recipe, get_recipe_from_env, recipe_summary
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +113,10 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     if recipe == QuantizeRecipe.NON_QUANTIZE:
         return QLinearParams(quantize=False, quantize_type=QuantizeType.NONE)
     elif recipe == QuantizeRecipe.BF16_REF:
+        from miniTransformer.quantiztion.bf16_ref_op import Bfloat16RefOp
         return QLinearParams(quantize=True, quantize_type=QuantizeType.NONE, quantize_op=Bfloat16RefOp())
     elif recipe == QuantizeRecipe.INT4_SUB_CHANNEL:
+        from miniTransformer.quantiztion.int4_quantize_op import Int4TiledQuantizeOp
         group_size = env.get_int4_fake_group_size()
         return QLinearParams(
             quantize=True,
@@ -154,6 +138,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             ),
             quantize_op=Int4TiledQuantizeOp())
     elif recipe == QuantizeRecipe.INT4_MARLIN_FORWARD:
+        from miniTransformer.quantiztion.int4_quantize_op import Int4MarlinForwardQuantizeOp
         group_size = env.get_int4_real_group_size()
         return QLinearParams(
             quantize=True,
@@ -179,6 +164,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             ),
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_REF:
+        from miniTransformer.quantiztion.nvfp4_quantize_op_ref import Nvfp4TiledQuantizeRefOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -213,6 +199,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL:
         # Split accumulator for all gemms.
         # fmt: off
+        from miniTransformer.quantiztion.nvfp4_quantize_op import Nvfp4TiledQuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -249,6 +236,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         # fmt: on
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN:
         # TE PR #3045 per-token NVFP4 (rowwise act + per_token_weight_2d weight).
+        from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken import Nvfp4TiledQuantizePertokenOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -285,6 +273,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_W_PERTENSOR:
         # Temporary ablation (QAT16): QAT15 act per-token + weight per-expert
         # tensor amax broadcast into TE bulk (QAT8-like outer scale).
+        from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken_w_pertensor import Nvfp4PertokenWeightPertensorOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -321,6 +310,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD:
         # NVFP4 per-token forward (same as QAT15) + TE-style BF16 dgrad/wgrad.
         # data_t stores BF16 splits (no physical transpose); bwd uses layout NN/NT.
+        from miniTransformer.quantiztion.nvfp4_quantize_op_pertoken_bf16_bwd import Nvfp4PertokenBf16BackwardOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -356,6 +346,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2:
         # Pertoken activation (Triton) + tensor-global weight + CuTeDSL grouped GEMM (SM100).
+        from miniTransformer.quantiztion.nvfp4_cursor2_op import Nvfp4Cursor2QuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -391,6 +382,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_REF:
         # Pertoken activation + tensor-global weight + CuTeDSL grouped GEMM (SM100).
+        from miniTransformer.quantiztion.nvfp4_cursor2_op_ref import Nvfp4Cursor2QuantizeOpRef
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -426,6 +418,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS:
         # Pertoken activation + tensor-global weight + CUTLASS v2 grouped FP4 GEMM (SM100).
+        from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass import Nvfp4Cursor2CutlassQuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -461,6 +454,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_BWD:
         # CUTLASS v2 FP4 forward GEMM + MXFP8 CUTLASS backward dgrad (SM100).
+        from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_backward import Nvfp4Cursor2CutlassBackwardQuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -496,6 +490,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_V2:
         # CUTLASS v2 FP4 forward GEMM + MXFP8 CUTLASS backward dgrad (SM100).
+        from miniTransformer.quantiztion.nvfp4_cursor2_op_cutlass_v2 import Nvfp4Cursor2CutlassV2QuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -531,6 +526,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_W4A16:
         # Origin activation + tensor-global weight.
+        from miniTransformer.quantiztion.nvfp4_w4a16_op import Nvfp4W4A16QuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -565,6 +561,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET:
+        from miniTransformer.quantiztion.nvfp4_quartet_op import Nvfp4QuartetQuantizeOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -596,6 +593,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_QDQ_BLOCK:
+        from miniTransformer.quantiztion.nvfp4_qdq_op import Nvfp4QdqOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -627,6 +625,7 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
             allgather_quantize=False,
         )
     elif recipe == QuantizeRecipe.FP4_QDQ_PERTOKEN:
+        from miniTransformer.quantiztion.nvfp4_qdq_op import Nvfp4QdqOp
         return QLinearParams(
             quantize=True,
             quantize_type=QuantizeType.NVFP4,
@@ -661,74 +660,46 @@ def get_qlinear_params_from_predefined(recipe: QuantizeRecipe) -> QLinearParams:
         raise ValueError(f"Unsupported quantize recipe: {recipe}")
 
 
+_logged_recipes = set()
+
+
+def _log_recipe_selection(spec, source: str) -> None:
+    """One concise summary per effective recipe in the main process."""
+    if os.environ.get("RANK", "0") != "0":
+        return
+    description = describe_recipe(spec, source=source)
+    key = (spec.name, source, description["backward"], tuple(description["environment"].items()))
+    if key in _logged_recipes:
+        return
+    _logged_recipes.add(key)
+    if source == "default":
+        logger.warning(
+            "MINITE_RECIPE and QAT_PARAMS are unset. Using historical fallback "
+            "fp4_subchannel_scaling_cursor2_ref (QAT6). Select a recipe explicitly."
+        )
+    logger.info("miniTransformer: %s", recipe_summary(description))
+
+
+def get_qlinear_params(recipe: Union[str, int, QuantizeRecipe]) -> QLinearParams:
+    """Create independent parameters/operators from a name, enum, or legacy QAT ID.
+
+    Existing environment tuning flags still apply. This function neither changes
+    environment variables nor replaces TE layers.
+    """
+    spec = get_recipe(recipe)
+    params = get_qlinear_params_from_predefined(QuantizeRecipe(spec.enum_value))
+    _log_recipe_selection(spec, "explicit")
+    return params
+
+
+def get_qlinear_params_from_env() -> QLinearParams:
+    """Resolve MINITE_RECIPE / QAT_PARAMS with the historical QAT6 fallback."""
+    spec, source = get_recipe_from_env()
+    params = get_qlinear_params_from_predefined(QuantizeRecipe(spec.enum_value))
+    _log_recipe_selection(spec, source)
+    return params
+
+
 def get_qlinear_params_from_env_qat_params() -> QLinearParams:
-    if os.environ.get("QAT_PARAMS"):
-        qat_params_idx = int(os.getenv("QAT_PARAMS"))
-    else:
-        logger.warning("QAT_PARAMS is not set. Use QAT_PARAMS=6, which uses DeepGemm backend")
-        qat_params_idx = 6
-
-    if qat_params_idx == 1:
-        return get_qlinear_params_from_predefined(QuantizeRecipe.NON_QUANTIZE)
-    if qat_params_idx == 2:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.INT4_SUB_CHANNEL
-        )
-    if qat_params_idx == 3:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_REF
-        )
-    if qat_params_idx == 4:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL
-        )
-    if qat_params_idx == 5:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_QUARTET
-        )
-    if qat_params_idx == 6:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_REF
-        )
-    if qat_params_idx == 7:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2
-        )
-    if qat_params_idx == 8:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS
-        )
-    if qat_params_idx == 9:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_W4A16
-        )
-    if qat_params_idx == 10:
-        return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_QDQ_BLOCK)
-    if qat_params_idx == 11:
-        return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_QDQ_PERTOKEN)
-    if qat_params_idx == 12:
-        return get_qlinear_params_from_predefined(QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_BWD)
-    if qat_params_idx == 13:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.INT4_MARLIN_FORWARD
-        )
-    if qat_params_idx == 14:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_CURSOR2_CUTLASS_V2
-        )
-    if qat_params_idx == 15:
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN
-        )
-    if qat_params_idx == 16:
-        # Temporary ablation: QAT15 act + weight per-expert tensor amax.
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_W_PERTENSOR
-        )
-    if qat_params_idx == 17:
-        # Former QAT16: NVFP4 per-token forward + BF16 backward op.
-        return get_qlinear_params_from_predefined(
-            QuantizeRecipe.FP4_SUB_CHANNEL_PERTOKEN_BF16_BWD
-        )
-
-    raise ValueError(f"Unsupported QAT_PARAMS index: {qat_params_idx}")
+    """Compatibility entry point; also accepts the new MINITE_RECIPE selector."""
+    return get_qlinear_params_from_env()

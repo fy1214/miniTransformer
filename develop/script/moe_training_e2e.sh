@@ -5,16 +5,16 @@
 #   te_bf16
 #   te_nvfp4
 #   te_nvfp4_pertoken
-#   qat14 | mini_qat14
-#   qat15 | mini_qat15
+#   mini_nvfp4_cursor2_cutlass_v2 | qat14 | mini_qat14
+#   mini_nvfp4_per_token | qat15 | mini_qat15
 #   qat15_disable_bwd | mini_qat15_disable_bwd   # QAT15 + DISABLE_BACKWARD_QUANT=1
-#   qat16 | mini_qat16   # weight per-expert tensor amax (W_PERTENSOR)
-#   qat17 | mini_qat17   # former QAT16: per-token fwd + BF16 bwd
+#   mini_nvfp4_per_token_w_per_tensor | qat16 | mini_qat16
+#   mini_nvfp4_per_token_bf16_bwd | qat17 | mini_qat17
 #
 # Examples:
 #   BACKEND=te_bf16 bash develop/script/moe_training_e2e.sh
 #   bash develop/script/moe_training_e2e.sh --backend qat15 --profile nsys
-#   BACKENDS="te_bf16 te_nvfp4 qat15" bash develop/script/moe_training_sweep.sh
+#   bash develop/script/moe_training_e2e.sh --backend mini_nvfp4_per_token --dry-run
 #
 # Note: leaves develop/script/moe_training.sh (original TE-only launcher) untouched.
 #
@@ -25,7 +25,7 @@
 #   NUM_LAYERS / DATA_PATH / TOKENIZER_PATH / LOG_ROOT
 #   PROFILE=off|nsys   (default nsys; torch profile via Megatron --profile*)
 #   USE_MOCK_DATA=1    (default when DATA_PATH empty)
-#   MINITE_NVFP4_PATH  (default dense for qat15/qat16)
+#   MINITE_NVFP4_PATH  (default dense for qat15/qat16/qat17)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,9 +38,37 @@ RDZV_ENDPOINT="${RDZV_ENDPOINT:-localhost:29400}"
 BACKEND="${BACKEND:-te_nvfp4_pertoken}"
 PROFILE="${PROFILE:-nsys}"
 EXTRA_ARGS=()
+DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --nnodes|--rdzv_endpoint|--backend|--profile)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "missing value for $1" >&2
+        exit 2
+      fi
+      ;;
+  esac
+  case "$1" in
+    --help|-h)
+      cat <<'HELP'
+Usage: bash develop/script/moe_training_e2e.sh [options] [Megatron arguments]
+  --backend NAME     TE or miniTransformer backend (default te_nvfp4_pertoken)
+  --profile off|nsys Profiling mode (default nsys)
+  --nnodes N         Number of nodes
+  --rdzv_endpoint X  Rendezvous address
+  --dry-run          Print configuration and command without creating directories
+
+Named backends: mini_nvfp4_per_token, mini_nvfp4_cursor2_cutlass_v2,
+                mini_nvfp4_per_token_w_per_tensor, mini_nvfp4_per_token_bf16_bwd
+Legacy qat14–17, qat15_disable_bwd, and all TE aliases remain accepted.
+HELP
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
     --nnodes)
       NNODES="$2"
       shift 2
@@ -71,14 +99,14 @@ normalize_backend() {
     te_bf16|te-bf16|bf16) echo "te_bf16" ;;
     te_nvfp4|te-nvfp4|nvfp4) echo "te_nvfp4" ;;
     te_nvfp4_pertoken|te-nvfp4-pertoken|pertoken) echo "te_nvfp4_pertoken" ;;
-    qat14|mini_qat14) echo "qat14" ;;
-    qat15|mini_qat15) echo "qat15" ;;
+    qat14|mini_qat14|mini_nvfp4_cursor2_cutlass_v2) echo "qat14" ;;
+    qat15|mini_qat15|mini_nvfp4_per_token) echo "qat15" ;;
     qat15_disable_bwd|qat15-disable|mini_qat15_disable_bwd|qat15_disable) echo "qat15_disable_bwd" ;;
-    qat16|mini_qat16) echo "qat16" ;;
-    qat17|mini_qat17) echo "qat17" ;;
+    qat16|mini_qat16|mini_nvfp4_per_token_w_per_tensor) echo "qat16" ;;
+    qat17|mini_qat17|mini_nvfp4_per_token_bf16_bwd) echo "qat17" ;;
     *)
       echo "unknown backend: $1" >&2
-      echo "expected: te_bf16 te_nvfp4 te_nvfp4_pertoken qat14 qat15 qat15_disable_bwd qat16 qat17" >&2
+      echo "expected: te_bf16 te_nvfp4 te_nvfp4_pertoken mini_nvfp4_cursor2_cutlass_v2 mini_nvfp4_per_token mini_nvfp4_per_token_w_per_tensor mini_nvfp4_per_token_bf16_bwd (legacy qat14–17 and qat15_disable_bwd also accepted)" >&2
       exit 2
       ;;
   esac
@@ -115,14 +143,13 @@ export NVTE_NVFP4_DISABLE_RHT="${NVTE_NVFP4_DISABLE_RHT:-0}"
 export NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING="${NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING:-0}"
 export NVTE_NVFP4_DISABLE_2D_QUANTIZATION="${NVTE_NVFP4_DISABLE_2D_QUANTIZATION:-1}"
 
-mkdir -p "${TRITON_CACHE_DIR}" "${NCCL_TMPDIR}"
-
 # Reset backend-specific env, then apply.
 unset SHOULD_REPLACE_TE_GROUPLINEAR || true
 unset QAT_PARAMS || true
+unset MINITE_RECIPE || true
 unset DISABLE_BACKWARD_QUANT || true
 unset TE_FP4_PERTOKEN || true
-# Keep caller MINITE_NVFP4_PATH if set; otherwise set below for QAT15/16.
+# Keep caller MINITE_NVFP4_PATH if set; otherwise set below for QAT15–17.
 
 FP4_ARGS=()
 QAT_BF16_LAYER_ARGS=()
@@ -205,6 +232,13 @@ case "${BACKEND}" in
 esac
 
 export PYTHONPATH="${HOOKS_DIR}:${MINITRANSFORMER_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+# The selected backend owns the recipe, just as it historically owned QAT_PARAMS.
+# -S avoids loading training hooks while inspecting this dependency-free registry.
+if [[ -n "${QAT_PARAMS:-}" ]]; then
+  MINITE_RECIPE="$(python3 -B -S -c 'import sys; from miniTransformer.recipes import get_recipe; print(get_recipe(int(sys.argv[1])).name)' "${QAT_PARAMS}")"
+  export MINITE_RECIPE
+fi
+
 
 LOG_ROOT="${LOG_ROOT:-/home/admin/log/exp}"
 EXP_NAME="${EXP_NAME:-moe_e2e_${BACKEND}_N${NNODES}_g${GPUS_PER_NODE}_tp${TP}_pp${PP}_cp${CP}_ep${EP}}"
@@ -222,32 +256,7 @@ if [[ -z "${USE_MOCK_DATA}" ]]; then
   fi
 fi
 
-mkdir -p "${LOG_DIR}" "${TENSORBOARD_DIR}"
 META_JSON="${LOG_DIR}/run_meta.json"
-
-cat >"${META_JSON}" <<EOF
-{
-  "backend": "${BACKEND}",
-  "exp_name": "${EXP_NAME}",
-  "megatron_root": "${MEGATRON_ROOT}",
-  "minitransformer_root": "${MINITRANSFORMER_ROOT}",
-  "tp": ${TP}, "pp": ${PP}, "cp": ${CP}, "ep": ${EP},
-  "gpus_per_node": ${GPUS_PER_NODE}, "nnodes": ${NNODES},
-  "seq_length": ${SEQ_LENGTH}, "train_iters": ${TRAIN_ITERS},
-  "micro_batch_size": ${MICRO_BATCH_SIZE}, "global_batch_size": ${GLOBAL_BATCH_SIZE},
-  "num_layers": ${NUM_LAYERS}, "num_experts": ${NUM_EXPERTS},
-  "profile": "${PROFILE}",
-  "use_mock_data": ${USE_MOCK_DATA},
-  "env": {
-    "SHOULD_REPLACE_TE_GROUPLINEAR": "${SHOULD_REPLACE_TE_GROUPLINEAR:-}",
-    "QAT_PARAMS": "${QAT_PARAMS:-}",
-    "DISABLE_BACKWARD_QUANT": "${DISABLE_BACKWARD_QUANT:-}",
-    "TE_FP4_PERTOKEN": "${TE_FP4_PERTOKEN:-}",
-    "MINITE_NVFP4_PATH": "${MINITE_NVFP4_PATH:-}",
-    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "${NVTE_NVFP4_DISABLE_2D_QUANTIZATION}"
-  }
-}
-EOF
 
 echo "============================================================"
 echo "MoE e2e perf  backend=${BACKEND}  profile=${PROFILE}"
@@ -256,7 +265,7 @@ echo "LOG_DIR=${LOG_DIR}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
 echo "mock_data=${USE_MOCK_DATA}  train_iters=${TRAIN_ITERS}  seq=${SEQ_LENGTH}"
 echo "parallel: tp=${TP} pp=${PP} cp=${CP} ep=${EP} gpus/node=${GPUS_PER_NODE}"
-echo "env: REPLACE=${SHOULD_REPLACE_TE_GROUPLINEAR:-} QAT=${QAT_PARAMS:-} DISABLE_BWD=${DISABLE_BACKWARD_QUANT:-} TE_PERTOKEN=${TE_FP4_PERTOKEN:-} NVFP4_PATH=${MINITE_NVFP4_PATH:-}"
+echo "env: REPLACE=${SHOULD_REPLACE_TE_GROUPLINEAR:-} RECIPE=${MINITE_RECIPE:-native_te} QAT=${QAT_PARAMS:-} DISABLE_BWD=${DISABLE_BACKWARD_QUANT:-} TE_PERTOKEN=${TE_FP4_PERTOKEN:-} NVFP4_PATH=${MINITE_NVFP4_PATH:-}"
 echo "============================================================"
 
 DISTRIBUTED_ARGS=(
@@ -331,6 +340,7 @@ GPT_ARGS=(
   --norm-epsilon 1e-6
 )
 
+# Guard optional arrays for Bash 3.2, whose nounset treats empty arrays as unset.
 MOE_ARGS=(
   --num-experts "${NUM_EXPERTS}"
   --moe-router-topk "${MOE_TOPK}"
@@ -338,7 +348,7 @@ MOE_ARGS=(
   --moe-grouped-gemm
   --moe-aux-loss-coeff 0.001
   --moe-token-dispatcher-type alltoall
-  "${AMAX_FUSE_ARGS[@]}"
+  ${AMAX_FUSE_ARGS[@]+"${AMAX_FUSE_ARGS[@]}"}
 )
 
 # Qwen3 vocab embedding size. NullTokenizer treats --vocab-size as *without* EOD
@@ -404,8 +414,8 @@ fi
 INFIX_ARGS=(
   --padded-vocab-size "${PADDED_VOCAB_SIZE}"
   --attention-backend flash
-  "${FP4_ARGS[@]}"
-  "${QAT_BF16_LAYER_ARGS[@]}"
+  ${FP4_ARGS[@]+"${FP4_ARGS[@]}"}
+  ${QAT_BF16_LAYER_ARGS[@]+"${QAT_BF16_LAYER_ARGS[@]}"}
 )
 
 EXE="${MEGATRON_ROOT}/pretrain_gpt.py"
@@ -421,25 +431,78 @@ CMD=(
   "${OPTIMIZE_ARGS[@]}"
   "${TRAIN_ARGS[@]}"
   "${MODEL_PARALLEL_ARGS[@]}"
-  "${PROFILER_ARGS[@]}"
+  ${PROFILER_ARGS[@]+"${PROFILER_ARGS[@]}"}
   "${INFIX_ARGS[@]}"
-  "${EXTRA_ARGS[@]}"
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 )
 
-run_train() {
-  if [[ "${PROFILE}" == "nsys" ]]; then
-    mkdir -p "$(dirname "${NSYS_OUTPUT}")"
-    nsys profile \
-      -s none \
-      -t nvtx,cuda \
-      -o "${NSYS_OUTPUT}" \
-      --force-overwrite true \
-      --capture-range=cudaProfilerApi \
-      --capture-range-end=stop \
-      "${CMD[@]}"
-  else
+LAUNCH_CMD=("${CMD[@]}")
+if [[ "${PROFILE}" == "nsys" ]]; then
+  LAUNCH_CMD=(
+    nsys profile -s none -t nvtx,cuda -o "${NSYS_OUTPUT}"
+    --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop
     "${CMD[@]}"
-  fi
+  )
+fi
+
+python3 -B -S - <<'PYINFO'
+import os
+from miniTransformer.recipes import get_recipe_from_env, describe_recipe, recipe_summary
+if os.environ.get("QAT_PARAMS"):
+    spec, _ = get_recipe_from_env()
+    info = describe_recipe(spec, source="backend")
+    print("miniTransformer:", recipe_summary(info))
+    for note in info["notes"]:
+        print("Note:", note)
+else:
+    print("Recipe: native Transformer Engine (miniTransformer selector unset)")
+for name in ("MINITE_RECIPE", "QAT_PARAMS", "SHOULD_REPLACE_TE_GROUPLINEAR",
+             "DISABLE_BACKWARD_QUANT", "TE_FP4_PERTOKEN", "MINITE_NVFP4_PATH",
+             "NVTE_NVFP4_DISABLE_RHT", "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING",
+             "NVTE_NVFP4_DISABLE_2D_QUANTIZATION"):
+    print(f"  {name}={os.environ.get(name, '<unset>')}")
+PYINFO
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  printf 'command:'
+  printf ' %q' "${LAUNCH_CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+mkdir -p "${TRITON_CACHE_DIR}" "${NCCL_TMPDIR}" "${LOG_DIR}" "${TENSORBOARD_DIR}"
+if [[ "${PROFILE}" == "nsys" ]]; then
+  mkdir -p "$(dirname "${NSYS_OUTPUT}")"
+fi
+
+# Use JSON serialization so user-supplied paths/names with quotes remain valid.
+python3 -B -S - "${META_JSON}" "${BACKEND}" "${EXP_NAME}" "${MEGATRON_ROOT}" \
+  "${MINITRANSFORMER_ROOT}" "${TP}" "${PP}" "${CP}" "${EP}" \
+  "${GPUS_PER_NODE}" "${NNODES}" "${SEQ_LENGTH}" "${TRAIN_ITERS}" \
+  "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${NUM_LAYERS}" "${NUM_EXPERTS}" \
+  "${PROFILE}" "${USE_MOCK_DATA}" <<'PYMETA'
+import json, os, sys
+from pathlib import Path
+from miniTransformer.recipes import RECIPE_ENV_VARS, get_recipe_from_env, describe_recipe
+keys = ("backend", "exp_name", "megatron_root", "minitransformer_root", "tp", "pp", "cp", "ep",
+        "gpus_per_node", "nnodes", "seq_length", "train_iters", "micro_batch_size",
+        "global_batch_size", "num_layers", "num_experts", "profile", "use_mock_data")
+metadata = dict(zip(keys, sys.argv[2:]))
+for key in keys[4:16] + ("use_mock_data",):
+    metadata[key] = int(metadata[key])
+variables = RECIPE_ENV_VARS + ("SHOULD_REPLACE_TE_GROUPLINEAR", "TE_FP4_PERTOKEN")
+metadata["env"] = {key: os.environ.get(key, "") for key in variables}
+recipe = None
+if os.environ.get("QAT_PARAMS"):
+    spec, _ = get_recipe_from_env()
+    recipe = describe_recipe(spec, source="backend")
+metadata.update(recipe=recipe, recipe_name=recipe["name"] if recipe else None,
+                qat_id=recipe["qat_id"] if recipe else None)
+Path(sys.argv[1]).write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
+PYMETA
+
+run_train() {
+  "${LAUNCH_CMD[@]}"
 }
 
 # Capture stdout/stderr for throughput parsing.

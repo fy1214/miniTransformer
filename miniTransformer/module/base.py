@@ -181,7 +181,7 @@ class LayerLinearBaseModule(torch.nn.Module, ABC):
         """Set local qlinear_params based on passed in qlinear_params, optionally disable FP8 quantization"""
 
         if qlinear_params is None:
-            qlinear_params = config.get_qlinear_params_from_env_qat_params()
+            qlinear_params = config.get_qlinear_params_from_env()
         if layer_number in get_keep_in_bf16_layer_numbers():
             return config.QLinearParams(quantize=False)
         else:

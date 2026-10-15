@@ -3,7 +3,8 @@
 Usage:
     python test_group_linear_exact.py
     python test_group_linear_exact.py --tests 1 2 3
-    python test_group_linear_exact.py --qparam 6
+    python test_group_linear_exact.py --recipe nvfp4_per_token
+    python test_group_linear_exact.py --qparam 6  # legacy test ID, not QAT6
     python test_group_linear_exact.py --tests 1 4 --qparam 9
 """
 import argparse
@@ -14,6 +15,7 @@ from torch.profiler import profile, ProfilerActivity, record_function
 
 from miniTransformer.module.config import QuantizeRecipe, get_qlinear_params_from_predefined
 from miniTransformer.module.group_linear import GroupedLinear
+from miniTransformer.recipes import get_recipe
 
 AVAILABLE_TESTS = {
     1: ("test_group_linear_forward", "Forward pass execution"),
@@ -25,6 +27,7 @@ AVAILABLE_TESTS = {
     7: ("test_group_linear_input_row_amax", "GroupedLinear forward/backward with prefused row_amax"),
 }
 
+# Historical test IDs are independent of runtime QAT_PARAMS; preserve them.
 AVAILABLE_QPARAMS = {
     1: ("NON_QUANTIZE", QuantizeRecipe.NON_QUANTIZE, "No quantization"),
     2: ("INT4_SUB_CHANNEL", QuantizeRecipe.INT4_SUB_CHANNEL, "INT4 sub-channel quantization"),
@@ -499,7 +502,7 @@ Available Tests:
   6 - log_prob vs train CUDA compare
   7 - input_row_amax (PERTOKEN only)
 
-Available Quantization Recipes:
+Legacy test recipe IDs (independent of QAT_PARAMS):
   1 - NON_QUANTIZE
   2 - INT4_SUB_CHANNEL
   3 - FP4_SUB_CHANNEL_REF
@@ -525,12 +528,14 @@ Examples:
         default=None,
         help="Test IDs to run (default: 1-4 correctness tests)",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--recipe", help="Public recipe name or enum value (recommended)")
+    selection.add_argument(
         "--qparam",
         type=int,
         choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
-        default=4,
-        help="Recipe id (see --list-qparams). Default: 4 (FP4_SUB_CHANNEL)",
+        default=None,
+        help="Legacy test recipe ID, NOT a QAT_PARAMS ID (see --list-qparams). Default: 4",
     )
     parser.add_argument("--list-tests", action="store_true", help="List tests and exit")
     parser.add_argument("--list-qparams", action="store_true", help="List recipes and exit")
@@ -552,7 +557,7 @@ def list_available_tests():
 
 
 def list_available_qparams():
-    print("\nAvailable Quantization Recipes:")
+    print("\nLegacy test recipe IDs (independent of QAT_PARAMS):")
     print("=" * 60)
     for qparam_id, (qparam_name, _, qparam_desc) in AVAILABLE_QPARAMS.items():
         print(f"  {qparam_id}. {qparam_name}")
@@ -560,13 +565,21 @@ def list_available_qparams():
     print("=" * 60)
 
 
-def run_all_tests(qparam_id: int = 4, test_ids: list = None, nsys_only: bool = False):
+def run_all_tests(qparam_id: int = 4, test_ids: list = None, nsys_only: bool = False, recipe_name: str = None):
     print("\n" + "=" * 60)
     print("GroupLinear Module Test Suite")
     print("=" * 60)
 
-    qparam_name, qparam_recipe, qparam_desc = AVAILABLE_QPARAMS[qparam_id]
-    print(f"Quantization Recipe: {qparam_id}. {qparam_name}")
+    if recipe_name is not None:
+        spec = get_recipe(recipe_name)
+        qparam_name = spec.name
+        qparam_recipe = QuantizeRecipe(spec.enum_value)
+        qparam_desc = spec.description
+        recipe_label = f"{spec.name} (QAT{spec.qat_id})" if spec.qat_id is not None else spec.name
+    else:
+        qparam_name, qparam_recipe, qparam_desc = AVAILABLE_QPARAMS[qparam_id]
+        recipe_label = f"legacy test ID {qparam_id}: {qparam_name} (not QAT_PARAMS)"
+    print(f"Quantization Recipe: {recipe_label}")
     print(f"Description: {qparam_desc}")
 
     if test_ids is None:
@@ -606,7 +619,7 @@ def run_all_tests(qparam_id: int = 4, test_ids: list = None, nsys_only: bool = F
     print("\n" + "=" * 60)
     print("Test Summary")
     print("=" * 60)
-    print(f"Quantization: {qparam_id}. {qparam_name}")
+    print(f"Quantization: {recipe_label}")
     print(f"Total tests run: {len(test_ids)}")
     print(f"Passed: {len(passed_tests)}")
     print(f"Failed: {len(failed_tests)}")
@@ -638,4 +651,5 @@ if __name__ == "__main__":
     if args.list_qparams:
         list_available_qparams()
         exit(0)
-    run_all_tests(qparam_id=args.qparam, test_ids=args.tests, nsys_only=args.nsys_only)
+    run_all_tests(qparam_id=args.qparam if args.qparam is not None else 4,
+                  test_ids=args.tests, nsys_only=args.nsys_only, recipe_name=args.recipe)

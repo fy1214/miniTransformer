@@ -1,7 +1,11 @@
 import os
 
 def should_switch_to_hybrid_linear():
-    # Switch to kitchen linear if QAT_PARAMS is set
+    # Preserve the historical norm choice for each explicitly selected recipe.
+    # The layer factory validates recipe selectors before norm construction.
+    # This gate must not re-resolve selectors when qlinear_params was explicit.
+    if os.environ.get("MINITE_RECIPE", "").strip():
+        return True
     qat_params_idx = int(os.getenv("QAT_PARAMS", "0"))
     should_switch = qat_params_idx > 0
     return should_switch

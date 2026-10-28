@@ -4,7 +4,7 @@
 
 ![Version](https://img.shields.io/badge/version-1.0.0-2563eb)
 
-[Quick start](#quick-start) · [Recipes](#choose-a-recipe) · [Megatron integration](#megatron-integration) · [Documentation](#documentation) · [Development](#development)
+[Quick start](#quick-start) · [Recipes](#choose-a-recipe) · [Megatron integration](#megatron-integration) · [Documentation](#documentation) · [Papers](#papers) · [Development](#development)
 
 miniTransformer is the implementation package for **miniTE**. It provides PyTorch
 `Linear`, `LayerNormLinear`, and `GroupedLinear` modules for experimenting with
@@ -181,6 +181,14 @@ Additional entry points: [environment setup](patch/b200/README.md),
 [MoE launcher](develop/script/README.md), [NVFP4 kernel tests](tests/python/nvfp4/README.md),
 [distributed tests](tests/python/distributed/README.md), and
 [log-probability comparison tools](tools/logpdiff-tools/README.md).
+
+## Papers
+
+- **miniTE: Diagnosing and Bridging the Execution Gap in Native NVFP4
+  Reinforcement Learning** — [arXiv:2610.23928](https://arxiv.org/abs/2610.23928).
+- **miniTE technical report** (failure diagnosis, TRIAGE, miniTE implementation,
+  and measured gains, with interactive figures) —
+  [LMSYS blog post](https://www.lmsys.org/blog/2026-10-25-minite).
 
 ## Development
 

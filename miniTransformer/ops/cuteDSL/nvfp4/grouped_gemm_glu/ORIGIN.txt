@@ -1,0 +1,9 @@
+# Vendored from TE cudnn-frontend grouped_gemm_glu (SM100).
+#
+# Source (reference):
+#   TransformerEngine/3rdparty/cudnn-frontend/python/cudnn/grouped_gemm/
+#     grouped_gemm_glu/{api,moe_blockscaled_grouped_gemm_glu_bias}.py
+#     moe_{utils,persistent_scheduler,sched_extension,kernel_helpers}.py
+#   + slimmed api_base (dtype/pointer helpers inlined; no cudnn._compiled_module)
+#
+# Edit freely in-tree; re-sync from upstream when needed.
